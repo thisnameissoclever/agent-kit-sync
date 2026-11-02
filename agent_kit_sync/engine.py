@@ -786,6 +786,9 @@ class Engine:
             if entry is not None and current is not None and sha256(current) != expected:
                 continue  # Edited since this run started; the next run carries it back.
             if current == copy.data:
+                if entry is None:
+                    # The file was already here, written by someone else: keep a copy so uninstall leaves it.
+                    self._backup_unmanaged(copy, current, None)
                 if entry is None or entry["hash"] != sha256(copy.data):
                     self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
                 continue

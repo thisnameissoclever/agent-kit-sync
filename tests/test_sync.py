@@ -221,5 +221,32 @@ class ConflictTests(TwoMachines):
         self.assertIn(b"report B", engine.held.blob(held[0], "ours"))
 
 
+class AdoptionTests(TwoMachines):
+    def test_existing_identical_file_survives_removal(self):
+        self.standard_config()
+        a = self.machine("a")
+        skill = a.path(".claude", "skills", "review", "SKILL.md")
+        skill.parent.mkdir(parents=True)
+        skill.write_text((self.seed / "modules/writing/skills/review/SKILL.md").read_text())
+        a.sync()
+        data = a.machine_data()
+        data.setdefault("overrides", {})["writing/review"] = {"kind": "disable"}
+        a.write_machine(data)
+        a.sync()
+        self.assertTrue(skill.is_file())
+        self.assertFalse(a.path(".agents", "skills", "review").exists())
+
+    def test_incoming_item_does_not_overwrite_a_different_unmanaged_file(self):
+        self.standard_config()
+        a = self.machine("a")
+        mine = a.path(".claude", "skills", "review", "SKILL.md")
+        mine.parent.mkdir(parents=True)
+        mine.write_text("my own review skill\n")
+        engine, report = a.sync()
+        self.assertEqual(mine.read_text(), "my own review skill\n")
+        self.assertTrue([e for e in engine.held.all() if e["kind"] == "collision"])
+        self.assertIn("Read the draft", a.read(".agents", "skills", "review", "SKILL.md"))
+
+
 if __name__ == "__main__":
     unittest.main()
