@@ -64,7 +64,9 @@ Every hook call starts Python once. On an Apple silicon Mac in November 2026, a 
 
 Paste this into Claude Code or Codex:
 
-> Clone https://github.com/OWNER/agent-kit-sync into a temporary folder. Then read `kit/skills/agent-kit-sync-setup/SKILL.md` in that clone and follow it to set up agent-kit-sync on this machine.
+> Clone the agent-kit-sync repository, REPO_URL, into a temporary folder. Then read `kit/skills/agent-kit-sync-setup/SKILL.md` in that clone and follow it to set up agent-kit-sync on this machine.
+
+Replace REPO_URL with the address of this repository, or of your fork, from the **Code** button on its GitHub page.
 
 The agent asks you, each with a recommendation:
 
