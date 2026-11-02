@@ -242,7 +242,7 @@ def detach(argv, layout_root: str) -> None:
     log = open(os.path.join(logs, "sync-background.log"), "ab")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log, "close_fds": True, "cwd": str(layout_root)}
     if sys.platform.startswith("win"):
-        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(argv, **kwargs)

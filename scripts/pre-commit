@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Refuse a commit whose added lines contain a term from the contributor's own blocklist."""
+
+import os
+import re
+import subprocess
+import sys
+
+path = os.path.join(os.path.expanduser("~"), ".agent-kit-sync", "contributor-blocklist.txt")
+try:
+    with open(path, encoding="utf-8") as handle:
+        terms = [line.strip() for line in handle if line.strip() and not line.startswith("#")]
+except OSError:
+    sys.exit(0)
+diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color"], stdout=subprocess.PIPE, check=True).stdout.decode("utf-8", "replace")
+added = [line[1:] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+found = set()
+for term in terms:
+    pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+    if any(pattern.search(line) for line in added):
+        found.add(term)
+if found:
+    sys.stderr.write("This commit adds terms from " + path + ": " + ", ".join(sorted(found)) + "\nRemove them before committing.\n")
+    sys.exit(1)

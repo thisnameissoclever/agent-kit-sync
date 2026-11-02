@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -139,7 +140,9 @@ class InstalledToolTests(TwoMachines):
         env = dict(os.environ)
         for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_KIT_SYNC_HOME"):
             env.pop(name, None)
-        env.update({"HOME": str(self.a.home), "USERPROFILE": str(self.a.home), "AGENT_KIT_SYNC_NO_BACKGROUND": "1", "PATH": "/usr/bin:/bin"})
+        # Keep Git on the path but hide the user's own claude and codex programs.
+        git_dir = os.path.dirname(shutil.which("git") or "/usr/bin/git")
+        env.update({"HOME": str(self.a.home), "USERPROFILE": str(self.a.home), "AGENT_KIT_SYNC_NO_BACKGROUND": "1", "PATH": os.pathsep.join([git_dir, os.path.dirname(sys.executable)])})
         env.update(extra_env or {})
         launcher = self.a.layout.launcher
         cmd = [sys.executable, "-I", "-S", str(launcher)] if launcher.exists() else [sys.executable, "-I", "-S", str(ROOT / "bootstrap.py")]
