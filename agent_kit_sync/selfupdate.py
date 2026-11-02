@@ -58,7 +58,8 @@ def self_test(layout: Layout, version: Path) -> Tuple[bool, str]:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_", "CODEX_", "AGENT_KIT_SYNC"))}
         env.update({"HOME": home, "USERPROFILE": home, "AGENT_KIT_SYNC_HOME": str(Path(home) / ".agent-kit-sync")})
         try:
-            result = subprocess.run([sys.executable, "-I", "-S", "-m", "agent_kit_sync.selftest"], cwd=str(version), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SELF_TEST_SECONDS)
+            code = "import sys; sys.path.insert(0, sys.argv[1]); from agent_kit_sync.selftest import main; sys.exit(main())"
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(version)], cwd=home, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SELF_TEST_SECONDS)
         except subprocess.TimeoutExpired:
             return False, "the self-test took longer than 20 seconds"
         return result.returncode == 0, result.stdout.decode("utf-8", "replace")[-800:]
@@ -75,6 +76,11 @@ def prune(layout: Layout) -> None:
     for old in versions[KEEP:]:
         if old.name != current and time.time() - old.stat().st_mtime > 3600:
             shutil.rmtree(old, ignore_errors=True)
+
+
+def origin(layout: Layout) -> Optional[str]:
+    result = gitops.run(layout.tool_repo, "remote", "get-url", "origin", check=False)
+    return result.stdout.decode().strip() if result.returncode == 0 else None
 
 
 def update(layout: Layout, policy: str, network: bool = True) -> Tuple[str, str]:

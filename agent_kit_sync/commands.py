@@ -51,9 +51,17 @@ def ensure_tool(layout: Layout, tool_url: Optional[str]) -> str:
     """Make sure a tool version is installed and current. Returns its folder name."""
     from .selfupdate import current_name, install_version, switch
     layout.tool.mkdir(parents=True, exist_ok=True)
-    source = tool_url or str(Path(__file__).resolve().parents[1])
+    here = Path(__file__).resolve().parents[1]
+    source = tool_url or str(here)
     if not layout.tool_repo.exists():
         gitops.run(None, "clone", "-q", "--bare", source, str(layout.tool_repo), timeout=gitops.NETWORK_TIMEOUT)
+        # Follow the public repository the clone came from, not the clone itself, which may be deleted.
+        upstream = tool_url
+        if upstream is None and (here / ".git").exists():
+            found = gitops.run(here, "remote", "get-url", "origin", check=False)
+            upstream = found.stdout.decode().strip() if found.returncode == 0 else None
+        if upstream:
+            gitops.run(layout.tool_repo, "remote", "set-url", "origin", upstream)
     commit = gitops.rev(layout.tool_repo, "main") or gitops.rev(layout.tool_repo, "HEAD")
     if commit is None:
         raise RuntimeError(f"the tool repo at {source} has no commits")
@@ -237,6 +245,8 @@ def _agent_from_codex(path: Path) -> str:
         name = key if key in ("name", "description") else "codex." + key
         if isinstance(value, (str, int, float, bool)):
             header.append(f"{name}: {yaml_quote(value)}\n")
+        else:
+            raise SystemExit(f"{path} has the field {key}, which holds a list or table; agent-kit-sync can sync only single values in subagent fields. Move it out of the file before adding it.")
     header.append("---\n")
     body = str(data.get("developer_instructions", ""))
     return "".join(header) + (body if body.endswith("\n") else body + "\n")

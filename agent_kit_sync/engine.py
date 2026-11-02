@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Set, Tuple
 
-from . import checks, gitops, render, sections, settings, tomledit
+from . import checks, gitops, render, sections, settings, toml, tomledit
 from .fsutil import ChangedUnderneath, atomic_write, prune_empty_dirs, read_or_none, real, remove_file, sha256, stat_signature
 from .model import ConfigError, Inventory, Item, Machine, Module, load_inventory, load_local_modules, load_machine, load_module
 from .paths import Layout
@@ -81,10 +81,10 @@ def item_is_code(module: Module, item: Item, tree: Tree) -> bool:
     if item.kind == "setting":
         return is_code_setting(item.data.get("app", ""), item.data.get("key", ""))
     if item.kind == "agent":
-        raw = tree.read(item.data["file"]) or b""
-        return b"{{kit.hook " in raw
+        from .plan import agent_is_code
+        return agent_is_code(tree.read(item.data["file"]) or b"")
     if item.kind in ("skill", "file"):
-        return any(is_code_path(rel, item.kind) for rel in item_source_files(module, item, tree))
+        return any(is_code_path(rel, item.kind, tree.read(rel), tree.executable(rel)) for rel in item_source_files(module, item, tree))
     return False
 
 
@@ -100,6 +100,8 @@ class Engine:
         self.checker = checks.Checker(self.blocklist)
         self.record = RunRecord(layout)
         self.report = Report()
+        self.failed_modules: Set[str] = set()   # modules that could not be rendered this run
+        self.throttle_fetch = False             # set for runs started after a file write
         self.approve_new: Set[str] = set()      # item keys approved during setup
         self.replace_existing: Set[str] = set() # "app|module/item" allowed to overwrite unmanaged files
         self.carried: Dict[str, Optional[str]] = {}  # copy or block keys carried back, with their hash when found
@@ -169,6 +171,18 @@ class Engine:
             return
         for entry in pending.get("entries", []):
             current = read_or_none(Path(entry["path"]))
+            if current is not None and sha256(current) == entry["hash"] and entry.get("blocks") is not None:
+                # An instruction file was written but the index was not: adopt the written blocks.
+                try:
+                    present = sections.extract(current.decode("utf-8"))
+                except (sections.MarkerError, UnicodeDecodeError):
+                    present = {}
+                for block_key, block_hash in entry["blocks"].items():
+                    key = block_key.split("|", 1)[1]
+                    if key in present and block_key in self.index.blocks and sha256(present[key].encode("utf-8")) == block_hash:
+                        self.index.blocks[block_key]["hash"] = block_hash
+                        self.index.blocks[block_key]["content"] = present[key]
+                continue
             if current is not None and sha256(current) == entry["hash"] and entry.get("copy_key"):
                 index_entry = entry["index"]
                 self.index.copies[entry["copy_key"]] = index_entry
@@ -359,6 +373,9 @@ class Engine:
             if len({r for r in results}) > 1:
                 conflicts.extend(group[:-1])
             new_files[source_rel] = results[-1]
+        for change in edits:
+            if change.kind in ("edit", "section-edit"):
+                self._verify_render(module, item, change, new_files)
         problems = self._check_sources(module, item, new_files, tree)
         if problems:
             self._hold_edit(module, item, changes, "This edit failed agent-kit-sync's checks: " + "; ".join(str(p) for p in problems[:5]), new_files)
@@ -377,6 +394,36 @@ class Engine:
         for change in conflicts:
             self.held.add(f"edit-conflict:{change.copy_key}", "edit-conflict", f"Two copies of {item.key} on this machine were edited differently before a sync. The {self._app_label(changes[-1].app)} edit was kept; this one, from {self._app_label(change.app)}, is saved here.", ["discard", "use-this"], {"edited": change.new or b""}, item_key=item.key)
         self.report.edits.append(item.key)
+
+    def _verify_render(self, module: Module, item: Item, change: LocalChange, new_files: Dict[str, Optional[bytes]]) -> None:
+        """Raise RenderError unless rendering the carried-back source reproduces the edited copy exactly."""
+        source_rel = self._source_rel(change)
+        source = new_files.get(source_rel)
+        if source is None:
+            return
+        if change.kind == "section-edit":
+            entry = self.index.blocks[change.copy_key]
+            values = values_for(self.layout, self.machine, module.name, change.app, {})
+            _p, edited_base, _a = sections.split_local(change.new.decode("utf-8"))
+            if render.render_text(source.decode("utf-8"), values).text != edited_base:
+                raise render.RenderError("rendering the carried-back section does not reproduce the edit")
+            return
+        entry = self.index.copies[change.copy_key]
+        kind = entry["render_kind"]
+        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+        text = source.decode("utf-8") if kind != "copy" else None
+        if kind == "copy":
+            again = source
+        elif kind == "text":
+            again = render.render_text(text, values).text.encode("utf-8")
+        elif kind == "agent-md":
+            again = render.render_agent_md(text, change.app, values).text.encode("utf-8")
+        else:
+            again = render.render_agent_codex(text, values).encode("utf-8")
+            if toml.loads(again.decode("utf-8")) == toml.loads(change.new.decode("utf-8")):
+                return  # Same values; Codex reads TOML, so formatting differences do not matter.
+        if again != change.new:
+            raise render.RenderError("rendering the carried-back source does not reproduce the edited file exactly")
 
     def _app_label(self, app: str) -> str:
         return {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "kit": "hook"}.get(app, app)
@@ -485,7 +532,10 @@ class Engine:
         if policy == "ask-code":
             if item.kind == "hook" or item_is_code(module, item, tree):
                 return True
-            return any(data is not None and is_code_path(rel, item.kind) for rel, data in new_files.items())
+            if item.kind == "agent":
+                from .plan import agent_is_code
+                return any(data is not None and agent_is_code(data) for data in new_files.values())
+            return any(data is not None and is_code_path(rel, item.kind, data) for rel, data in new_files.items())
         return False
 
     def _hold_edit(self, module: Module, item: Item, changes: List[LocalChange], summary: str, new_files: Optional[Dict[str, Optional[bytes]]] = None, outgoing: bool = False) -> None:
@@ -535,23 +585,36 @@ class Engine:
         """Commit changed files in the checkout that pass the checks; leave the rest uncommitted."""
         if not (self.checkout / ".git").exists():
             return
+        from .tree import ignored
+        head = gitops.head(self.checkout)
         paths, failed = [], []
         for entry in gitops.status_porcelain(self.checkout):
-            path = entry[3:]
+            status, path = entry[:2], entry[3:]
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
+            if ignored(path, ()):
+                # Never commit a cache or junk file; drop it from the checkout.
+                if "?" in status:
+                    (self.checkout / path).unlink()
+                continue
             target = self.checkout / path
             data = read_or_none(target)
             if data is not None:
-                old = gitops.show(self.checkout, "HEAD", path) if gitops.head(self.checkout) else None
-                templated = path.endswith(".md") and "/sections/" in path or "/agents/" in path
+                old = gitops.show(self.checkout, "HEAD", path) if head else None
+                templated = (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
                 problems = self.checker.file(path, data, own=True, templated=templated, added_lines=checks.added_line_numbers(old, data))
                 if problems:
                     failed.append((path, problems))
                     continue
             paths.append(path)
         for path, problems in failed:
-            self.alerts.raise_(f"checkout:{path}", f"agent-kit-sync did not commit {path} in the config repo checkout, because it failed the checks: " + "; ".join(str(p) for p in problems[:3]), "agent-kit-sync test")
+            # Put the failing file back to its last commit so it never blocks a later merge.
+            if head and gitops.show(self.checkout, "HEAD", path) is not None:
+                gitops.run(self.checkout, "checkout", "HEAD", "--", path, check=False)
+            elif "?" not in path:
+                gitops.run(self.checkout, "rm", "-fq", "--", path, check=False)
+            held = self.held.by_key(f"checkout:{path}")
+            self.alerts.raise_(f"checkout:{path}", f"agent-kit-sync did not commit {path} in the config repo, because it failed the checks: " + "; ".join(str(p) for p in problems[:3]) + ". It was set back to the last synced version.", "agent-kit-sync status")
         for path in paths:
             self.alerts.close(f"checkout:{path}")
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
@@ -559,15 +622,18 @@ class Engine:
             self.record.data["commits"].append(commit)
 
     def merge_remote(self) -> None:
-        try:
-            gitops.fetch(self.checkout)
-            self.index.last_fetch = time.time()
-        except gitops.GitError as error:
-            self.alerts.raise_("fetch", f"agent-kit-sync could not fetch the config repo: {error}", "agent-kit-sync status")
-            self.report.errors.append(str(error))
-            return
-        self.alerts.close("fetch")
-        remote = gitops.rev(self.checkout, "origin/main")
+        # A run started after a file write fetches at most once a minute; every other run fetches.
+        if not self.throttle_fetch or time.time() - self.index.last_fetch >= 60 or self.report.edits or self.report.deletions:
+            try:
+                gitops.fetch(self.checkout)
+                self.index.last_fetch = time.time()
+            except gitops.GitError as error:
+                self.alerts.raise_("fetch", f"agent-kit-sync could not fetch the config repo: {error}", "agent-kit-sync status")
+                self.report.errors.append(str(error))
+                return
+            self.alerts.close("fetch")
+        upstream = gitops.upstream(self.checkout)
+        remote = gitops.rev(self.checkout, upstream)
         local = gitops.head(self.checkout)
         if remote is None or (local and gitops.is_ancestor(self.checkout, remote, local)):
             return
@@ -575,42 +641,123 @@ class Engine:
             gitops.run(self.checkout, "reset", "-q", "--hard", remote)
             self.report.merged = True
             return
+        self._set_aside_uncommitted()
         env = gitops.identity_env(self.machine.git_identity)
-        result = gitops.run(self.checkout, "merge", "--no-edit", "--no-ff", "-q", "origin/main", check=False, env=env)
+        if gitops.is_ancestor(self.checkout, local, remote):
+            gitops.run(self.checkout, "merge", "-q", "--ff-only", upstream, env=env)
+            self.report.merged = True
+            return
+        result = gitops.run(self.checkout, "merge", "--no-edit", "-q", upstream, check=False, env=env)
         if result.returncode != 0:
-            self._resolve_conflicts()
+            if not gitops.unmerged(self.checkout):
+                gitops.run(self.checkout, "merge", "--abort", check=False)
+                self.alerts.raise_("merge", f"agent-kit-sync could not merge the config repo: {result.stdout.decode('utf-8', 'replace').strip()[-300:]}", "agent-kit-sync status")
+                self.report.errors.append("merge failed")
+                return
+            self._resolve_conflicts(local, remote)
             gitops.run(self.checkout, "commit", "-q", "--no-verify", "--no-edit", env=env)
         self.report.merged = True
 
-    def _resolve_conflicts(self) -> None:
+    def _set_aside_uncommitted(self) -> None:
+        """Save files left uncommitted in the checkout as held changes, so they never block a merge."""
+        for entry in gitops.status_porcelain(self.checkout):
+            path = entry[3:].split(" -> ", 1)[-1]
+            data = read_or_none(self.checkout / path)
+            self.held.add(f"checkout:{path}", "checkout-edit", f"{path} was changed in the config repo checkout but failed the checks, so it was set aside before merging.", ["discard", "use-this"], {"ours": data or b""}, path=path)
+        gitops.run(self.checkout, "reset", "-q", "--hard", "HEAD", check=False)
+        gitops.run(self.checkout, "clean", "-fdq", check=False)
+
+    def _resolve_conflicts(self, local: str, remote: str) -> None:
+        restored_items = set()
         for path, code in sorted(gitops.unmerged(self.checkout).items()):
             target = self.checkout / path
             if code in ("UU", "AA"):
                 ours = gitops.run(self.checkout, "show", f":2:{path}", check=False).stdout
-                self.held.add(f"merge:{path}", "merge-conflict", f"This machine and another changed {path} in the same place. The other machine's version was kept; this machine's version is saved here.", ["discard", "use-this"], {"ours": ours}, path=path)
-                gitops.run(self.checkout, "checkout", "--theirs", "--", path)
+                if path.endswith("module.toml"):
+                    # A manifest: keep both sides' entries by taking theirs and re-adding ours that are missing.
+                    theirs = gitops.run(self.checkout, "show", f":3:{path}", check=False).stdout
+                    merged = self._union_manifest(ours, theirs)
+                    atomic_write(target, merged)
+                else:
+                    self.held.add(f"merge:{path}", "merge-conflict", f"This machine and another changed {path} in the same place. The other machine's version was kept; this machine's version is saved here.", ["discard", "use-this"], {"ours": ours}, path=path)
+                    gitops.run(self.checkout, "checkout", "--theirs", "--", path)
+                    self.report.held.append(path)
                 gitops.run(self.checkout, "add", "--", path)
-                self.report.held.append(path)
-            elif code == "UD":
+            elif code in ("UD", "DU"):
+                # One side deleted, the other edited: the edit wins and the item stays.
+                gitops.run(self.checkout, "checkout", "--ours" if code == "UD" else "--theirs", "--", path, check=False)
                 gitops.run(self.checkout, "add", "--", path)
-                self.alerts.raise_(f"kept:{path}", f"Another machine deleted {path}, which this machine had edited. The edit was kept.", "agent-kit-sync status")
-            elif code == "DU":
-                gitops.run(self.checkout, "add", "--", path)
-                self.alerts.raise_(f"kept:{path}", f"This machine deleted {path}, which another machine had edited. The edit was kept.", "agent-kit-sync status")
+                parts = PurePosixPath(path).parts
+                if len(parts) >= 2 and parts[0] == "modules":
+                    restored_items.add(parts[1])
+                who = "Another machine" if code == "UD" else "This machine"
+                self.alerts.raise_(f"kept:{path}", f"{who} deleted {path}, which the other machine had edited. The edit was kept, and the item stays.", "agent-kit-sync status")
             else:
                 if target.exists():
                     gitops.run(self.checkout, "rm", "-q", "--", path)
                 else:
                     gitops.run(self.checkout, "rm", "-q", "--cached", "--", path, check=False)
+        for module in restored_items:
+            self._restore_manifest_entries(module, local, remote)
+
+    def _union_manifest(self, ours: bytes, theirs: bytes) -> bytes:
+        """Take the other machine's module.toml and add back any entries only this machine has."""
+        text = theirs.decode("utf-8")
+        mine = ours.decode("utf-8")
+        for array in ("sections", "skills", "agents", "hooks", "settings", "files"):
+            try:
+                ours_entries = toml.loads(mine).get(array, [])
+                their_names = {e.get("name") for e in toml.loads(text).get(array, [])}
+            except toml.TOMLDecodeError:
+                return theirs
+            for entry in ours_entries:
+                name = entry.get("name")
+                if name and name not in their_names:
+                    raw = tomledit.entry_text(mine, array, name)
+                    if raw:
+                        text = tomledit.append_entry_text(text, raw)
+        return text.encode("utf-8")
+
+    def _restore_manifest_entries(self, module: str, local: str, remote: str) -> None:
+        """Put back module.toml entries for items whose files the merge kept because of an edit."""
+        manifest_rel = f"modules/{module}/module.toml"
+        current = read_or_none(self.checkout / manifest_rel)
+        sources = [gitops.show(self.checkout, commit, manifest_rel) for commit in (local, remote)]
+        text = current.decode("utf-8") if current else 'description = ""\n'
+        for source in sources:
+            if source is None:
+                continue
+            old = source.decode("utf-8")
+            try:
+                old_data = toml.loads(old)
+                names = {(a, e.get("name")) for a in ("sections", "skills", "agents", "hooks", "settings", "files") for e in toml.loads(text).get(a, [])}
+            except toml.TOMLDecodeError:
+                continue
+            for array in ("sections", "skills", "agents", "hooks", "files"):
+                for entry in old_data.get(array, []):
+                    name = entry.get("name")
+                    rel = entry.get("file") or entry.get("dir") or entry.get("path")
+                    if name and (array, name) not in names and rel and (self.checkout / "modules" / module / rel).exists():
+                        raw = tomledit.entry_text(old, array, name)
+                        if raw:
+                            text = tomledit.append_entry_text(text, raw)
+                            names.add((array, name))
+        atomic_write(self.checkout / manifest_rel, text.encode("utf-8"))
+        gitops.run(self.checkout, "add", "--", manifest_rel)
+        kit = self.checkout / "kit.toml"
+        kit_text = kit.read_text(encoding="utf-8") if kit.exists() else "format = 1\n"
+        if module not in {m.get("name") for m in toml.loads(kit_text).get("modules", [])}:
+            atomic_write(kit, tomledit.append_entry(kit_text, "modules", {"name": module}).encode("utf-8"))
+            gitops.run(self.checkout, "add", "--", "kit.toml")
 
     def push(self) -> None:
         local = gitops.head(self.checkout)
-        remote = gitops.rev(self.checkout, "origin/main")
-        if local is None or local == remote:
+        remote = gitops.rev(self.checkout, gitops.upstream(self.checkout))
+        if local is None or local == remote or (remote and gitops.is_ancestor(self.checkout, local, remote)):
             return
         for attempt in range(2):
             try:
-                if gitops.push(self.checkout):
+                if gitops.push(self.checkout, gitops.branch(self.checkout)):
                     self.report.pushed = True
                     self.record.data["pushed"] = True
                     self.alerts.close("push")
@@ -649,8 +796,8 @@ class Engine:
                         trees[item.key] = old[1]
                     continue
                 fingerprint = item_fingerprint(module, item, tree)
-                if item.key in self.report.edits:
-                    kept.append(item)  # This machine's own edit, carried back in this run.
+                if item.key in self.report.edits or (self.forced(item.key) and self.index.approvals.get("outgoing:" + item.key)):
+                    kept.append(item)  # This machine's own edit, carried back or approved in this run.
                     continue
                 approved = self.index.approvals.get(item.key) == fingerprint
                 if info is None or "fp" not in info:
@@ -727,17 +874,28 @@ class Engine:
             return trees.get(item.key) or Tree(module.root)
 
         plan = Planner(self.layout, self.machine, effective, tree_for).build()
+        self.failed_modules = set(plan.failed)
         for error in plan.errors:
             self.report.errors.append(error)
-        self.index.hooks = [
+        for name in plan.failed:
+            reason = next((e for e in plan.errors if e.startswith(f"module {name}:")), "")
+            self.alerts.raise_(f"module:{name}", f"agent-kit-sync could not install module {name}, so this machine keeps its previous version. {reason}", "agent-kit-sync status")
+        for name in {m.name for m in effective} - set(plan.failed):
+            self.alerts.close(f"module:{name}")
+        previous_hooks = [h for h in self.index.hooks if h["module"] in self.failed_modules]
+        self.index.hooks = previous_hooks + [
             {"module": h.module, "name": h.name, "path": str(h.path), "events": h.events, "tools": h.tools, "protocol": h.protocol,
              "args": h.args, "runtime": h.runtime, "timeout": h.timeout, "on_failure": h.on_failure, "apps": h.apps, "order": h.order}
             for h in plan.hooks]
         self._write_copies(plan)
         self._write_sections(plan)
+        self.index.save()
         self._write_settings(plan)
+        self.index.save()
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
         for module in effective:
+            if module.name in self.failed_modules:
+                continue
             for item in module.items:
                 tree = tree_for(module, item)
                 info = self.index.items.setdefault(item.key, {})
@@ -751,10 +909,13 @@ class Engine:
                 info["local"] = module.local
                 info.pop("approved", None)
         if incoming:
-            for info in self.index.items.values():
+            for key, info in self.index.items.items():
                 info.pop("force", None)
+                self.index.approvals.pop("outgoing:" + key, None)
         present = {item.key for module in effective for item in module.items}
         for item_key in list(self.index.items):
+            if item_key.split("/", 1)[0] in self.failed_modules:
+                continue
             if item_key not in present and not self.index.items[item_key].get("frozen") and not (self.restoring and self.index.items[item_key].get("adopted")):
                 del self.index.items[item_key]
         self.index.save()
@@ -846,7 +1007,9 @@ class Engine:
             atomic_write(backup, current)
 
     def _remove_stale(self, wanted: Set[str], plan: Plan) -> None:
-        stale = [key for key in self.index.copies if key not in wanted and not self.frozen(self.index.copies[key]["item_key"])]
+        failed = set(plan.failed)
+        stale = [key for key in self.index.copies if key not in wanted and not self.frozen(self.index.copies[key]["item_key"])
+                 and self.index.copies[key]["item_key"].split("/", 1)[0] not in failed]
         for copy_key in stale:
             entry = self.index.copies[copy_key]
             path = Path(entry["path"])
@@ -899,6 +1062,9 @@ class Engine:
             except sections.MarkerError:
                 continue
             desired = {block.key: block.content for block in by_app.get(app, [])}
+            for entry in self.index.blocks.values():
+                if entry["app"] == app and entry["key"].split("/", 1)[0] in getattr(self, "failed_modules", set()) and entry["key"] in present:
+                    desired.setdefault(entry["key"], present[entry["key"]])
             for key in frozen_keys:
                 if key in present:
                     desired.setdefault(key, present[key])
@@ -923,9 +1089,14 @@ class Engine:
             new_text = sections.apply(text, desired, managed, unwrap)
             if new_text != text:
                 self.record.file(real(path), raw, kind="instructions")
+                # Record what is about to be written, so a crash between the write and the index save
+                # is finished by the next run instead of being read as an edit.
+                pending = {f"{app}|{block.key}": sha256(block.content.encode("utf-8")) for block in by_app.get(app, [])}
+                self.journal.begin([{"path": str(real(path)), "hash": sha256(new_text.encode("utf-8")), "blocks": pending, "app": app}])
                 try:
                     atomic_write(path, new_text.encode("utf-8"), expect=sha256(raw) if raw is not None else None)
                 except ChangedUnderneath:
+                    self.journal.finish()
                     continue
             for key in list(self.index.blocks):
                 if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired:
@@ -934,6 +1105,8 @@ class Engine:
                 if block.key in skip:
                     continue
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
+            self.index.save()
+            self.journal.finish()
             self._size_alert(app, path, new_text)
 
     def _size_alert(self, app: str, path: Path, text: str) -> None:
@@ -964,6 +1137,8 @@ class Engine:
             if setting_key in wanted:
                 continue
             entry = self.index.settings[setting_key]
+            if entry["item_key"].split("/", 1)[0] in getattr(self, "failed_modules", set()):
+                continue
             path = Path(entry["path"])
             current = settings.read_value(path, entry["key"])
             if json.dumps(current, default=str) == json.dumps(entry.get("written"), default=str):

@@ -12,6 +12,16 @@ try:
         terms = [line.strip() for line in handle if line.strip() and not line.startswith("#")]
 except OSError:
     sys.exit(0)
+names = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=AM", "-z"], stdout=subprocess.PIPE, check=True).stdout.decode("utf-8", "replace").split("\0")
+cache = [n for n in names if n.endswith((".pyc", ".pyo")) or "__pycache__/" in n]
+if cache:
+    sys.stderr.write("This commit adds Python cache files, which hold this machine's paths: " + ", ".join(cache[:5]) + "\n")
+    sys.exit(1)
+binary = subprocess.run(["git", "diff", "--cached", "--numstat", "--diff-filter=AM"], stdout=subprocess.PIPE, check=True).stdout.decode("utf-8", "replace")
+flagged = [line.split("\t", 2)[2] for line in binary.splitlines() if line.startswith("-\t-\t")]
+if flagged:
+    sys.stderr.write("This commit adds binary files the term check cannot read: " + ", ".join(flagged[:5]) + "\nCheck them by hand, then commit with --no-verify.\n")
+    sys.exit(1)
 diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color"], stdout=subprocess.PIPE, check=True).stdout.decode("utf-8", "replace")
 added = [line[1:] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
 found = set()

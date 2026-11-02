@@ -16,7 +16,7 @@ WINDOWS = sys.platform.startswith("win")
 
 
 class ChangedUnderneath(Exception):
-    """The file changed between reading it and replacing it."""
+    """The file changed between reading it and replacing it, or another process holds it open."""
 
 
 def sha256(data: bytes) -> str:
@@ -100,7 +100,10 @@ def atomic_write(path, data: bytes, *, executable: Optional[bool] = None, expect
             current_hash = None if current is None else sha256(current)
             if current_hash != expect:
                 raise ChangedUnderneath(str(target))
-        replace_with_retry(tmp, target)
+        try:
+            replace_with_retry(tmp, target)
+        except PermissionError as error:
+            raise ChangedUnderneath(f"{target} is open in another program: {error}") from None
     finally:
         if tmp.exists():
             tmp.unlink()

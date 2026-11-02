@@ -50,9 +50,14 @@ def run_module_tests(layout, only: Optional[str] = None) -> int:
     from .engine import Engine
     engine = Engine(layout)
     _inv, modules = engine.load_modules()
+    from .state import Held
+    held_items = {e.get("item_key") for e in Held(layout).all() if e["kind"] in ("new-item", "incoming")}
     failures = 0
     for module in modules:
         if only and module.name != only:
+            continue
+        if any(item.key in held_items for item in module.items):
+            sys.stdout.write(f"skipped: {module.name} (held for approval)\n")
             continue
         for item in module.of("hook"):
             for rel in item.data.get("tests", []):

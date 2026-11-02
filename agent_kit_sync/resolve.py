@@ -75,6 +75,9 @@ def _edit(layout, machine, index, entry, choice):
                     prune_empty_dirs(target.parent, root)
             else:
                 atomic_write(target, blob)
+        # Rewrite this machine's installed copies from the approved source and refresh the index,
+        # so the approved edit is not seen as a new edit on the next run.
+        index.items.setdefault(item_key, {})["force"] = True
         index.approvals["outgoing:" + item_key] = "1"
         return f"Approved the edit to {item_key}; it is committed and pushed at the next sync."
     if choice == "retry":

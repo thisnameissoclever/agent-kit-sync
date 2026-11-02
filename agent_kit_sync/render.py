@@ -342,6 +342,8 @@ def carry_back_agent_codex(source: str, old_render: str, edited: str, values: Va
             continue
         if old.get(field_name) == new.get(field_name):
             continue
+        if field_name in new and not isinstance(new[field_name], (str, int, float, bool)):
+            raise RenderError(f"the Codex field {field_name} is not a single value; agent-kit-sync syncs only text, numbers, and true or false")
         if field_name in by_field:
             key, first = by_field[field_name]
             if field_name not in new:

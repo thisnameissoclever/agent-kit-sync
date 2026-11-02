@@ -85,6 +85,7 @@ class Plan:
     hooks: List[HookSpec] = field(default_factory=list)
     skipped: Dict[str, str] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
+    failed: List[str] = field(default_factory=list)   # modules that could not be rendered
 
     def instruction_files(self, machine: Machine) -> Dict[str, Path]:
         return {app: machine.app_homes[app] / name for app, name in INSTRUCTION_FILES.items() if app in machine.apps}
@@ -94,13 +95,33 @@ def runtimes_available() -> Dict[str, bool]:
     return {"python": True, "node": shutil.which("node") is not None, "bash": shutil.which("bash") is not None, "powershell": shutil.which("pwsh") is not None or shutil.which("powershell") is not None}
 
 
-def is_code_path(rel: str, kind: str) -> bool:
-    if kind in ("hook",):
+TEXT_SUFFIXES = (".md", ".markdown")
+AGENT_CODE_KEYS = ("hooks", "mcpServers", "mcp_servers", "permissionMode", "permission_mode", "sandbox_mode", "tools", "disallowedTools")
+
+
+def is_code_path(rel: str, kind: str, data: Optional[bytes] = None, executable: bool = False) -> bool:
+    """Code is anything that can run or widen what an agent may do: everything except Markdown text."""
+    if kind == "hook" or executable:
+        return True
+    if data is not None and data.startswith(b"#!"):
         return True
     suffix = PurePosixPath(rel).suffix.lower()
-    if kind == "skill":
-        return suffix not in (".md", ".txt", ".rst", "")
+    if kind in ("skill", "file"):
+        return suffix not in TEXT_SUFFIXES
     return suffix in CODE_SUFFIXES
+
+
+def agent_is_code(source: bytes) -> bool:
+    """A subagent definition is code when its header can run commands or change permissions."""
+    import re as _re
+    text = source.decode("utf-8", "replace")
+    if "{{kit.hook " in text:
+        return True
+    header = text.split("\n---", 1)[0] if text.startswith("---") else ""
+    for key in AGENT_CODE_KEYS:
+        if _re.search(r"^(?:[a-z]+\.)?" + _re.escape(key) + r"\s*:", header, _re.M):
+            return True
+    return False
 
 
 def is_code_setting(app: str, key: str) -> bool:
@@ -200,10 +221,14 @@ class Planner:
             if reason is not None:
                 plan.skipped[module.name] = reason
                 continue
+            before = (len(plan.copies), len(plan.sections), len(plan.settings), len(plan.hooks))
             try:
                 self._module(plan, module, order)
-            except (render.RenderError, OSError, ValueError) as error:
+            except (render.RenderError, OSError, ValueError, UnicodeDecodeError) as error:
+                # Drop whatever this module planned, so the engine keeps its previous copies.
+                del plan.copies[before[0]:], plan.sections[before[1]:], plan.settings[before[2]:], plan.hooks[before[3]:]
                 plan.errors.append(f"module {module.name}: {error}")
+                plan.failed.append(module.name)
                 plan.skipped[module.name] = f"error: {error}"
         return plan
 
@@ -285,7 +310,7 @@ class Planner:
                 plan.copies.append(Copy(
                     key=f"{app}|{item.key}|{rel}", app=app, module=module.name, item=item.name, kind="skill",
                     path=dest / Path(*PurePosixPath(rel).parts), source_rel=f"{rel_dir}/{rel}", data=data,
-                    executable=executable, render_kind=kind, code=is_code_path(rel, "skill"), local=module.local,
+                    executable=executable, render_kind=kind, code=is_code_path(rel, "skill", raw, executable), local=module.local,
                 ))
 
     def _agent(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
@@ -294,7 +319,7 @@ class Planner:
         if raw is None:
             raise render.RenderError(f"subagent {item.name} file {rel} is missing")
         source = raw.decode("utf-8")
-        has_hooks = "{{kit.hook " in source
+        has_hooks = agent_is_code(raw)
         for app in apps:
             dest = agent_dest(self.machine, app, item.name)
             if dest is None:

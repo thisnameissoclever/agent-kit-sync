@@ -25,7 +25,6 @@ def git_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         "GCM_INTERACTIVE": "never",
         "GIT_ASKPASS": "",
         "SSH_ASKPASS": "",
-        "GIT_SSH_COMMAND": env.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes",
         "LC_ALL": "C",
     })
     env.pop("GIT_DIR", None)
@@ -40,7 +39,14 @@ def run(repo: Optional[Path], *args: str, timeout: int = LOCAL_TIMEOUT, check: b
     cmd = ["git"]
     if repo is not None:
         cmd += ["-C", str(repo)]
-    cmd += ["-c", "core.autocrlf=false", "-c", "core.longpaths=true", "-c", "core.quotepath=false", *args]
+    cmd += ["-c", "core.autocrlf=false", "-c", "core.longpaths=true", "-c", "core.quotepath=false", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args]
+    if args and args[0] in ("fetch", "push", "clone", "ls-remote", "pull") and "GIT_SSH_COMMAND" not in os.environ:
+        configured = None
+        if repo is not None:
+            found = subprocess.run(["git", "-C", str(repo), "config", "--get", "core.sshCommand"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            configured = found.stdout.decode().strip() or None
+        env = dict(env or {})
+        env["GIT_SSH_COMMAND"] = (configured or "ssh") + " -o BatchMode=yes"
     try:
         result = subprocess.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if input_bytes is None else subprocess.PIPE, timeout=timeout, env=git_env(env), stdin=None if input_bytes is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -108,7 +114,7 @@ def commit_all(repo: Path, message: str, identity: Dict[str, str], paths: Option
     name = identity.get("name") or "agent-kit-sync"
     email = identity.get("email") or "agent-kit-sync@localhost"
     env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
-    run(repo, "commit", "-q", "--no-verify", "-m", message, env=env)
+    run(repo, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message, env=env)
     return head(repo)
 
 
@@ -124,6 +130,21 @@ def has_remote(repo: Path, name: str = "origin") -> bool:
 
 def fetch(repo: Path, remote: str = "origin") -> None:
     run(repo, "fetch", "--quiet", "--prune", remote, timeout=NETWORK_TIMEOUT)
+
+
+def branch(repo: Path) -> str:
+    """The checkout's current branch, or main when it has none yet."""
+    result = run(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    name = result.stdout.decode().strip()
+    return name or "main"
+
+
+def upstream(repo: Path) -> str:
+    """The remote-tracking ref for the current branch, such as origin/main."""
+    name = branch(repo)
+    result = run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    found = result.stdout.decode().strip()
+    return found if result.returncode == 0 and found else f"origin/{name}"
 
 
 def push(repo: Path, branch: str = "main", remote: str = "origin") -> bool:

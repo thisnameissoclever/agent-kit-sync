@@ -47,8 +47,19 @@ def cmd_sync(args, layout: Layout) -> int:
         if not args.background:
             say("Another agent-kit-sync run is in progress; it will run again when it finishes.")
         return 0
-    except ConfigError as error:
-        say(f"agent-kit-sync: {error}")
+    except Exception as error:  # Every failure must reach the user, not only the log.
+        import traceback
+        from .state import Alerts
+        detail = f"{type(error).__name__}: {error}"
+        try:
+            Alerts(layout).raise_("run", f"An agent-kit-sync sync failed: {detail[:300]}. The full error is in {layout.logs / 'sync-background.log'}.", "agent-kit-sync sync")
+            from .notify import notify
+            notify("agent-kit-sync", f"A sync failed: {detail[:150]}")
+        except Exception:
+            pass
+        sys.stderr.write(traceback.format_exc())
+        if not args.background:
+            say(f"agent-kit-sync: {detail}")
         return 2
 
 
@@ -77,7 +88,7 @@ def _one_run(args, layout: Layout) -> int:
     machine = load_machine(layout)
     alerts = Alerts(layout)
     network = not args.offline
-    if not machine.cloud:
+    if not machine.cloud and not getattr(args, "quiet_wait", False):
         outcome, detail = update(layout, machine.policy.get("tool_updates", "apply"), network)
         if outcome == "failed":
             alerts.raise_("tool-update", f"An agent-kit-sync update failed its self-test, so this machine stays on the version it has. {detail[-200:]}", "agent-kit-sync status")
@@ -85,9 +96,14 @@ def _one_run(args, layout: Layout) -> int:
             alerts.raise_("tool-update", f"agent-kit-sync version {detail} is available. This machine's policy asks before updating.", "agent-kit-sync update --apply")
         elif outcome in ("updated", "current"):
             alerts.close("tool-update")
+            _offline_count(layout, reset=True)
+        if outcome == "offline" and network and _offline_count(layout) >= 20:
+            alerts.raise_("tool-update", f"agent-kit-sync has not reached its own repository in 20 runs, so it is not updating. {detail[-200:]}", "agent-kit-sync doctor")
     before = {alert["id"] for alert in alerts.open()}
     engine = Engine(layout)
+    engine.throttle_fetch = bool(getattr(args, "quiet_wait", False))
     report = engine.run(network=network)
+    alerts.close("run")
     try:
         changed = register(layout, engine.machine, engine.index.hooks)
         if changed.get("codex"):
@@ -102,6 +118,20 @@ def _one_run(args, layout: Layout) -> int:
         for alert in alerts.open():
             say(f"Alert: {alert['message']}")
     return 1 if report.errors else 0
+
+
+def _offline_count(layout: Layout, reset: bool = False) -> int:
+    path = layout.state / "tool-offline"
+    try:
+        count = 0 if reset else int(path.read_text() or "0") + 1
+    except (OSError, ValueError):
+        count = 0 if reset else 1
+    try:
+        layout.state.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(count))
+    except OSError:
+        pass
+    return count
 
 
 def _print_report(report) -> None:
