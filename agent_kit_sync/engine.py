@@ -115,6 +115,9 @@ class Engine:
         inventory = load_inventory(self.checkout) if (self.checkout / "kit.toml").is_file() else None
         modules = list(inventory.modules) if inventory else []
         modules += load_local_modules(self.layout)
+        builtin = Path(__file__).resolve().parent.parent / "kit"
+        if (builtin / "module.toml").is_file():
+            modules.append(load_module(builtin, "agent-kit-sync", local=True, source="builtin"))
         names = [module.name for module in modules]
         duplicates = {name for name in names if names.count(name) > 1}
         if duplicates:
@@ -147,9 +150,16 @@ class Engine:
         self.install(modules, incoming=True)
         if network and gitops.has_remote(self.checkout) and not self.machine.cloud:
             self.push()
+        self.refresh_signatures()
         self.index.save()
         self.record.save()
         return self.report
+
+    def refresh_signatures(self) -> None:
+        """Save each installed copy's size and modification time, which the dispatcher compares cheaply."""
+        for entry in self.index.copies.values():
+            current = read_or_none(Path(entry["path"]))
+            entry["sig"] = stat_signature(entry["path"]) if current is not None and sha256(current) == entry["hash"] else None
 
     # ------------------------------------------------------------ crash recovery
 
@@ -169,6 +179,9 @@ class Engine:
 
     # ------------------------------------------------------------ finding local edits
 
+    def forced(self, item_key: str) -> bool:
+        return bool(self.index.items.get(item_key, {}).get("force"))
+
     def frozen(self, item_key: str) -> bool:
         info = self.index.items.get(item_key, {})
         frozen = info.get("frozen")
@@ -182,7 +195,7 @@ class Engine:
         changes: List[LocalChange] = []
         for copy_key, entry in sorted(self.index.copies.items()):
             item_key = entry["item_key"]
-            if self.frozen(item_key):
+            if self.frozen(item_key) or self.forced(item_key):
                 continue
             path = Path(entry["path"])
             current = read_or_none(path)
@@ -201,7 +214,7 @@ class Engine:
                 continue
             self.alerts.close(f"markers:{app}")
             for block_key, entry in sorted(self.index.blocks.items()):
-                if entry["app"] != app or self.frozen(entry["item_key"]):
+                if entry["app"] != app or self.frozen(entry["item_key"]) or self.forced(entry["item_key"]):
                     continue
                 module, item = entry["item_key"].split("/", 1)
                 if entry["key"] not in blocks:
@@ -210,6 +223,8 @@ class Engine:
                 elif sha256(blocks[entry["key"]].encode("utf-8")) != entry["hash"]:
                     changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, blocks[entry["key"]].encode("utf-8")))
         for setting_key, entry in sorted(self.index.settings.items()):
+            if entry.get("force") or (entry.get("held") and self.held.find(entry["held"])):
+                continue
             path = Path(entry["path"])
             try:
                 current = settings.read_value(path, entry["key"])
@@ -307,6 +322,8 @@ class Engine:
                 self._hold_edit(module, item, item_changes, f"agent-kit-sync could not carry this edit back exactly: {error}")
 
     def _carry_item(self, module: Module, item: Item, changes: List[LocalChange]) -> None:
+        if module.source == "builtin":
+            raise render.RenderError("this item comes with agent-kit-sync itself; put local changes in an override instead")
         for change in changes:
             if change.kind != "setting":
                 self.carried[change.copy_key] = sha256(change.new) if change.new is not None else None
@@ -635,8 +652,9 @@ class Engine:
                 if item.key in self.report.edits:
                     kept.append(item)  # This machine's own edit, carried back in this run.
                     continue
+                approved = self.index.approvals.get(item.key) == fingerprint
                 if info is None or "fp" not in info:
-                    if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new:
+                    if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new or approved:
                         kept.append(item)
                         continue
                     self._hold_incoming(item, "new-item", f"{item.key} is new from the config repo.", head, item_is_code(module, item, tree))
@@ -646,7 +664,7 @@ class Engine:
                     continue
                 code = item_is_code(module, item, tree)
                 policy = self.machine.policy["code_changes" if code else "other_changes"]
-                if policy == "apply" or info.get("approved") == fingerprint:
+                if policy == "apply" or approved:
                     kept.append(item)
                     continue
                 old = self._item_at(module, item.name, info["commit"])
@@ -663,15 +681,17 @@ class Engine:
         for item_key, info in list(self.index.items.items()):
             if item_key in present or "commit" not in info or info.get("local") or item_key in self.report.deletions:
                 continue
-            policy = self.machine.policy["other_changes"]
-            if policy == "apply":
-                continue
             module_name, item_name = item_key.split("/", 1)
+            pin = self.machine.overrides.get(item_key) or self.machine.overrides.get(module_name)
+            pinned = bool(pin and pin.get("kind") == "pin" and pin.get("commit"))
+            if self.machine.policy["other_changes"] == "apply" and not pinned:
+                continue
             module = next((m for m in result if m.name == module_name), None)
-            old = self._item_at(Module(module_name, self.checkout / "modules" / module_name, False), item_name, info["commit"])
+            old = self._item_at(Module(module_name, self.checkout / "modules" / module_name, False), item_name, pin["commit"] if pinned else info["commit"])
             if old is None:
                 continue
-            self._hold_incoming_raw(item_key, "removal", f"{item_key} was removed from the config repo.", head, False)
+            if not pinned:
+                self._hold_incoming_raw(item_key, "removal", f"{item_key} was removed from the config repo.", head, False)
             if module is None:
                 module = Module(module_name, self.checkout / "modules" / module_name, False)
                 result.append(module)
@@ -723,10 +743,16 @@ class Engine:
                 info = self.index.items.setdefault(item.key, {})
                 if item.key in trees and not module.local:
                     continue
-                info["fp"] = item_fingerprint(module, item, tree)
+                fingerprint = item_fingerprint(module, item, tree)
+                if incoming and info.get("fp") and info["fp"] != fingerprint and info.get("commit") and item.key not in self.report.edits:
+                    self.record.data["incoming"][item.key] = info["commit"]
+                info["fp"] = fingerprint
                 info["commit"] = head
                 info["local"] = module.local
                 info.pop("approved", None)
+        if incoming:
+            for info in self.index.items.values():
+                info.pop("force", None)
         present = {item.key for module in effective for item in module.items}
         for item_key in list(self.index.items):
             if item_key not in present and not self.index.items[item_key].get("frozen"):
@@ -755,6 +781,8 @@ class Engine:
             expected = entry["hash"] if entry else None
             if copy.key in self.carried:
                 expected = self.carried[copy.key]
+            if self.forced(f"{copy.module}/{copy.item}") and current is not None:
+                expected = sha256(current)
             if entry is not None and current is not None and sha256(current) != expected:
                 continue  # Edited since this run started; the next run carries it back.
             if current == copy.data:
@@ -789,7 +817,7 @@ class Engine:
         found: Set[str] = set()
         for copy in wanted.values():
             group = f"{copy.app}|{copy.module}/{copy.item}"
-            if copy.key in self.index.copies or group in self.replace_existing or copy.app == "kit":
+            if copy.key in self.index.copies or group in self.replace_existing or self.index.approvals.get("replace:" + group) or copy.app == "kit":
                 continue
             current = read_or_none(copy.path)
             if current is not None and current != copy.data:
@@ -877,6 +905,8 @@ class Engine:
                     continue
                 found = sha256(present[entry["key"]].encode("utf-8"))
                 expected = self.carried.get(block_key, entry["hash"]) if block_key in self.carried else entry["hash"]
+                if self.forced(entry["item_key"]):
+                    expected = found
                 if found != expected:
                     desired[entry["key"]] = present[entry["key"]]
                     skip.add(entry["key"])
@@ -929,7 +959,10 @@ class Engine:
             current = settings.read_value(path, entry["key"])
             if json.dumps(current, default=str) == json.dumps(entry.get("written"), default=str):
                 replaced = entry.get("replaced", None)
-                self._change_setting(path, entry["key"], settings.MISSING if entry.get("was_missing") else replaced)
+                if entry.get("was_missing"):
+                    self._change_setting(path, entry["key"], settings.MISSING)
+                elif replaced is not None and json.dumps(replaced, default=str) != json.dumps(current, default=str):
+                    self._change_setting(path, entry["key"], replaced)
             del self.index.settings[setting_key]
 
     def _apply_setting(self, path: Path, key: str, value, mode: str, setting_key: str, item_key: str, app: str, entry: Optional[dict]) -> None:
@@ -939,11 +972,14 @@ class Engine:
             self.alerts.raise_(f"settings:{path}", f"agent-kit-sync cannot read {path}: {error}", "agent-kit-sync status")
             return
         desired = settings.desired_value(None if current is settings.MISSING else current, value, mode)
+        if entry is not None and not entry.get("force") and current is not settings.MISSING and json.dumps(current, sort_keys=True, default=str) != json.dumps(entry.get("written"), sort_keys=True, default=str):
+            return  # Changed by something else and not yet decided; find_local_changes holds it.
         if current is not settings.MISSING and settings.satisfied(current, value, mode):
             if entry is None:
                 self.index.settings[setting_key] = {"app": app, "key": key, "path": str(path), "item_key": item_key, "written": current, "was_missing": False, "replaced": current}
             else:
                 entry["written"] = current
+                entry.pop("force", None)
             return
         if not self._change_setting(path, key, desired):
             return
@@ -966,9 +1002,13 @@ class Engine:
                 return False
             if new_text == text:
                 return True
-            self.record.file(real(path), raw, kind="settings")
+            try:
+                old_value = settings.read_value(path, key)
+            except settings.SettingsError:
+                old_value = settings.MISSING
             try:
                 atomic_write(path, new_text.encode("utf-8"), expect=sha256(raw) if raw is not None else None)
+                self.record.data.setdefault("settings", []).append({"path": str(path), "key": key, "missing": old_value is settings.MISSING, "old": None if old_value is settings.MISSING else old_value})
                 return True
             except ChangedUnderneath:
                 time.sleep(0.05)
