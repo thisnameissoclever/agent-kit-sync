@@ -224,6 +224,8 @@ class InstalledToolTests(TwoMachines):
         self.assertTrue(wrapper.is_file())
         result = subprocess.run(cmd, stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home)), timeout=30)
         self.assertEqual(result.returncode, 0)
+        from agent_kit_sync import VERSION
+        self.assertIn(VERSION, result.stdout.decode())
         self.assertTrue(self.a.path(".agents", "skills", "agent-kit-sync-setup", "SKILL.md").is_file())
 
     def test_doctor_and_status(self):

@@ -29,8 +29,11 @@ def remove_tree(path) -> None:
     import stat
 
     def clear_and_retry(function, target, _info):
-        os.chmod(target, stat.S_IWRITE)
-        function(target)
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            function(target)
+        except FileNotFoundError:
+            pass
 
     if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=clear_and_retry)
@@ -125,7 +128,11 @@ class TwoMachines(unittest.TestCase):
         self.seed = seed
 
     def tearDown(self):
-        remove_tree(self.tmp) if self.tmp.exists() else None
+        if self.tmp.exists():
+            try:
+                remove_tree(self.tmp)
+            except OSError:
+                shutil.rmtree(self.tmp, ignore_errors=True)
 
     def seed_files(self, files: dict, message="seed"):
         for rel, text in files.items():
