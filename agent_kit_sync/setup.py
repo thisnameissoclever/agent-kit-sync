@@ -24,6 +24,7 @@ from . import VERSION, gitops, toml
 from .fsutil import atomic_write, read_or_none
 from .paths import APPS, Layout, detect_apps, os_name
 
+re_network = re.compile(r"^(?:https?://|ssh://|git://|[\w.-]+@[\w.-]+:)")
 SKIP_FOLDERS = {"node_modules", ".git", "Library", "AppData", ".Trash", ".cache", "Applications", "Pictures", "Music", "Movies"}
 
 
@@ -97,7 +98,12 @@ def init(args, layout: Layout) -> int:
 
 
 def public_check(url: str) -> bool:
-    """True when the repository can be read with every saved credential turned off."""
+    """True when a hosted repository can be read with every saved credential turned off.
+
+    A folder on this machine is never public, so only network addresses are checked.
+    """
+    if not re_network.match(url):
+        return False
     env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
     result = gitops.run(None, "-c", "credential.helper=", "ls-remote", "--heads", url, check=False, timeout=30, env=env)
     return result.returncode == 0

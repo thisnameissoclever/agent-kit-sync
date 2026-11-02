@@ -755,7 +755,7 @@ class Engine:
                 info.pop("force", None)
         present = {item.key for module in effective for item in module.items}
         for item_key in list(self.index.items):
-            if item_key not in present and not self.index.items[item_key].get("frozen"):
+            if item_key not in present and not self.index.items[item_key].get("frozen") and not (self.restoring and self.index.items[item_key].get("adopted")):
                 del self.index.items[item_key]
         self.index.save()
 
@@ -911,7 +911,13 @@ class Engine:
                     desired[entry["key"]] = present[entry["key"]]
                     skip.add(entry["key"])
             managed = [entry["key"] for entry in self.index.blocks.values() if entry["app"] == app] + list(desired)
-            new_text = sections.apply(text, desired, managed)
+            unwrap = []
+            if self.restoring:
+                for entry in self.index.blocks.values():
+                    adopted = self.index.items.get(entry["item_key"], {}).get("adopted", [])
+                    if entry["app"] == app and str(path) in adopted:
+                        unwrap.append(entry["key"])
+            new_text = sections.apply(text, desired, managed, unwrap)
             if new_text != text:
                 self.record.file(real(path), raw, kind="instructions")
                 try:

@@ -67,12 +67,14 @@ def _ensure_newline(content: str) -> str:
     return content if content.endswith("\n") or content == "" else content + "\n"
 
 
-def apply(text: str, desired: Dict[str, str], managed: List[str]) -> str:
+def apply(text: str, desired: Dict[str, str], managed: List[str], unwrap: Optional[List[str]] = None) -> str:
     """Return the file with each desired block written and each managed, undesired block removed.
 
     `desired` maps keys to content in the order new blocks are added. `managed` lists every
-    key this tool may remove; blocks with other keys are left alone.
+    key this tool may remove; blocks with other keys are left alone. Blocks in `unwrap` lose
+    their markers but keep their text, for text that was the user's before it was synced.
     """
+    unwrap = unwrap or []
     lines, blocks = parse(text)
     present = {block.key: block for block in blocks}
     out: List[str] = []
@@ -84,6 +86,8 @@ def apply(text: str, desired: Dict[str, str], managed: List[str]) -> str:
             out.append(lines[block.begin])
             out.append(_ensure_newline(desired[block.key]))
             out.append(lines[block.end])
+        elif block.key in unwrap:
+            out.extend(lines[block.begin + 1:block.end])
         elif block.key not in managed:
             out.extend(lines[block.begin:block.end + 1])
         else:

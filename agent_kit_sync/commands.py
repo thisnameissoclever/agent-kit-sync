@@ -184,6 +184,11 @@ def cmd_add(args, layout: Layout) -> int:
         backup = layout.state / "backups" / ("adopted-" + time.strftime("%Y%m%d-%H%M%S") + "-" + source.name)
         atomic_write(backup, original.encode("utf-8"))
         atomic_write(source, sections.adopt(original, start, stop, f"{args.module}/{name}").encode("utf-8"))
+        from .state import Index
+        index = Index(layout)
+        adopted = index.items.setdefault(f"{args.module}/{name}", {})
+        adopted.setdefault("adopted", []).append(str(source))
+        index.save()
     else:
         name = args.name or slug(source.name)
         rel = f"files/{source.name}"
