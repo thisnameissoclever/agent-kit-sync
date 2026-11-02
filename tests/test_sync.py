@@ -248,5 +248,121 @@ class AdoptionTests(TwoMachines):
         self.assertIn("Read the draft", a.read(".agents", "skills", "review", "SKILL.md"))
 
 
+class ReviewRegressionTests(TwoMachines):
+    def test_merges_do_not_create_endless_commits(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        path = a.path(".claude", "skills", "review", "SKILL.md")
+        a.write(path, path.read_text() + "More.\n")
+        a.sync()
+        for _ in range(3):
+            b.sync()
+            a.sync()
+        count = int(git(self.remote, "rev-list", "--count", "main").strip())
+        self.assertLessEqual(count, 3)
+
+    def test_skill_script_change_is_held_as_code(self):
+        self.standard_config()
+        self.seed_files({"modules/writing/skills/review/run": "#!/bin/sh\necho hi\n"}, "script")
+        a = self.machine("a")
+        b = self.machine("b", policy={"new_items": "apply", "code_changes": "ask", "other_changes": "apply", "outgoing": "push"})
+        a.sync()
+        b.sync()
+        script = a.path(".claude", "skills", "review", "run")
+        a.write(script, "#!/bin/sh\necho changed\n")
+        a.sync()
+        engine, _report = b.sync()
+        self.assertEqual(b.read(".claude", "skills", "review", "run"), "#!/bin/sh\necho hi\n")
+        self.assertTrue([e for e in engine.held.all() if e["kind"] == "incoming"])
+
+    def test_delete_on_one_machine_and_edit_on_another_keeps_item(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        import shutil
+        shutil.rmtree(a.path(".claude", "skills", "review"))
+        a.sync()
+        path = b.path(".claude", "skills", "review", "SKILL.md")
+        b.write(path, path.read_text().replace("report problems", "report B"))
+        b.sync()
+        self.assertIn("report B", b.read(".claude", "skills", "review", "SKILL.md"))
+        self.assertIn('name = "review"', (b.layout.config / "modules/writing/module.toml").read_text())
+        a.sync()
+        self.assertIn("report B", a.read(".claude", "skills", "review", "SKILL.md"))
+
+    def test_unrenderable_module_keeps_previous_copies_and_alerts(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        agent = self.seed / "modules/writing/agents/helper.md"
+        self.seed_files({"modules/writing/agents/helper.md": "---\nname: helper\ndescription: |\n  multi\n  line\n---\nBody.\n"}, "bad")
+        engine, report = a.sync()
+        self.assertTrue(a.path(".claude", "skills", "review", "SKILL.md").exists())
+        self.assertTrue(a.path(".codex", "agents", "helper.toml").exists())
+        self.assertTrue([x for x in engine.alerts.open() if x["key"] == "module:writing"])
+
+    def test_contains_setting_tolerates_added_entries(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "perms"\n',
+            "modules/perms/module.toml": '[[settings]]\napp = "claude"\nkey = "permissions.allow"\nvalue = ["Read"]\nmode = "contains"\n',
+        })
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        data["permissions"]["allow"].append("Bash(npm test)")
+        a.write(path, json.dumps(data, indent=2))
+        engine, _report = a.sync()
+        self.assertEqual([e for e in engine.held.all() if e["kind"] == "setting"], [])
+
+    def test_codex_toml_list_field_edit_is_held_not_stringified(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".codex", "agents", "helper.toml")
+        a.write(path, path.read_text() + 'skills_config = ["a", "b"]\n')
+        engine, report = a.sync()
+        self.assertTrue(report.held)
+        self.assertNotIn("skills_config", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+    def test_variant_path_outside_module_is_rejected(self):
+        self.standard_config()
+        self.seed_files({"modules/writing/module.toml": (self.seed / "modules/writing/module.toml").read_text().replace('file = "sections/plain.md"', 'file = "sections/plain.md"\nvariants = { codex = "../../kit.toml" }')}, "traversal")
+        a = self.machine("a")
+        engine, report = a.sync()
+        self.assertTrue(report.errors)
+        self.assertNotIn("format = 1", a.read(".codex", "AGENTS.md") if a.path(".codex", "AGENTS.md").exists() else "")
+
+    def test_failing_checkout_file_does_not_block_merges(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        bad = b.layout.config / "modules/writing/skills/review/SKILL.md"
+        bad.write_text(bad.read_text() + "/Users/someone/secret\n")
+        path = a.path(".claude", "skills", "review", "SKILL.md")
+        a.write(path, path.read_text() + "From A.\n")
+        a.sync()
+        _engine, report = b.sync()
+        self.assertIn("From A.", b.read(".claude", "skills", "review", "SKILL.md"))
+        self.assertNotIn("someone", (b.layout.config / "modules/writing/skills/review/SKILL.md").read_text())
+
+    def test_append_override_on_a_skill(self):
+        self.standard_config()
+        a = self.machine("a")
+        extra = a.layout.root / "local" / "review-extra.md"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("Only on this machine.\n")
+        data = a.machine_data()
+        data.setdefault("overrides", {})["writing/review"] = {"kind": "append", "file": str(extra)}
+        a.write_machine(data)
+        a.sync()
+        self.assertIn("Only on this machine.", a.read(".claude", "skills", "review", "SKILL.md"))
+        self.assertNotIn("Only on this machine.", (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

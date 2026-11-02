@@ -202,7 +202,7 @@ tests = ["tests/test_no_rm.py"]
 
 A hook fails when it exits with a code other than 0 or 2, prints output the dispatcher cannot read, or runs past its timeout. Where an app cannot ask the user to confirm, `ask` becomes `deny` with a reason telling the agent to ask.
 
-If Python moves, such as after an upgrade, the registered commands cannot start. Run `agent-kit-sync repair` in a terminal.
+If Python moves, such as after an upgrade, the registered commands cannot start. Run `agent-kit-sync repair` in a terminal; the command falls back to any `python3` on the path, or run `python3 ~/.agent-kit-sync/launcher.py repair` directly.
 
 ## Agent settings
 
@@ -230,7 +230,7 @@ When another program changes a synced setting, agent-kit-sync holds the change a
 | `tool_updates` | `apply`, `ask`, or `pin` | `apply` |
 | `approval` | `agent` or `terminal` | `agent` |
 
-Code means anything that can run or change what agents may do without asking: hooks, scripts, non-Markdown files in skills, tests, hooks inside subagent definitions, and settings under `hooks`, `permissions`, `env`, and keys agent-kit-sync does not recognize. With the recommended values, text spreads by itself, and code moves between machines only after you approve it where it was written and where it arrives. With `approval = "terminal"`, agents cannot approve held changes; you confirm in a terminal.
+Code means anything that can run or change what agents may do without asking: hooks, scripts, non-Markdown files in skills, tests, hooks inside subagent definitions, and settings under `hooks`, `permissions`, `env`, and keys agent-kit-sync does not recognize. With the recommended values, text spreads by itself, and code moves between machines only after you approve it where it was written and where it arrives. With `approval = "terminal"`, approving a held change needs `yes` typed in an interactive terminal outside an agent session. An agent that can run commands in a terminal of its own could still type it, so treat this setting as a guard against mistakes, not against a determined agent.
 
 An override changes one module or item on this machine only:
 

@@ -108,7 +108,7 @@ def json_set(text: str, key: KeyPath, value: Any) -> str:
 
 # ---------------------------------------------------------------- TOML (Codex)
 
-HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$")
+HEADER = re.compile(r"^\s*\[\[?\s*((?:[A-Za-z0-9_-]+|\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'))*)\s*\]\]?\s*(?:#.*)?$")
 ASSIGN = re.compile(r"^\s*((?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*'))*)\s*=")
 TOML_SCALARS = (str, int, float, bool)
 
@@ -118,6 +118,13 @@ def _header_parts(raw: str) -> List[str]:
 
 
 def _key_parts(raw: str) -> List[str]:
+    try:
+        return _key_parts_strict(raw)
+    except ValueError:
+        return [raw.strip()]
+
+
+def _key_parts_strict(raw: str) -> List[str]:
     parts, buf, quote, number = [], "", None, 0
     while number < len(raw):
         char = raw[number]
@@ -199,12 +206,17 @@ def toml_set(text: str, key: KeyPath, value: Any) -> str:
     else:
         found = None
         last_assignment = start - 1
-        for number in range(start, stop):
+        number = start
+        while number < stop:
             match = ASSIGN.match(lines[number])
-            if match:
-                last_assignment = number
-                if _key_parts(match.group(1)) == [name]:
-                    found = number
+            if not match:
+                number += 1
+                continue
+            end = _value_end(lines, number, match.end(), stop)
+            if _key_parts(match.group(1)) == [name]:
+                found = number
+            last_assignment = end
+            number = end + 1
         if found is not None:
             after = lines[found][ASSIGN.match(lines[found]).end():].strip()
             if after.startswith(("[", "{", '"""', "'''")) and not _single_line_value(after):
@@ -223,6 +235,20 @@ def toml_set(text: str, key: KeyPath, value: Any) -> str:
     if toml_load(result) != expected:
         raise SettingsError(f"changing {'.'.join(parts)} would change other settings too")
     return result
+
+
+def _value_end(lines: List[str], number: int, offset: int, stop: int) -> int:
+    """The last line of the value that starts on line `number`."""
+    text = lines[number][offset:]
+    end = number
+    while end + 1 < stop:
+        try:
+            toml.loads("x = " + text)
+            return end
+        except toml.TOMLDecodeError:
+            end += 1
+            text += lines[end]
+    return end
 
 
 def _single_line_value(after: str) -> bool:

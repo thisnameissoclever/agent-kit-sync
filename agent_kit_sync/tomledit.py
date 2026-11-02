@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 
 from . import toml
 
-HEADER = re.compile(r"^\s*\[")
+HEADER = re.compile(r"^\s*\[\[?\s*[A-Za-z0-9_\"'.-][^\]]*\]\]?\s*(?:#.*)?$")
 
 
 def _entries(text: str, array: str) -> List[Tuple[int, int, dict]]:
@@ -18,7 +18,7 @@ def _entries(text: str, array: str) -> List[Tuple[int, int, dict]]:
     found = []
     number = 0
     while number < len(lines):
-        if lines[number].strip() == f"[[{array}]]":
+        if re.match(r"^\s*\[\[\s*" + re.escape(array) + r"\s*\]\]\s*(?:#.*)?$", lines[number]):
             stop = number + 1
             while stop < len(lines) and not HEADER.match(lines[stop]):
                 stop += 1

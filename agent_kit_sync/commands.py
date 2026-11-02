@@ -41,9 +41,12 @@ def write_launcher(layout: Layout) -> None:
     atomic_write(layout.launcher, template)
     python = sys.executable
     if os_name() == "windows":
-        atomic_write(layout.bin / "agent-kit-sync.cmd", f'@echo off\r\n"{python}" -I -S "{layout.launcher}" %*\r\n'.encode("utf-8"))
+        script = (f'@echo off\r\nif exist "{python}" (\r\n  "{python}" -I -S "{layout.launcher}" %*\r\n) else (\r\n'
+                  f'  py -3 -I -S "{layout.launcher}" %*\r\n)\r\n')
+        atomic_write(layout.bin / "agent-kit-sync.cmd", script.encode("utf-8"))
     else:
-        script = f'#!/bin/sh\nexec "{python}" -I -S "{layout.launcher}" "$@"\n'
+        script = (f'#!/bin/sh\nPY="{python}"\n[ -x "$PY" ] || PY=$(command -v python3 || command -v python)\n'
+                  f'exec "$PY" -I -S "{layout.launcher}" "$@"\n')
         atomic_write(layout.bin / "agent-kit-sync", script.encode("utf-8"), executable=True)
 
 
@@ -82,7 +85,9 @@ def cmd_setup(args, layout: Layout) -> int:
 def cmd_install(args, layout: Layout) -> int:
     """Install without questions, for cloud sessions and machines whose machine file already exists."""
     from .cli import cmd_sync
+    from .fsutil import private_dir
     layout.root.mkdir(parents=True, exist_ok=True)
+    private_dir(layout.root)
     ensure_tool(layout, None)
     write_launcher(layout)
     if not layout.config.exists():
@@ -188,15 +193,16 @@ def cmd_add(args, layout: Layout) -> int:
         atomic_write(root / "sections" / f"{name}.md", body.encode("utf-8"))
         text = tomledit.append_entry(text, "sections", {"name": name, "file": f"sections/{name}.md"})
         # Mark the original text in place, so the tool manages it from now on.
-        original = source.read_text(encoding="utf-8")
+        original = source.read_bytes().decode("utf-8")
         backup = layout.state / "backups" / ("adopted-" + time.strftime("%Y%m%d-%H%M%S") + "-" + source.name)
         atomic_write(backup, original.encode("utf-8"))
         atomic_write(source, sections.adopt(original, start, stop, f"{args.module}/{name}").encode("utf-8"))
-        from .state import Index
-        index = Index(layout)
-        adopted = index.items.setdefault(f"{args.module}/{name}", {})
-        adopted.setdefault("adopted", []).append(str(real(source)))
-        index.save()
+        from .state import Index, run_lock
+        with run_lock(layout, wait=60):
+            index = Index(layout)
+            adopted = index.items.setdefault(f"{args.module}/{name}", {})
+            adopted.setdefault("adopted", []).append(str(real(source)))
+            index.save()
     else:
         name = args.name or slug(source.name)
         rel = f"files/{source.name}"
@@ -217,14 +223,28 @@ def cmd_add(args, layout: Layout) -> int:
 
 
 def _section_text(path: Path, heading: str):
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines = path.read_bytes().decode("utf-8").splitlines(keepends=True)
     target = heading.strip().lstrip("#").strip()
+    fence = None
     for number, line in enumerate(lines):
+        marker = re.match(r"^\s*(```+|~~~+)", line)
+        if marker:
+            fence = None if fence and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence) else (fence or marker.group(1))
+            continue
+        if fence:
+            continue
         match = re.match(r"^(#+)\s+(.*?)\s*$", line)
         if match and match.group(2) == target:
             level = len(match.group(1))
             stop = len(lines)
+            inner = None
             for later in range(number + 1, len(lines)):
+                marker = re.match(r"^\s*(```+|~~~+)", lines[later])
+                if marker:
+                    inner = None if inner and marker.group(1)[0] == inner[0] and len(marker.group(1)) >= len(inner) else (inner or marker.group(1))
+                    continue
+                if inner:
+                    continue
                 other = re.match(r"^(#+)\s", lines[later])
                 if other and len(other.group(1)) <= level:
                     stop = later
@@ -439,7 +459,7 @@ def cmd_repair(args, layout: Layout) -> int:
 
 def cmd_undo(args, layout: Layout) -> int:
     from .model import load_machine
-    from .state import RunRecord, run_lock
+    from .state import Index, RunRecord, run_lock
     record = RunRecord.latest(layout)
     if record is None:
         say("No run to undo.")
@@ -450,6 +470,17 @@ def cmd_undo(args, layout: Layout) -> int:
         return 0
     machine = load_machine(layout)
     with run_lock(layout, wait=30):
+        own = [c for c in record["commits"] if c]
+        if own and (layout.config / ".git").exists():
+            env = gitops.identity_env(machine.git_identity)
+            for commit in reversed(own):
+                result = gitops.run(layout.config, "revert", "--no-edit", commit, env=env, check=False)
+                if result.returncode != 0:
+                    gitops.run(layout.config, "revert", "--abort", check=False)
+                    say(f"Could not reverse commit {commit[:12]}, because later changes touch the same lines. Nothing was undone; edit the files back by hand, then sync.")
+                    return 1
+        index = Index(layout)
+        touched = {str(Path(entry["path"])) for entry in record["files"]}
         for entry in reversed(record["files"]):
             path = Path(entry["path"])
             if entry.get("kind") in ("instructions", "settings"):
@@ -467,11 +498,12 @@ def cmd_undo(args, layout: Layout) -> int:
         for entry in record["files"]:
             if entry.get("kind") == "instructions" and entry.get("saved"):
                 _restore_blocks(Path(entry["path"]), Path(entry["saved"]).read_text(encoding="utf-8"))
-        own = [c for c in record["commits"] if c]
-        if own and (layout.config / ".git").exists():
-            env = gitops.identity_env(machine.git_identity)
-            for commit in reversed(own):
-                gitops.run(layout.config, "revert", "--no-edit", commit, env=env, check=False)
+        # Items this run carried back: put their edited copies back to the reversed version at the next sync.
+        for item_key in record.get("edits", []):
+            index.items.setdefault(item_key, {})["force"] = True
+        for key in [k for k, e in index.copies.items() if str(real(Path(e["path"]))) in touched or str(Path(e["path"])) in touched]:
+            index.drop_copy(key)
+        index.save()
         data = toml.load_file(layout.machine_file)
         for item_key, commit in record.get("incoming", {}).items():
             data.setdefault("overrides", {})[item_key] = {"kind": "pin", "commit": commit}
@@ -480,11 +512,6 @@ def cmd_undo(args, layout: Layout) -> int:
         saved = json.loads(marker.read_text(encoding="utf-8"))
         saved["undone"] = time.time()
         atomic_write(marker, json.dumps(saved).encode("utf-8"))
-        from .state import Index
-        index = Index(layout)
-        index.copies.clear()
-        index.blocks.clear()
-        index.save()
     say("Reversed the run. Changes it brought from other machines are pinned on this machine; run agent-kit-sync sync to push the reversal of this machine's own changes.")
     return 0
 
@@ -531,6 +558,8 @@ def cmd_uninstall(args, layout: Layout) -> int:
         engine._write_settings(plan)
         engine.index.save()
         unregister(layout, machine)
+        from .setup import restore_registrations
+        restore_registrations(layout)
     say(f"Removed agent-kit-sync from this machine. The kit folder {layout.root} is left in place; delete it yourself when you no longer need its backups and logs. Codex keeps its approval records for the removed entries until you clear them in /hooks.")
     return 0
 

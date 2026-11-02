@@ -14,7 +14,7 @@ from . import render
 SECRET_PATTERNS = [
     ("GitHub token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{60,}\b")),
     ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    ("private key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    ("private key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----")),
     ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
     ("API key", re.compile(r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}|AIza[0-9A-Za-z_-]{35})\b")),
 ]
@@ -67,14 +67,21 @@ def machine_values() -> List[str]:
     return values
 
 
-def is_text(path: str, data: bytes) -> bool:
-    if b"\0" in data[:8192]:
-        return False
+def decode_any(data: bytes) -> str:
+    """Decode text in UTF-8, UTF-16, or Latin-1, so no encoding skips the checks."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", "replace")
+    sample = data[:4096]
+    if sample and sample.count(b"\0") * 3 > len(sample):
+        for codec in ("utf-16-le", "utf-16-be"):
+            try:
+                return data.decode(codec)
+            except UnicodeDecodeError:
+                continue
     try:
-        data.decode("utf-8")
+        return data.decode("utf-8")
     except UnicodeDecodeError:
-        return False
-    return True
+        return data.decode("latin-1")
 
 
 def _word(term: str) -> re.Pattern:
@@ -145,9 +152,11 @@ class Checker:
         findings: List[Finding] = []
         if PurePosixPath(path).suffix == ".py":
             findings += self.python_findings(path, data)
-        if not is_text(path, data):
-            return findings
-        text = data.decode("utf-8")
+        text = decode_any(data)
+        if "\0" in text:
+            # Binary: look for blocked terms and secrets in the printable runs only.
+            text = "\n".join(re.findall(r"[\x20-\x7e]{6,}", text))
+            added_lines = None
         findings += self.text_findings(path, text, own=own, lines=added_lines)
         if templated:
             findings += self.placeholder_findings(path, text)
@@ -156,14 +165,11 @@ class Checker:
 
 def added_line_numbers(old: Optional[bytes], new: bytes) -> Optional[List[int]]:
     """Line numbers in `new` that are not in `old`, or None to check every line."""
-    if old is None:
+    if old is None or b"\0" in old[:4096] or b"\0" in new[:4096]:
         return None
     import difflib
-    try:
-        old_lines = old.decode("utf-8").splitlines()
-        new_lines = new.decode("utf-8").splitlines()
-    except UnicodeDecodeError:
-        return None
+    old_lines = decode_any(old).splitlines()
+    new_lines = decode_any(new).splitlines()
     numbers = []
     for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
         if tag in ("replace", "insert"):

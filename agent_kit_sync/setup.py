@@ -72,7 +72,9 @@ def check(args, layout: Layout) -> int:
 
 def init(args, layout: Layout) -> int:
     from .commands import ensure_tool, write_launcher
+    from .fsutil import private_dir
     layout.root.mkdir(parents=True, exist_ok=True)
+    private_dir(layout.root)
     for folder in (layout.state, layout.logs, layout.local_modules):
         folder.mkdir(parents=True, exist_ok=True)
     version = ensure_tool(layout, args.tool_url)
@@ -104,8 +106,14 @@ def public_check(url: str) -> bool:
     """
     if not re_network.match(url):
         return False
-    env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
-    result = gitops.run(None, "-c", "credential.helper=", "ls-remote", "--heads", url, check=False, timeout=30, env=env)
+    https = url
+    match = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+?)(?:\.git)?$", url)
+    if match:
+        https = f"https://{match.group(1)}/{match.group(2)}.git"
+    if not https.startswith(("http://", "https://")):
+        return False
+    env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_SSH_COMMAND": "false"}
+    result = gitops.run(None, "-c", "credential.helper=", "ls-remote", "--heads", https, check=False, timeout=30, env=env)
     return result.returncode == 0
 
 
@@ -302,14 +310,19 @@ def apply(args, layout: Layout) -> int:
         if machine.get(folder):
             Path(machine[folder]).mkdir(parents=True, exist_ok=True)
     atomic_write(layout.machine_file, toml.dumps(machine).encode("utf-8"))
-    removed = remove_registrations(layout, answers.get("remove_registrations", []))
     engine = Engine(layout)
     engine.approve_new = set(answers.get("approve", []))
     engine.replace_existing = set(answers.get("replace_existing", []))
     result = engine.run(network=gitops.has_remote(layout.config))
     write_launcher(layout)
     changed = register(layout, engine.machine, engine.index.hooks)
-    out({"installed": len(result.installed), "held": result.held, "errors": result.errors, "registered": changed, "removed_registrations": removed, "pushed": result.pushed})
+    # Only now that the dispatcher runs the adopted hooks, remove their old registrations.
+    installed_scripts = {Path(h["path"]).name for h in engine.index.hooks}
+    wanted = [e for e in answers.get("remove_registrations", []) if any(name in str(e.get("command", "")) for name in installed_scripts)]
+    skipped = [e for e in answers.get("remove_registrations", []) if e not in wanted]
+    removed = remove_registrations(layout, wanted)
+    out({"installed": len(result.installed), "held": result.held, "errors": result.errors, "registered": changed, "removed_registrations": removed,
+         "kept_registrations": [e.get("command") for e in skipped], "pushed": result.pushed})
     return 1 if result.errors else 0
 
 
@@ -327,6 +340,10 @@ def remove_registrations(layout: Layout, entries: List[dict]) -> List[str]:
         backup = layout.state / "backups" / "registrations" / (path.parent.name + "-" + path.name)
         if not backup.exists():
             atomic_write(backup, raw)
+            _private(backup)
+        record = layout.state / "backups" / "registrations" / "removed.json"
+        previous = json.loads(record.read_text(encoding="utf-8")) if record.exists() else []
+        previous += [{"file": str(path), "event": e["event"], "command": e["command"]} for e in wanted]
         data = json.loads(raw.decode("utf-8"))
         hooks = data.get("hooks") or {}
         for entry in wanted:
@@ -339,8 +356,46 @@ def remove_registrations(layout: Layout, entries: List[dict]) -> List[str]:
             hooks[entry["event"]] = [g for g in groups if g.get("hooks")]
             if not hooks[entry["event"]]:
                 del hooks[entry["event"]]
-        atomic_write(path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        from .settings import json_indent
+        original = raw.decode("utf-8")
+        atomic_write(path, (json.dumps(data, indent=json_indent(original), ensure_ascii=False) + ("\n" if original.endswith("\n") else "")).encode("utf-8"))
+        atomic_write(record, json.dumps(previous, indent=1).encode("utf-8"))
     return removed
+
+
+def _private(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def restore_registrations(layout: Layout) -> List[str]:
+    """Put back the hook entries setup removed, from the saved backup of each file."""
+    record = layout.state / "backups" / "registrations" / "removed.json"
+    if not record.exists():
+        return []
+    restored = []
+    for entry in json.loads(record.read_text(encoding="utf-8")):
+        path = Path(entry["file"])
+        backup = layout.state / "backups" / "registrations" / (path.parent.name + "-" + path.name)
+        original = read_json(backup)
+        group = next((g for g in (original.get("hooks") or {}).get(entry["event"], []) for h in g.get("hooks", []) if str(h.get("command")) == entry["command"]), None)
+        if group is None:
+            continue
+        raw = read_or_none(path)
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+        groups = data.setdefault("hooks", {}).setdefault(entry["event"], [])
+        if any(str(h.get("command")) == entry["command"] for g in groups for h in g.get("hooks", [])):
+            continue
+        handler = next(h for h in group["hooks"] if str(h.get("command")) == entry["command"])
+        groups.append(dict(group, hooks=[handler]))
+        from .settings import json_indent
+        text = raw.decode("utf-8") if raw else ""
+        atomic_write(path, (json.dumps(data, indent=json_indent(text), ensure_ascii=False) + ("\n" if text.endswith("\n") or not text else "")).encode("utf-8"))
+        restored.append(entry["command"])
+    record.unlink()
+    return restored
 
 
 def register_step(args, layout: Layout) -> int:

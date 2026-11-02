@@ -154,6 +154,7 @@ class Engine:
             self.push()
         self.refresh_signatures()
         self.index.save()
+        self.record.data["edits"] = sorted(set(self.report.edits))
         self.record.save()
         return self.report
 
@@ -247,6 +248,10 @@ class Engine:
             written = entry.get("written", settings.MISSING)
             if current is settings.MISSING and "written" not in entry:
                 continue
+            if entry.get("mode") == "contains":
+                wanted = entry.get("value") or []
+                if current is not settings.MISSING and settings.satisfied(current, wanted, "contains"):
+                    continue  # Other software or the user added entries; that is not a change to the synced ones.
             if json.dumps(current, sort_keys=True, default=str) != json.dumps(written, sort_keys=True, default=str):
                 module, item = entry["item_key"].split("/", 1)
                 change = LocalChange("setting", entry["item_key"], module, item, entry["app"], setting_key, path)
@@ -377,6 +382,8 @@ class Engine:
             if change.kind in ("edit", "section-edit"):
                 self._verify_render(module, item, change, new_files)
         problems = self._check_sources(module, item, new_files, tree)
+        if not problems and item.kind == "hook":
+            problems = self._run_hook_tests(module, item, new_files)
         if problems:
             self._hold_edit(module, item, changes, "This edit failed agent-kit-sync's checks: " + "; ".join(str(p) for p in problems[:5]), new_files)
             return
@@ -410,6 +417,8 @@ class Engine:
             return
         entry = self.index.copies[change.copy_key]
         kind = entry["render_kind"]
+        if kind.startswith("override-"):
+            return  # Checked by the planner on the next render; the edit went to this machine's override file.
         values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
         text = source.decode("utf-8") if kind != "copy" else None
         if kind == "copy":
@@ -478,6 +487,16 @@ class Engine:
         if old_render is None or source is None:
             raise render.RenderError("the copy this edit started from is not on record")
         kind = entry["render_kind"]
+        if kind.startswith("override-replace-"):
+            self._write_override_file(module.name, item.name, "replace", change.new)
+            return source  # The config repo's version is unchanged.
+        if kind.startswith("override-local-"):
+            kind = kind[len("override-local-"):]
+            edited_text, prepend, append = sections.unwrap_local(change.new.decode("utf-8"))
+            old_text, _p, _a = sections.unwrap_local(old_render.decode("utf-8"))
+            self._update_local_text(module.name, item.name, prepend, append)
+            change = LocalChange(change.kind, change.item_key, change.module, change.item, change.app, change.copy_key, change.path, edited_text.encode("utf-8"))
+            old_render = old_text.encode("utf-8")
         values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
         if kind == "copy":
             if source != old_render:
@@ -491,6 +510,13 @@ class Engine:
         if kind == "agent-codex":
             return render.carry_back_agent_codex(source.decode("utf-8"), old_render.decode("utf-8"), edited, values).encode("utf-8")
         raise render.RenderError(f"unknown copy kind {kind}")
+
+    def _write_override_file(self, module: str, item: str, kind: str, data: bytes) -> None:
+        override = self.machine.overrides.get(f"{module}/{item}") or {}
+        target = Path(override.get("file", ""))
+        if not target.is_absolute():
+            target = self.layout.root / target
+        atomic_write(target, data)
 
     def _update_local_text(self, module: str, item: str, prepend: Optional[str], append: Optional[str]) -> None:
         for kind, text in (("prepend", prepend), ("append", append)):
@@ -524,6 +550,40 @@ class Engine:
             old = tree.read(source_rel)
             problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, added_lines=checks.added_line_numbers(old, data))
         return problems
+
+    def _run_hook_tests(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]]) -> List[checks.Finding]:
+        """Run a hook's tests against the edited files, in a copy of the module, with the user's folders redirected."""
+        import tempfile
+        from .testing import run_test
+        tests = list(item.data.get("tests", []))
+        if not tests:
+            return []
+        with tempfile.TemporaryDirectory(prefix="aks-module-") as tmp:
+            copy_root = Path(tmp) / module.name
+            shutil.copytree(module.root, copy_root, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+            for rel, data in new_files.items():
+                target = copy_root / Path(*PurePosixPath(rel).parts)
+                if data is None:
+                    if target.exists():
+                        target.unlink()
+                else:
+                    atomic_write(target, data)
+            findings = []
+            for rel in tests:
+                result, detail = run_test(copy_root, rel)
+                if result == "failed":
+                    findings.append(checks.Finding("module-tests", rel, 0, detail.strip().splitlines()[-1] if detail.strip() else "failed"))
+            return findings
+
+    def _incoming_tests_fail(self, module: Module, item: Item, tree: Tree) -> Optional[str]:
+        from .testing import run_test
+        if item.kind != "hook" or not item.data.get("tests") or tree.commit is not None:
+            return None
+        for rel in item.data["tests"]:
+            result, detail = run_test(module.root, rel)
+            if result == "failed":
+                return f"{rel}: {detail.strip().splitlines()[-1] if detail.strip() else 'failed'}"
+        return None
 
     def _outgoing_held(self, module: Module, item: Item, tree: Tree, new_files: Dict[str, Optional[bytes]]) -> bool:
         policy = self.machine.policy.get("outgoing", "push")
@@ -775,6 +835,9 @@ class Engine:
 
     def _effective_modules(self, modules: List[Module], incoming: bool) -> Tuple[List[Module], Dict[str, Tree]]:
         """Replace held or pinned items with the version this machine last approved."""
+        latest = Index(self.layout)
+        for key, value in latest.approvals.items():
+            self.index.approvals.setdefault(key, value)
         trees: Dict[str, Tree] = {}
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
         result = []
@@ -812,7 +875,15 @@ class Engine:
                 code = item_is_code(module, item, tree)
                 policy = self.machine.policy["code_changes" if code else "other_changes"]
                 if policy == "apply" or approved:
-                    kept.append(item)
+                    failure = self._incoming_tests_fail(module, item, tree)
+                    if failure is None:
+                        kept.append(item)
+                        continue
+                    self.alerts.raise_(f"tests:{item.key}", f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version. {failure[:200]}", "agent-kit-sync test")
+                    old = self._item_at(module, item.name, info["commit"])
+                    if old is not None:
+                        kept.append(old[0])
+                        trees[item.key] = old[1]
                     continue
                 old = self._item_at(module, item.name, info["commit"])
                 self._hold_incoming(item, "incoming", f"{item.key} changed in the config repo.", head, code)
@@ -909,9 +980,11 @@ class Engine:
                 info["local"] = module.local
                 info.pop("approved", None)
         if incoming:
-            for key, info in self.index.items.items():
-                info.pop("force", None)
-                self.index.approvals.pop("outgoing:" + key, None)
+            for key in list(self.index.items):
+                if self.index.items[key].get("force"):
+                    self.index.clear_force(key)
+                if "outgoing:" + key in self.index.approvals:
+                    self.index.drop_approval("outgoing:" + key)
         present = {item.key for module in effective for item in module.items}
         for item_key in list(self.index.items):
             if item_key.split("/", 1)[0] in self.failed_modules:
@@ -1141,7 +1214,11 @@ class Engine:
                 continue
             path = Path(entry["path"])
             current = settings.read_value(path, entry["key"])
-            if json.dumps(current, default=str) == json.dumps(entry.get("written"), default=str):
+            if entry.get("mode") == "contains" and isinstance(current, list):
+                # Remove only the entries this tool added; keep everything else in the list.
+                added = entry.get("added", entry.get("value") or [])
+                self._change_setting(path, entry["key"], [v for v in current if v not in added])
+            elif json.dumps(current, default=str) == json.dumps(entry.get("written"), default=str):
                 replaced = entry.get("replaced", None)
                 if entry.get("was_missing"):
                     self._change_setting(path, entry["key"], settings.MISSING)
@@ -1156,14 +1233,20 @@ class Engine:
             self.alerts.raise_(f"settings:{path}", f"agent-kit-sync cannot read {path}: {error}", "agent-kit-sync status")
             return
         desired = settings.desired_value(None if current is settings.MISSING else current, value, mode)
-        if entry is not None and not entry.get("force") and current is not settings.MISSING and json.dumps(current, sort_keys=True, default=str) != json.dumps(entry.get("written"), sort_keys=True, default=str):
+        changed_elsewhere = False
+        if entry is not None and current is not settings.MISSING:
+            changed_elsewhere = json.dumps(current, sort_keys=True, default=str) != json.dumps(entry.get("written"), sort_keys=True, default=str)
+        if mode == "contains" and changed_elsewhere and settings.satisfied(current, value, mode):
+            changed_elsewhere = False
+        if entry is not None and not entry.get("force") and changed_elsewhere:
             return  # Changed by something else and not yet decided; find_local_changes holds it.
         if current is not settings.MISSING and settings.satisfied(current, value, mode):
             if entry is None:
-                self.index.settings[setting_key] = {"app": app, "key": key, "path": str(path), "item_key": item_key, "written": current, "was_missing": False, "replaced": current}
+                entry = self.index.settings[setting_key] = {"app": app, "key": key, "path": str(path), "item_key": item_key, "written": current, "was_missing": False, "replaced": current}
             else:
                 entry["written"] = current
                 entry.pop("force", None)
+            entry["mode"], entry["value"] = mode, value
             return
         if not self._change_setting(path, key, desired):
             return
@@ -1171,6 +1254,9 @@ class Engine:
             entry = self.index.settings[setting_key] = {"app": app, "key": key, "path": str(path), "item_key": item_key,
                                                         "was_missing": current is settings.MISSING, "replaced": None if current is settings.MISSING else current}
         entry["written"] = desired
+        entry["mode"], entry["value"] = mode, value
+        if mode == "contains" and isinstance(entry.get("replaced"), list):
+            entry["added"] = [v for v in value if v not in entry["replaced"]]
         entry.pop("force", None)
         self.report.installed.append(f"setting {setting_key}")
 

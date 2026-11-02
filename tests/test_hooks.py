@@ -212,7 +212,11 @@ class InstalledToolTests(TwoMachines):
         self.install()
         text = self.a.read(".codex", "AGENTS.md")
         self.assertIn("disable MODULE/ITEM", text)
-        self.assertIn(str(self.a.layout.launcher), text)
+        self.assertIn(str(self.a.layout.bin / "agent-kit-sync"), text)
+        wrapper = self.a.layout.bin / "agent-kit-sync"
+        self.assertTrue(wrapper.is_file())
+        result = subprocess.run([str(wrapper), "--version"], stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home)), timeout=30)
+        self.assertEqual(result.returncode, 0)
         self.assertTrue(self.a.path(".agents", "skills", "agent-kit-sync-setup", "SKILL.md").is_file())
 
     def test_doctor_and_status(self):
@@ -231,6 +235,32 @@ class InstalledToolTests(TwoMachines):
         result = self.cli("hook", "claude", "session_start", stdin=payload)
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"setup again", result.stderr)
+
+    def test_self_update_installs_a_new_commit_and_follows_origin(self):
+        self.install()
+        from agent_kit_sync import gitops as g
+        origin = g.run(self.a.layout.tool_repo, "remote", "get-url", "origin").stdout.decode().strip()
+        self.assertEqual(Path(origin).resolve(), Path(self.tool_url).resolve())
+        before = (self.a.layout.tool / "current").read_text().strip()
+        tool = Path(self.tool_url)
+        (tool / "NOTES.md").write_text("new commit\n")
+        git(tool, "add", "-A")
+        git(tool, "commit", "-q", "-m", "next")
+        result = self.cli("update")
+        self.assertIn(b"updated", result.stdout, result.stdout + result.stderr)
+        after = (self.a.layout.tool / "current").read_text().strip()
+        self.assertNotEqual(before, after)
+
+    def test_self_update_keeps_old_version_when_self_test_fails(self):
+        self.install()
+        before = (self.a.layout.tool / "current").read_text().strip()
+        tool = Path(self.tool_url)
+        (tool / "agent_kit_sync" / "selftest.py").write_text("import sys\ndef main():\n    return 1\n")
+        git(tool, "add", "-A")
+        git(tool, "commit", "-q", "-m", "broken")
+        result = self.cli("update")
+        self.assertIn(b"failed", result.stdout)
+        self.assertEqual((self.a.layout.tool / "current").read_text().strip(), before)
 
     def test_dispatcher_timing(self):
         self.install()

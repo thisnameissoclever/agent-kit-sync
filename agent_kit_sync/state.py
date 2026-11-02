@@ -49,6 +49,18 @@ class Index:
         self.always_restore: List[str] = list(raw.get("always_restore", []))
         self.alerted_sizes: List[str] = list(raw.get("alerted_sizes", []))
         self.last_fetch: float = float(raw.get("last_fetch", 0))
+        self._dropped_approvals: set = set()
+        self._cleared_force: set = set()
+
+    def drop_approval(self, key: str) -> None:
+        self.approvals.pop(key, None)
+        self._dropped_approvals.add(key)
+
+    def clear_force(self, key: str) -> None:
+        info = self.items.get(key)
+        if info is not None:
+            info.pop("force", None)
+        self._cleared_force.add(key)
 
     def rendered_path(self, copy_key: str) -> Path:
         import hashlib
@@ -68,6 +80,20 @@ class Index:
             path.unlink()
 
     def save(self) -> None:
+        # Decisions written by other commands while this run held an older copy are kept.
+        on_disk = _load(self.path, {})
+        for key, value in dict(on_disk.get("approvals", {})).items():
+            if key not in self.approvals and key not in self._dropped_approvals:
+                self.approvals[key] = value
+        for key in on_disk.get("always_restore", []):
+            if key not in self.always_restore:
+                self.always_restore.append(key)
+        for key, info in dict(on_disk.get("items", {})).items():
+            mine = self.items.get(key)
+            if mine is not None and info.get("force") and not mine.get("force") and key not in self._cleared_force:
+                mine["force"] = True
+            if mine is not None and info.get("adopted"):
+                mine.setdefault("adopted", info["adopted"])
         _save(self.path, {
             "version": INDEX_VERSION,
             "copies": self.copies,

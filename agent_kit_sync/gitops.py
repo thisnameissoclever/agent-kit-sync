@@ -40,7 +40,7 @@ def run(repo: Optional[Path], *args: str, timeout: int = LOCAL_TIMEOUT, check: b
     if repo is not None:
         cmd += ["-C", str(repo)]
     cmd += ["-c", "core.autocrlf=false", "-c", "core.longpaths=true", "-c", "core.quotepath=false", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args]
-    if args and args[0] in ("fetch", "push", "clone", "ls-remote", "pull") and "GIT_SSH_COMMAND" not in os.environ:
+    if args and args[0] in ("fetch", "push", "clone", "ls-remote", "pull") and "GIT_SSH_COMMAND" not in os.environ and "GIT_SSH_COMMAND" not in (env or {}):
         configured = None
         if repo is not None:
             found = subprocess.run(["git", "-C", str(repo), "config", "--get", "core.sshCommand"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)

@@ -132,6 +132,13 @@ def load_module(root: Path, name: str, local: bool, source: Optional[str] = None
     return module
 
 
+def safe_rel(rel) -> bool:
+    if not isinstance(rel, str) or not rel or "\0" in rel:
+        return False
+    parts = rel.replace("\\", "/").split("/")
+    return not (rel.startswith(("/", "\\")) or ".." in parts or ":" in rel or rel.startswith("~"))
+
+
 def _exists(module: Module, tree, rel: str) -> bool:
     if tree is None:
         return (module.root / rel).exists()
@@ -154,8 +161,9 @@ def _check_files(module: Module, tree=None) -> None:
             continue
         if not isinstance(rel, str) or not rel:
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} has no file")
-        if rel.startswith(("/", "\\")) or ".." in rel.replace("\\", "/").split("/") or ":" in rel:
-            raise ConfigError(f"module {module.name}: {item.kind} {item.name} points outside the module")
+        extra = list(dict(item.data.get("variants", {})).values()) + list(item.data.get("tests", [])) + list(item.data.get("templates", []))
+        if not safe_rel(rel) or not all(safe_rel(path) for path in extra):
+            raise ConfigError(f"module {module.name}: {item.kind} {item.name} lists a path outside the module")
         if not _exists(module, tree, rel):
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} lists {rel}, which does not exist")
         for app, variant in dict(item.data.get("variants", {})).items():
@@ -229,6 +237,12 @@ def load_machine(layout: Layout) -> Machine:
     for target, override in overrides.items():
         if override.get("kind") not in OVERRIDE_KINDS:
             raise ConfigError(f"{path}: override for {target} must have kind {', '.join(OVERRIDE_KINDS)}")
+        if override.get("kind") in ("replace", "prepend", "append"):
+            local_file = Path(str(override.get("file", "")))
+            if not local_file.is_absolute():
+                local_file = layout.root / local_file
+            if not local_file.is_file():
+                raise ConfigError(f"{path}: the {override['kind']} override for {target} lists {local_file}, which does not exist")
     apps = list(data.get("apps", []))
     homes = {app: Path(value) for app, value in dict(data.get("app_homes", {})).items()}
     for app in apps:

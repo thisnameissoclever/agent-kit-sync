@@ -126,7 +126,9 @@ def update_file(path: Path, layout: Layout, desired: Dict[str, dict]) -> bool:
             data.pop("hooks", None)
         if not changed:
             return False
-        text = json.dumps(data, indent=2, ensure_ascii=False) + ("\n" if raw is None or raw.endswith(b"\n") else "")
+        from .settings import json_indent
+        original = raw.decode("utf-8") if raw else ""
+        text = json.dumps(data, indent=json_indent(original), ensure_ascii=False) + ("\n" if raw is None or raw.endswith(b"\n") else "")
         try:
             atomic_write(path, text.encode("utf-8"), expect=sha256(raw) if raw is not None else None)
             return True

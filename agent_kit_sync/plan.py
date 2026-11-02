@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -132,15 +133,24 @@ def is_code_setting(app: str, key: str) -> bool:
 
 
 def cli_command(layout: Layout, machine: Machine) -> str:
+    """How an agent runs agent-kit-sync: the wrapper in bin/, with forward slashes, which every shell accepts."""
+    if os_name() == "windows":
+        path = (layout.bin / "agent-kit-sync.cmd").as_posix()
+        return f'& "{path}"' if " " in path else path
+    path = str(layout.bin / "agent-kit-sync")
+    return shlex.quote(path)
+
+
+def hook_cli(layout: Layout, machine: Machine) -> str:
     python = machine.python or sys.executable
     parts = [python, "-I", "-S", str(layout.launcher)]
     if os_name() == "windows":
-        return " ".join('"' + part + '"' if " " in part else part for part in parts)
+        return subprocess.list2cmdline(parts)
     return " ".join(shlex.quote(part) for part in parts)
 
 
 def hook_command(layout: Layout, machine: Machine, module: str, name: str) -> str:
-    return cli_command(layout, machine) + f" run-hook {module}/{name}"
+    return hook_cli(layout, machine) + f" run-hook {module}/{name}"
 
 
 def values_for(layout: Layout, machine: Machine, module: str, app: str, hooks: Dict[str, str]) -> render.Values:
@@ -253,6 +263,18 @@ class Planner:
             return None, None, data
         return None, None, None
 
+    def _overridden(self, module: Module, item: Item, data: bytes, main: bool) -> Tuple[bytes, Optional[str]]:
+        """Apply a replace, prepend, or append override to an item's main file. Returns the bytes and the override kind."""
+        if not main:
+            return data, None
+        prepend, append, replace = self._local_text(module.name, item.name)
+        if replace is not None:
+            return replace, "replace"
+        if prepend is None and append is None:
+            return data, None
+        from .sections import wrap_local
+        return wrap_local(data.decode("utf-8"), prepend, append).encode("utf-8"), "local"
+
     def _module(self, plan: Plan, module: Module, order: int) -> None:
         apps = self.apps_for(module)
         for item in module.items:
@@ -307,6 +329,9 @@ class Planner:
                     kind = "text"
                 else:
                     data, kind = raw, "copy"
+                data, local = self._overridden(module, item, data, rel == "SKILL.md")
+                if local:
+                    kind = "override-" + local + "-" + kind
                 plan.copies.append(Copy(
                     key=f"{app}|{item.key}|{rel}", app=app, module=module.name, item=item.name, kind="skill",
                     path=dest / Path(*PurePosixPath(rel).parts), source_rel=f"{rel_dir}/{rel}", data=data,
@@ -329,6 +354,10 @@ class Planner:
                 data, kind = render.render_agent_codex(source, values), "agent-codex"
             else:
                 data, kind = render.render_agent_md(source, app, values).text, "agent-md"
+            if app != "codex":
+                encoded, local = self._overridden(module, item, data.encode("utf-8"), True)
+                if local:
+                    data, kind = encoded.decode("utf-8"), "override-" + local + "-" + kind
             plan.copies.append(Copy(
                 key=f"{app}|{item.key}|{rel}", app=app, module=module.name, item=item.name, kind="agent", path=dest,
                 source_rel=rel, data=data.encode("utf-8"), executable=False, render_kind=kind, code=has_hooks, local=module.local,
@@ -373,10 +402,11 @@ class Planner:
             raw = tree.read(source_rel)
             if raw is None:
                 continue
+            raw, local = self._overridden(module, item, raw, len(targets) == 1)
             plan.copies.append(Copy(
                 key=f"kit|{item.key}|{source_rel}", app="kit", module=module.name, item=item.name, kind="file",
                 path=base / Path(*PurePosixPath(source_rel).parts), source_rel=source_rel, data=raw,
-                executable=executable, render_kind="copy", code=is_code_path(source_rel, "file"), local=module.local,
+                executable=executable, render_kind=("override-" + local + "-copy") if local else "copy", code=is_code_path(source_rel, "file", raw, executable), local=module.local,
             ))
 
     def _setting(self, plan: Plan, module: Module, item: Item) -> None:

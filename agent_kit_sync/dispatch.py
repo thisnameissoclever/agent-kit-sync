@@ -146,8 +146,12 @@ def combine(app: str, event: str, results) -> Combined:
         if failed(result):
             detail = "timed out" if result.get("timeout") else (result["stderr"].decode("utf-8", "replace").strip()[-300:] or f"exit code {result['code']}")
             if hook.get("on_failure") == "closed":
-                out.note_decision("deny" if event in ("pre_tool_use", "user_prompt") else "continue", f"The {name} hook failed ({detail}), and it is set to block when it fails.")
-                out.blocked = True
+                message = f"The {name} hook failed ({detail}), and it is set to block when it fails."
+                if event in ("pre_tool_use", "user_prompt", "stop", "subagent_stop", "post_tool_use"):
+                    out.note_decision("deny" if event in ("pre_tool_use", "user_prompt", "post_tool_use") else "continue", message)
+                    out.blocked = True
+                else:
+                    out.user.append("agent-kit-sync: " + message + " This event cannot be blocked, so the session continues.")
             else:
                 out.user.append(f"agent-kit-sync: the {name} hook failed ({detail}) and was skipped.")
             continue
@@ -176,8 +180,8 @@ def combine(app: str, event: str, results) -> Combined:
             continue
         specific = data.get("hookSpecificOutput") or {}
         permission = specific.get("permissionDecision")
-        if permission in ("deny", "ask"):
-            out.note_decision(permission, str(specific.get("permissionDecisionReason", "")))
+        if permission in ("deny", "ask", "allow"):
+            out.note_decision(permission, str(specific.get("permissionDecisionReason", "")) if permission != "allow" else "")
         if data.get("decision") == "block":
             out.note_decision("deny" if event in ("pre_tool_use", "user_prompt", "post_tool_use") else "continue", str(data.get("reason", "")))
         if specific.get("additionalContext"):
@@ -208,8 +212,10 @@ def emit(app: str, event: str, combined: Combined, payload: dict, cursor_ask_is_
     if event == "pre_tool_use":
         if decision in ("deny", "ask"):
             specific = {"hookEventName": native_event, "permissionDecision": decision, "permissionDecisionReason": reason or "Blocked by a hook."}
-        elif combined.updated_input is not None:
-            specific = {"hookEventName": native_event, "permissionDecision": "allow", "updatedInput": combined.updated_input}
+        elif decision == "allow" or combined.updated_input is not None:
+            specific = {"hookEventName": native_event, "permissionDecision": "allow"}
+            if combined.updated_input is not None:
+                specific["updatedInput"] = combined.updated_input
     elif event in ("stop", "subagent_stop"):
         if decision == "continue" or (decision == "deny"):
             out["decision"] = "block"

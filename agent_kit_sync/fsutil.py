@@ -74,6 +74,16 @@ def replace_with_retry(src: Path, dst: Path, seconds: float = 2.0) -> None:
             time.sleep(0.1)
 
 
+def private_dir(path) -> None:
+    """Make a folder readable only by its owner, where the system supports it."""
+    if WINDOWS:
+        return
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
 def atomic_write(path, data: bytes, *, executable: Optional[bool] = None, expect=ANY) -> Path:
     """Write through any symbolic link to its target, by temporary file and rename.
 

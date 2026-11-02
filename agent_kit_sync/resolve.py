@@ -34,8 +34,14 @@ def resolve(layout: Layout, held_id: str, choice: str) -> int:
     machine = load_machine(layout)
     approving = choice in ("approve", "apply", "keep-and-sync", "use-this", "config-replaces-local", "local-replaces-config", "delete-everywhere", "retry")
     if approving and machine.policy.get("approval") == "terminal" and not _confirm_in_terminal(entry["summary"]):
-        print("This machine requires approval typed in a terminal outside any agent session. Run the same command there.")
+        print("This machine requires approval typed in an interactive terminal outside any agent session. Run the same command there.")
         return 3
+    from .state import run_lock
+    with run_lock(layout, wait=60):
+        return _resolve_locked(layout, machine, held, entry, choice)
+
+
+def _resolve_locked(layout, machine, held, entry, choice) -> int:
     index = Index(layout)
     alerts = Alerts(layout)
     kind = entry["kind"]
@@ -95,6 +101,8 @@ def _setting(layout, machine, index, entry, choice):
     record.pop("held", None)
     if choice == "keep-and-sync":
         value = json.loads(Held(layout).blob(entry, "value").decode("utf-8"))
+        if record.get("mode") == "contains" and isinstance(value, list):
+            value = [v for v in (record.get("value") or []) if v in value]
         module, item = entry["item_key"].split("/", 1)
         path = _module_root(layout, module) / "module.toml"
         from . import tomledit
