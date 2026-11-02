@@ -24,6 +24,23 @@ HOME_VARS = ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_KI
 IDENTITY = {"name": "Test Person", "email": "test@example.com"}
 
 
+def remove_tree(path) -> None:
+    """Delete a folder, including Git's read-only object files, which Windows will not delete as they are."""
+    import stat
+
+    def clear_and_retry(function, target, _info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            function(target)
+        except FileNotFoundError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=clear_and_retry)
+    else:
+        shutil.rmtree(path, onerror=clear_and_retry)
+
+
 def git(repo, *args):
     return gitops.run(Path(repo) if repo else None, *args, env=gitops.identity_env(IDENTITY)).stdout.decode()
 
@@ -111,7 +128,11 @@ class TwoMachines(unittest.TestCase):
         self.seed = seed
 
     def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.tmp.exists():
+            try:
+                remove_tree(self.tmp)
+            except OSError:
+                shutil.rmtree(self.tmp, ignore_errors=True)
 
     def seed_files(self, files: dict, message="seed"):
         for rel, text in files.items():

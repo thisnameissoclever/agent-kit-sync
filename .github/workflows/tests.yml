@@ -14,7 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        python: ["3.10", "3.13"]
+        include:
+          # Python 3.9 is the oldest version agent-kit-sync supports. The Ubuntu
+          # image behind ubuntu-latest has no 3.9, so Linux tests it on 24.04.
+          - os: macos-latest
+            python: "3.9"
+          - os: windows-latest
+            python: "3.9"
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
