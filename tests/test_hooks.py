@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
-from support import ROOT, TwoMachines, git
+from support import ROOT, TwoMachines, git, remove_tree
 from agent_kit_sync import dispatch
 
 
@@ -132,6 +132,7 @@ class InstalledToolTests(TwoMachines):
                 target = tool / path.relative_to(ROOT)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(path.read_bytes())
+        git(tool, "checkout", "-q", "-B", "main")
         git(tool, "add", "-A")
         git(tool, "commit", "-q", "--allow-empty", "-m", "current")
         self.tool_url = str(tool)
@@ -212,10 +213,16 @@ class InstalledToolTests(TwoMachines):
         self.install()
         text = self.a.read(".codex", "AGENTS.md")
         self.assertIn("disable MODULE/ITEM", text)
-        self.assertIn(str(self.a.layout.bin / "agent-kit-sync"), text)
-        wrapper = self.a.layout.bin / "agent-kit-sync"
+        if sys.platform.startswith("win"):
+            wrapper = self.a.layout.bin / "agent-kit-sync.cmd"
+            self.assertIn(wrapper.as_posix(), text)
+            cmd = ["cmd", "/c", str(wrapper), "--version"]
+        else:
+            wrapper = self.a.layout.bin / "agent-kit-sync"
+            self.assertIn(str(wrapper), text)
+            cmd = [str(wrapper), "--version"]
         self.assertTrue(wrapper.is_file())
-        result = subprocess.run([str(wrapper), "--version"], stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home)), timeout=30)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home)), timeout=30)
         self.assertEqual(result.returncode, 0)
         self.assertTrue(self.a.path(".agents", "skills", "agent-kit-sync-setup", "SKILL.md").is_file())
 
@@ -229,8 +236,7 @@ class InstalledToolTests(TwoMachines):
 
     def test_missing_version_prints_repair_command(self):
         self.install()
-        import shutil
-        shutil.rmtree(self.a.layout.tool)
+        remove_tree(self.a.layout.tool)
         payload = json.dumps({"session_id": "s1"}).encode()
         result = self.cli("hook", "claude", "session_start", stdin=payload)
         self.assertEqual(result.returncode, 1)

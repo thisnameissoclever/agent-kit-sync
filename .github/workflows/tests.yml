@@ -14,7 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        python: ["3.10", "3.13"]
+        include:
+          # macOS ships Python 3.9, the oldest version agent-kit-sync supports.
+          - os: macos-latest
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
