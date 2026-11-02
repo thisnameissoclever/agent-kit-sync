@@ -915,7 +915,7 @@ class Engine:
             if self.restoring:
                 for entry in self.index.blocks.values():
                     adopted = self.index.items.get(entry["item_key"], {}).get("adopted", [])
-                    if entry["app"] == app and str(path) in adopted:
+                    if entry["app"] == app and str(real(path)) in adopted:
                         unwrap.append(entry["key"])
             new_text = sections.apply(text, desired, managed, unwrap)
             if new_text != text:

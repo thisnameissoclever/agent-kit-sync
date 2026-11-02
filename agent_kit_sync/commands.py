@@ -187,7 +187,7 @@ def cmd_add(args, layout: Layout) -> int:
         from .state import Index
         index = Index(layout)
         adopted = index.items.setdefault(f"{args.module}/{name}", {})
-        adopted.setdefault("adopted", []).append(str(source))
+        adopted.setdefault("adopted", []).append(str(real(source)))
         index.save()
     else:
         name = args.name or slug(source.name)
