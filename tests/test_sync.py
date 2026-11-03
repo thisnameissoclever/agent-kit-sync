@@ -96,6 +96,58 @@ class EditTests(TwoMachines):
         self.assertIn("Help carefully.", source)
         self.assertIn("Help carefully.", a.read(".claude", "agents", "helper.md"))
 
+    def test_one_app_block_with_hook_reaches_only_that_app(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guarded"\n',
+            "modules/guarded/module.toml": """
+                description = "A subagent with its own hook"
+
+                [[agents]]
+                name = "reviewer"
+                file = "agents/reviewer.md"
+
+                [[hooks]]
+                name = "guard"
+                file = "hooks/guard.py"
+                events = []
+            """,
+            "modules/guarded/hooks/guard.py": "import sys\nsys.exit(0)\n",
+            "modules/guarded/agents/reviewer.md": """
+                ---
+                name: reviewer
+                description: Reviews
+                claude.hooks: {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "{{kit.hook guarded/guard}}"}]}]}
+                codex.sandbox_mode: read-only
+                ---
+                Review the work.
+
+                {{kit.only claude cursor}}
+                A hook runs each Bash command through {{kit.hook guarded/guard}}.
+
+                {{kit.end}}
+                Report what you find.
+            """,
+        })
+        a = self.machine("a")
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        claude = a.read(".claude", "agents", "reviewer.md")
+        self.assertIn("run-hook guarded/guard", claude)
+        self.assertIn("A hook runs each Bash command", claude)
+        self.assertNotIn("kit.", claude)
+        codex = toml.loads(a.read(".codex", "agents", "reviewer.toml"))
+        self.assertEqual(codex["developer_instructions"], "Review the work.\n\nReport what you find.\n")
+        self.assertNotIn("hooks", codex)
+        path = a.path(".codex", "agents", "reviewer.toml")
+        a.write(path, path.read_text().replace("Report what you find.", "Report every finding."))
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        source = (a.layout.config / "modules/guarded/agents/reviewer.md").read_text()
+        self.assertIn("Report every finding.", source)
+        self.assertIn("{{kit.only claude cursor}}", source)
+        self.assertIn("through {{kit.hook guarded/guard}}.", source)
+        self.assertIn("Report every finding.", a.read(".claude", "agents", "reviewer.md"))
+
     def test_edit_with_machine_path_is_held(self):
         self.standard_config()
         a = self.machine("a")

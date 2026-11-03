@@ -10,15 +10,18 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import toml
+from .paths import APPS
 
 PLACEHOLDER = re.compile(r"\{\{kit\.([a-z]+)(?: ([^{}\n]+?))?\}\}")
 PATH_NAMES = ("projects", "worktrees", "module", "home")
 APP_PREFIXES = ("claude.", "codex.", "cursor.", "antigravity.")
 FRONT_KEY = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*):(.*)$")
 SHARED_AGENT_KEYS = ("name", "description")
+ONLY_START = re.compile(r"^\s*\{\{kit\.only(?: ([^{}\n]*))?\}\}\s*$")
+ONLY_END = re.compile(r"^\s*\{\{kit\.end\}\}\s*$")
 
 
 class RenderError(Exception):
@@ -47,6 +50,8 @@ class Values:
             if not arg or arg not in self.hooks:
                 raise RenderError(f"{{{{kit.hook {arg}}}}} names no hook in the inventory")
             return self.hooks[arg]
+        if name in ("only", "end"):
+            raise RenderError("{{kit.only APP}} and {{kit.end}} must each be alone on a line")
         if arg is not None:
             raise RenderError(f"{{{{kit.{name}}}}} takes no argument")
         if name in ("home", "projects", "worktrees", "module", "app", "os", "cli"):
@@ -69,8 +74,39 @@ def placeholders_in(text: str) -> List[str]:
     return [match.group(0) for match in PLACEHOLDER.finditer(text)]
 
 
+def only_lines(lines: Sequence[str], app: str) -> Tuple[Set[int], Set[int]]:
+    """Lines to leave out of `app`'s copy, and the {{kit.only}} and {{kit.end}} marker lines among them."""
+    hidden: Set[int] = set()
+    markers: Set[int] = set()
+    current: Optional[List[str]] = None
+    for number, line in enumerate(lines):
+        start = ONLY_START.match(line)
+        if start:
+            if current is not None:
+                raise RenderError(f"line {number + 1}: a {{{{kit.only}}}} block starts inside another one")
+            current = (start.group(1) or "").split()
+            unknown = [name for name in current if name not in APPS]
+            if unknown or not current:
+                raise RenderError(f"line {number + 1}: {{{{kit.only}}}} must list apps separated by spaces, from {', '.join(APPS)}")
+            markers.add(number)
+        elif ONLY_END.match(line):
+            if current is None:
+                raise RenderError(f"line {number + 1}: {{{{kit.end}}}} has no {{{{kit.only}}}} block to end")
+            current = None
+            markers.add(number)
+        elif current is not None and app not in current:
+            hidden.add(number)
+    if current is not None:
+        raise RenderError("a {{kit.only}} block has no {{kit.end}} line")
+    return hidden | markers, markers
+
+
 def reverse_paths(line: str, values: Values) -> str:
-    """Turn this machine's own folder paths back into placeholders, on whole path prefixes."""
+    """Turn hook commands and this machine's own folder paths back into placeholders, on whole path prefixes."""
+    for key, command in sorted(values.hooks.items(), key=lambda pair: len(pair[1]), reverse=True):
+        if command:
+            pattern = re.compile(r"(?<![\w./\\-])" + re.escape(command) + r"(?=$|[\s\"'`;|&<>)\]])")
+            line = pattern.sub(lambda _match, key=key: "{{kit.hook " + key + "}}", line)
     for value, token in values.path_pairs():
         pattern = re.compile(r"(?<![\w.\-/\\~])" + re.escape(value) + r"(?=$|[/\\\s\"'`),;:\]>}]|\.(?:\s|$))")
         line = pattern.sub(lambda _match: token, line)
@@ -108,12 +144,15 @@ def project(source_lines: Sequence[str], rule: LineRule) -> Projection:
     return Projection(lines, index)
 
 
-def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str]) -> List[str]:
+def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str],
+               markers: Collection[int] = ()) -> List[str]:
     """Rebuild source lines so that projecting them again gives the edited lines.
 
     Lines the edit left alone come back from the source unchanged, placeholders and all.
     `reverse(j, line)` maps an edited line j back to source form. Source lines that the
-    projection dropped, such as another app's fields, stay in place.
+    projection dropped, such as another app's fields, stay in place. `markers` are the
+    {{kit.only}} and {{kit.end}} lines: an edit that adds lines next to one of them could
+    belong inside the block or outside it, so it raises RenderError instead of guessing.
     """
     mapped = set(old.source_index)
     out: List[str] = []
@@ -126,14 +165,23 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
                 out.append(source_lines[k])
         cursor = max(cursor, until)
 
-    matcher = difflib.SequenceMatcher(None, list(old.lines), list(edited_lines), autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    opcodes = difflib.SequenceMatcher(None, list(old.lines), list(edited_lines), autojunk=False).get_opcodes()
+    for number, (tag, i1, i2, j1, j2) in enumerate(opcodes):
         if tag == "equal":
             for i in range(i1, i2):
                 keep_unmapped(old.source_index[i])
                 out.append(source_lines[old.source_index[i]])
                 cursor = old.source_index[i] + 1
             continue
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            # Line for line: each edited line takes the place of the line it replaced.
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                keep_unmapped(old.source_index[i])
+                out.append(reverse(j, edited_lines[j]))
+                cursor = old.source_index[i] + 1
+            continue
+        if markers and _unclear_at_marker(opcodes, number, old, edited_lines, markers, len(source_lines)):
+            raise RenderError("the edit adds or removes lines at the edge of a {{kit.only}} block, so which apps they are for is unclear; make this change in the module's file")
         if i1 < i2:
             keep_unmapped(old.source_index[i1])
         for j in range(j1, j2):
@@ -145,21 +193,56 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
                     out.append(source_lines[k])
             cursor = last + 1
     keep_unmapped(len(source_lines))
+    if any(not line.endswith("\n") for line in out[:-1]):
+        raise RenderError("the edited copy has no line break after its last line, and lines for other apps follow it in the module's file; add the line break")
     return out
+
+
+def _unclear_at_marker(opcodes, number: int, old: Projection, edited_lines: Sequence[str], markers: Collection[int], total: int) -> bool:
+    """Whether a changed run of lines could equally sit on either side of a {{kit.only}} or {{kit.end}} line.
+
+    Lines added or removed next to a line with the same text can be matched one line
+    earlier or later with the same result, so the run is widened over such lines first.
+    """
+    tag, i1, i2, j1, j2 = opcodes[number]
+    index = old.source_index
+    lowest = opcodes[number - 1][1] if number > 0 and opcodes[number - 1][0] == "equal" else i1
+    highest = opcodes[number + 1][2] if number + 1 < len(opcodes) and opcodes[number + 1][0] == "equal" else i2
+    moved = list(edited_lines[j1:j2]) if tag == "insert" else list(old.lines[i1:i2]) if tag == "delete" else []
+    left = right = 0
+    if moved:
+        size = len(moved)
+        while i1 - left - 1 >= lowest and old.lines[i1 - left - 1] == moved[(size - 1 - left) % size]:
+            left += 1
+        while i2 + right < highest and old.lines[i2 + right] == moved[right % size]:
+            right += 1
+    first, stop = i1 - left, i2 + right
+    if tag == "delete":
+        if not (left or right):
+            return False
+        low, high = index[first], index[stop - 1]
+    else:
+        low = index[first - 1] if first > 0 else -1
+        high = index[stop] if stop < len(index) else total
+    return any(low < k < high for k in markers)
 
 
 # ---------------------------------------------------------------- plain templates
 
 
 def render_text(source: str, values: Values) -> Projection:
-    return project(source.splitlines(keepends=True), lambda _n, line: substitute(line, values))
+    lines = source.splitlines(keepends=True)
+    hidden, _markers = only_lines(lines, values.app)
+    return project(lines, lambda number, line: None if number in hidden else substitute(line, values))
 
 
 def carry_back_text(source: str, old_render: str, edited: str, values: Values) -> str:
     old = render_text(source, values)
     if old.text != old_render:
         raise RenderError("the source no longer renders to the copy that was written, so the edit cannot be carried back exactly")
-    lines = carry_back(source.splitlines(keepends=True), old, edited.splitlines(keepends=True), lambda _j, line: reverse_paths(line, values))
+    source_lines = source.splitlines(keepends=True)
+    _hidden, markers = only_lines(source_lines, values.app)
+    lines = carry_back(source_lines, old, edited.splitlines(keepends=True), lambda _j, line: reverse_paths(line, values), markers)
     return "".join(lines)
 
 
@@ -190,9 +273,11 @@ def front_entries(lines: Sequence[str], start: int, end: int) -> List[Tuple[str,
     return entries
 
 
-def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, Dict[str, str]]:
+def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, Dict[str, str], Set[int]]:
     _, start, end = split_frontmatter("".join(lines))
-    drop = set()
+    drop, markers = only_lines(lines, app)
+    if start >= 0 and any(number <= end for number in markers):
+        raise RenderError("a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools")
     renamed: Dict[str, str] = {}
     own = app + "."
     if start >= 0:
@@ -211,18 +296,18 @@ def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, 
                 line = match.group(1)[len(own):] + ":" + match.group(2) + line[match.end():]
         return substitute(line, values)
 
-    return rule, renamed
+    return rule, renamed, markers
 
 
 def render_agent_md(source: str, app: str, values: Values) -> Projection:
     lines = source.splitlines(keepends=True)
-    rule, _ = _md_rule(app, values, lines)
+    rule, _renamed, _markers = _md_rule(app, values, lines)
     return project(lines, rule)
 
 
 def carry_back_agent_md(source: str, app: str, old_render: str, edited: str, values: Values) -> str:
     lines = source.splitlines(keepends=True)
-    rule, renamed = _md_rule(app, values, lines)
+    rule, renamed, markers = _md_rule(app, values, lines)
     old = project(lines, rule)
     if old.text != old_render:
         raise RenderError("the subagent definition changed since this copy was written")
@@ -245,7 +330,7 @@ def carry_back_agent_md(source: str, app: str, old_render: str, edited: str, val
                     line = app + "." + key + ":" + match.group(2) + line[match.end():]
         return line
 
-    return "".join(carry_back(lines, old, edited_lines, reverse))
+    return "".join(carry_back(lines, old, edited_lines, reverse, markers))
 
 
 def yaml_scalar(raw: str):
@@ -282,6 +367,8 @@ def codex_fields(source: str, values: Values) -> Tuple[Dict[str, object], str]:
     lines = source.splitlines(keepends=True)
     _, start, end = split_frontmatter(source)
     fields: Dict[str, object] = {}
+    if start >= 0 and any(ONLY_START.match(line) or ONLY_END.match(line) for line in lines[start:end + 1]):
+        raise RenderError("a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as codex.sandbox_mode")
     if start >= 0:
         for key, first, after in front_entries(lines, start, end):
             if key in SHARED_AGENT_KEYS or key.startswith("codex."):
@@ -293,7 +380,7 @@ def codex_fields(source: str, values: Values) -> Tuple[Dict[str, object], str]:
         body = "".join(lines[end + 1:])
     else:
         body = source
-    return fields, substitute(body, values)
+    return fields, render_text(body, values).text
 
 
 def toml_multiline(text: str) -> str:

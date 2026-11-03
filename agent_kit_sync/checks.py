@@ -128,14 +128,27 @@ class Checker:
 
     def placeholder_findings(self, path: str, text: str) -> List[Finding]:
         findings = []
-        for number, line in enumerate(text.splitlines(), start=1):
+        lines = text.splitlines(keepends=True)
+        for number, line in enumerate(lines, start=1):
             for match in render.PLACEHOLDER.finditer(line):
                 name, arg = match.group(1), match.group(2)
                 if name in ("home", "projects", "worktrees", "module", "app", "os", "cli") and arg is None:
                     continue
                 if name in ("hook", "literal") and arg:
                     continue
+                if name in ("only", "end"):
+                    if not (render.ONLY_START.match(line) or render.ONLY_END.match(line)):
+                        findings.append(Finding("format", path, number, f"{match.group(0)} must be alone on its line"))
+                    continue
                 findings.append(Finding("format", path, number, f"unknown placeholder {match.group(0)}"))
+        try:
+            _hidden, markers = render.only_lines(lines, "claude")
+            if "agents" in PurePosixPath(path).parts and markers:
+                _lines, start, end = render.split_frontmatter(text)
+                if start >= 0 and min(markers) <= end:
+                    findings.append(Finding("format", path, min(markers) + 1, "a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools"))
+        except render.RenderError as error:
+            findings.append(Finding("format", path, 0, str(error)))
         return findings
 
     def python_findings(self, path: str, data: bytes) -> List[Finding]:

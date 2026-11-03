@@ -157,7 +157,17 @@ name = "review"
 dir = "skills/review"
 ```
 
-Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. In a skill, placeholders are replaced only in the files listed under `templates`. Write `{{kit.literal home}}` to show a placeholder literally.
+Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. `{{kit.hook MODULE/HOOK}}` becomes the command that runs one synced hook, for a hook that belongs inside a subagent definition. In a skill, placeholders are replaced only in the files listed under `templates`. Write `{{kit.literal home}}` to show a placeholder literally.
+
+Lines that only some apps should see go between two marker lines, each alone on its line:
+
+```markdown
+{{kit.only claude cursor}}
+A hook in this file runs every shell command in a read-only sandbox.
+{{kit.end}}
+```
+
+The block's lines appear in the listed apps' copies, and the marker lines appear in none. A block cannot sit in a subagent definition's header; write a field for one app with that app's name in front, such as `claude.tools`. An edit made in an app's copy that adds or removes lines directly before or after a block is held, because those lines could belong inside the block or outside it; make that change in the module's file.
 
 These files never sync: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `__pycache__`, `*.pyc`, `.pytest_cache`, `node_modules`, `.git`, and editor backups. A module can add patterns with `ignore = [...]`.
 

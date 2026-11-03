@@ -103,6 +103,7 @@ class Engine:
         self.failed_modules: Set[str] = set()   # modules that could not be rendered this run
         self.throttle_fetch = False             # set for runs started after a file write
         self.approve_new: Set[str] = set()      # item keys approved during setup
+        self.carry_modules: List[Module] = []   # the modules edits are carried back to, for {{kit.hook}} commands
         self.replace_existing: Set[str] = set() # "app|module/item" allowed to overwrite unmanaged files
         self.carried: Dict[str, Optional[str]] = {}  # copy or block keys carried back, with their hash when found
         self.restoring = False                  # uninstall: put back files the tool replaced
@@ -142,6 +143,7 @@ class Engine:
         self.alerts.close("config")
         changes = self.find_local_changes(modules)
         if changes:
+            self.carry_modules = modules
             self.carry_back(modules, changes)
         self.commit_local("Sync edits from " + self.machine.name)
         inventory, modules = self.load_modules()
@@ -410,7 +412,7 @@ class Engine:
             return
         if change.kind == "section-edit":
             entry = self.index.blocks[change.copy_key]
-            values = values_for(self.layout, self.machine, module.name, change.app, {})
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
             _p, edited_base, _a = sections.split_local(change.new.decode("utf-8"))
             if render.render_text(source.decode("utf-8"), values).text != edited_base:
                 raise render.RenderError("rendering the carried-back section does not reproduce the edit")
@@ -480,7 +482,7 @@ class Engine:
             prepend, edited_base, append = sections.split_local(edited)
             self._update_local_text(module.name, item.name, prepend, append)
             _p, old_base, _a = sections.split_local(old_render)
-            values = values_for(self.layout, self.machine, module.name, change.app, {})
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
             return render.carry_back_text(source.decode("utf-8"), old_base, edited_base, values).encode("utf-8")
         entry = self.index.copies[change.copy_key]
         old_render = self.index.rendered(change.copy_key)
@@ -529,12 +531,8 @@ class Engine:
             atomic_write(target, text.encode("utf-8"))
 
     def _hook_commands(self) -> Dict[str, str]:
-        from .plan import hook_command
-        commands = {}
-        for entry in self.index.hooks:
-            key = f"{entry['module']}/{entry['name']}"
-            commands[key] = hook_command(self.layout, self.machine, entry["module"], entry["name"])
-        return commands
+        from .plan import hook_commands
+        return hook_commands(self.layout, self.machine, self.carry_modules)
 
     def _check_sources(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]], tree: Tree) -> List[checks.Finding]:
         problems: List[checks.Finding] = []

@@ -153,6 +153,11 @@ def hook_command(layout: Layout, machine: Machine, module: str, name: str) -> st
     return hook_cli(layout, machine) + f" run-hook {module}/{name}"
 
 
+def hook_commands(layout: Layout, machine: Machine, modules: List[Module]) -> Dict[str, str]:
+    """The command for every hook in the inventory, which {{kit.hook MODULE/HOOK}} becomes."""
+    return {item.key: hook_command(layout, machine, module.name, item.name) for module in modules for item in module.of("hook")}
+
+
 def values_for(layout: Layout, machine: Machine, module: str, app: str, hooks: Dict[str, str]) -> render.Values:
     return render.Values(
         home=str(Path.home()),
@@ -199,10 +204,7 @@ class Planner:
         self.tree_for = tree_for
         self.runtimes = runtimes_available()
         self.overrides = machine.overrides
-        self.hook_commands: Dict[str, str] = {}
-        for module in modules:
-            for item in module.of("hook"):
-                self.hook_commands[item.key] = hook_command(layout, machine, module.name, item.name)
+        self.hook_commands = hook_commands(layout, machine, modules)
 
     def override(self, module: str, item: Optional[str] = None) -> Optional[dict]:
         if item and f"{module}/{item}" in self.overrides:
