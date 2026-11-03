@@ -412,16 +412,21 @@ class Engine:
             return
         if change.kind == "section-edit":
             entry = self.index.blocks[change.copy_key]
-            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
             _p, edited_base, _a = sections.split_local(change.new.decode("utf-8"))
             if render.render_text(source.decode("utf-8"), values).text != edited_base:
                 raise render.RenderError("rendering the carried-back section does not reproduce the edit")
             return
         entry = self.index.copies[change.copy_key]
         kind = entry["render_kind"]
-        if kind.startswith("override-"):
-            return  # Checked by the planner on the next render; the edit went to this machine's override file.
-        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+        if kind.startswith("override-replace-"):
+            return  # The edit went to this machine's replacement file; the config repo's version is unchanged.
+        if kind.startswith("override-local-"):
+            # Compare without this machine's own text, which went to its prepend and append files.
+            kind = kind[len("override-local-"):]
+            edited_text, _prepend, _append = sections.unwrap_local(change.new.decode("utf-8"))
+            change = LocalChange(change.kind, change.item_key, change.module, change.item, change.app, change.copy_key, change.path, edited_text.encode("utf-8"))
+        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
         text = source.decode("utf-8") if kind != "copy" else None
         if kind == "copy":
             again = source
@@ -482,7 +487,7 @@ class Engine:
             prepend, edited_base, append = sections.split_local(edited)
             self._update_local_text(module.name, item.name, prepend, append)
             _p, old_base, _a = sections.split_local(old_render)
-            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
             return render.carry_back_text(source.decode("utf-8"), old_base, edited_base, values).encode("utf-8")
         entry = self.index.copies[change.copy_key]
         old_render = self.index.rendered(change.copy_key)
@@ -499,7 +504,7 @@ class Engine:
             self._update_local_text(module.name, item.name, prepend, append)
             change = LocalChange(change.kind, change.item_key, change.module, change.item, change.app, change.copy_key, change.path, edited_text.encode("utf-8"))
             old_render = old_text.encode("utf-8")
-        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
         if kind == "copy":
             if source != old_render:
                 raise render.RenderError("the source changed since this copy was written")
@@ -530,12 +535,22 @@ class Engine:
                 target = self.layout.root / target
             atomic_write(target, text.encode("utf-8"))
 
-    def _hook_commands(self) -> Dict[str, str]:
-        """Commands for every hook a copy on this machine can name: the inventory's and the installed ones."""
+    def _hook_commands(self, module: Module) -> Dict[str, str]:
+        """Commands for every hook an item in `module` can name with {{kit.hook}}.
+
+        These are the hooks in the inventory and the ones installed here. A module in the
+        config repo reaches other machines, so it can name only hooks from the config repo;
+        a hook from a local module stays a plain command there, and the checks hold it.
+        """
         from .plan import hook_command, hook_commands
         commands = {f"{h['module']}/{h['name']}": hook_command(self.layout, self.machine, h["module"], h["name"]) for h in self.index.hooks}
         commands.update(hook_commands(self.layout, self.machine, self.carry_modules))
-        return commands
+        if module.local:
+            return commands
+        local = {m.name for m in self.carry_modules if m.local}
+        if self.layout.local_modules.is_dir():
+            local |= {folder.name for folder in self.layout.local_modules.iterdir() if folder.is_dir()}
+        return {key: command for key, command in commands.items() if key.split("/", 1)[0] not in local}
 
     def _check_sources(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]], tree: Tree) -> List[checks.Finding]:
         problems: List[checks.Finding] = []

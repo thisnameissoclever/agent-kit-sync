@@ -416,5 +416,42 @@ class ReviewRegressionTests(TwoMachines):
         self.assertNotIn("Only on this machine.", (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text())
 
 
+    def test_hook_from_a_local_module_never_becomes_a_shared_placeholder(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        mine = a.layout.local_modules / "mine"
+        (mine / "hooks").mkdir(parents=True)
+        (mine / "hooks" / "guard.py").write_text("import sys\nsys.exit(0)\n")
+        (mine / "module.toml").write_text('description = "Mine"\n\n[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = []\n')
+        engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        from agent_kit_sync.plan import hook_command
+        command = hook_command(a.layout, engine.machine, "mine", "guard")
+        path = a.path(".claude", "CLAUDE.md")
+        a.write(path, path.read_text().replace("Write plainly.", f"Write plainly. Check with `{command}` first."))
+        a.sync()
+        self.assertNotIn("kit.hook", (a.layout.config / "modules/writing/sections/plain.md").read_text())
+        _engine, report = b.sync()
+        self.assertEqual(report.errors, [])
+        self.assertIn("Write plainly.", b.read(".claude", "CLAUDE.md"))
+
+    def test_typed_block_in_a_copy_with_local_text_is_held(self):
+        self.standard_config()
+        a = self.machine("a")
+        extra = a.layout.root / "local" / "helper-extra.md"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("Only on this machine.\n")
+        data = a.machine_data()
+        data.setdefault("overrides", {})["writing/helper"] = {"kind": "append", "file": str(extra)}
+        a.write_machine(data)
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("Help with the task.\n", "Help with the task.\n{{kit.only codex}}\nSecret.\n{{kit.end}}\n"))
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        self.assertNotIn("Secret.", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+        self.assertNotIn("Secret.", a.read(".codex", "agents", "helper.toml"))
+
+
 if __name__ == "__main__":
     unittest.main()

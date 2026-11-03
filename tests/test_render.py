@@ -80,11 +80,51 @@ class OnlyBlockTests(unittest.TestCase):
         outside = carry(source, "claude", lambda t: t.replace("end only -->\n", "end only -->\nIt blocks writes.\n").replace("Outro.", "Outro, reworded."))
         self.assertEqual(render.render_text(outside, values("codex")).text, "Intro.\n\nIt blocks writes.\n\nOutro, reworded.\n")
 
-    def test_codex_edits_next_to_a_hidden_block_keep_it_whole(self):
+    def test_codex_rewording_around_a_hidden_block_keeps_it_in_place(self):
         source = "Shared.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared.\n"
-        back = carry(source, "codex", lambda t: "Shared, reworded.\nNew line.\nAlso shared, reworded.\n")
-        self.assertIn("{{kit.only claude}}\nClaude only.\n{{kit.end}}\n", back)
-        self.assertEqual(render.render_text(back, values("claude")).text.count("Claude only."), 1)
+        back = carry(source, "codex", lambda t: "Shared, reworded.\nAlso shared, reworded.\n")
+        self.assertEqual(back, "Shared, reworded.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared, reworded.\n")
+
+    def test_changing_the_line_count_around_a_hidden_block_is_refused(self):
+        source = "## Tools\nUse the shell.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\n## Reporting\nReport findings.\n"
+        rendered = render.render_text(source, values("codex")).text
+        edited = rendered.replace("Use the shell.\n## Reporting\n", "Use the shell carefully.\nPrefer read-only commands.\n## Output\n")
+        with self.assertRaises(render.RenderError):
+            render.carry_back_text(source, rendered, edited, values("codex"))
+
+    def test_typed_block_markers_are_refused(self):
+        source = "A.\nB.\n"
+        for typed in ("{{kit.only codex}}\nSecret.\n{{kit.end}}\n", "<!-- agent-kit-sync only codex -->\n"):
+            with self.subTest(typed=typed), self.assertRaises(render.RenderError):
+                render.carry_back_text(source, source, source + typed, values("claude"))
+
+    def test_comment_line_keeps_the_edits_line_break(self):
+        source = "A\n{{kit.only claude}}\nB\n{{kit.end}}"
+        back = carry(source, "claude", lambda t: t + "\nC\n")
+        self.assertEqual(back, "A\n{{kit.only claude}}\nB\n{{kit.end}}\nC\n")
+        crlf = "A\r\n{{kit.only claude}}\r\nB\r\n{{kit.end}}\r\nC\r\n"
+        back = carry(crlf, "claude", lambda t: t.replace("B\r\n", "B2\r\n"))
+        self.assertEqual(back, crlf.replace("B\r\n", "B2\r\n"))
+        back = carry("A\n{{kit.only claude}}\nB\n{{kit.end}}\nC\n", "claude", lambda t: t.replace("\n", "\r\n"))
+        self.assertEqual(back, "A\r\n{{kit.only claude}}\r\nB\r\n{{kit.end}}\r\nC\r\n")
+
+    def test_skill_header_cannot_hold_a_block(self):
+        source = "---\nname: s\n{{kit.only claude}}\nallowed-tools: Read\n{{kit.end}}\n---\nBody.\n"
+        with self.assertRaises(render.RenderError):
+            render.render_text(source, values("claude"), header=True)
+        self.assertTrue(Checker(own_values=[]).placeholder_findings("m/skills/s/SKILL.md", source))
+
+    def test_codex_errors_count_lines_from_the_top_of_the_file(self):
+        source = "---\nname: a\ndescription: d\n---\nBody.\n{{kit.end}}\n"
+        with self.assertRaisesRegex(render.RenderError, "line 6:"):
+            render.render_agent_codex(source, values("codex"))
+
+    def test_plain_header_edit_with_hidden_fields_matches_earlier_behavior(self):
+        source = "---\nname: a\ndescription: Helps\nclaude.tools: Read\ncodex.sandbox_mode: read-only\ncursor.model: fast\n---\nBody.\n"
+        rendered = render.render_agent_md(source, "cursor", values("cursor")).text
+        edited = rendered.replace("description: Helps\nmodel: fast\n", "description: >\n  Helps with reviews.\n")
+        back = render.carry_back_agent_md(source, "cursor", rendered, edited, values("cursor"))
+        self.assertEqual(render.render_agent_md(back, "cursor", values("cursor")).text, edited)
 
     def test_moving_a_line_across_a_comment_line_is_refused(self):
         source = "Read the task.\nFollow the plan.\n{{kit.only claude}}\nA hook sandboxes every command.\n{{kit.end}}\nReport back.\n"

@@ -327,7 +327,7 @@ class Planner:
                 if raw is None:
                     continue
                 if rel in templates:
-                    data = render.render_text(raw.decode("utf-8"), self._values(module, app)).text.encode("utf-8")
+                    data = render.render_text(raw.decode("utf-8"), self._values(module, app), header=rel.endswith(".md")).text.encode("utf-8")
                     kind = "text"
                 else:
                     data, kind = raw, "copy"

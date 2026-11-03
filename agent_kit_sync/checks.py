@@ -145,7 +145,7 @@ class Checker:
             _hidden, _shown, markers = render.only_lines(lines, "claude")
             if markers and PurePosixPath(path).suffix != ".md":
                 findings.append(Finding("format", path, min(markers) + 1, "{{kit.only}} blocks work only in Markdown files, because agent-kit-sync shows their edges as Markdown comments"))
-            if "agents" in PurePosixPath(path).parts and markers:
+            if markers:
                 _lines, start, end = render.split_frontmatter(text)
                 if start >= 0 and min(markers) <= end:
                     findings.append(Finding("format", path, min(markers) + 1, "a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools"))
