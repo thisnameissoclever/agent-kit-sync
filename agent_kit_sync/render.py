@@ -10,7 +10,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Callable, Collection, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import toml
 from .paths import APPS
@@ -22,6 +22,7 @@ FRONT_KEY = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*):(.*)$")
 SHARED_AGENT_KEYS = ("name", "description")
 ONLY_START = re.compile(r"^\s*\{\{kit\.only(?: ([^{}\n]*))?\}\}\s*$")
 ONLY_END = re.compile(r"^\s*\{\{kit\.end\}\}\s*$")
+SHOWN = re.compile(r"^\s*<!-- agent-kit-sync (?:only [a-z ]+|end only) -->\s*$")
 
 
 class RenderError(Exception):
@@ -74,9 +75,15 @@ def placeholders_in(text: str) -> List[str]:
     return [match.group(0) for match in PLACEHOLDER.finditer(text)]
 
 
-def only_lines(lines: Sequence[str], app: str) -> Tuple[Set[int], Set[int]]:
-    """Lines to leave out of `app`'s copy, and the {{kit.only}} and {{kit.end}} marker lines among them."""
+def only_lines(lines: Sequence[str], app: str) -> Tuple[Set[int], Dict[int, str], Set[int]]:
+    """Find the {{kit.only}} blocks for one app's copy.
+
+    Returns the source lines to leave out (every line of a block for other apps, markers
+    included), the marker lines of this app's own blocks with the comment line each
+    becomes, and every marker line.
+    """
     hidden: Set[int] = set()
+    shown: Dict[int, str] = {}
     markers: Set[int] = set()
     current: Optional[List[str]] = None
     for number, line in enumerate(lines):
@@ -89,23 +96,39 @@ def only_lines(lines: Sequence[str], app: str) -> Tuple[Set[int], Set[int]]:
             if unknown or not current:
                 raise RenderError(f"line {number + 1}: {{{{kit.only}}}} must list apps separated by spaces, from {', '.join(APPS)}")
             markers.add(number)
+            if app in current:
+                shown[number] = "<!-- agent-kit-sync only " + " ".join(current) + " -->"
+            else:
+                hidden.add(number)
         elif ONLY_END.match(line):
             if current is None:
                 raise RenderError(f"line {number + 1}: {{{{kit.end}}}} has no {{{{kit.only}}}} block to end")
-            current = None
             markers.add(number)
+            if app in current:
+                shown[number] = "<!-- agent-kit-sync end only -->"
+            else:
+                hidden.add(number)
+            current = None
+        elif SHOWN.match(line):
+            raise RenderError(f"line {number + 1} has the form agent-kit-sync writes around lines for some apps; write {{{{kit.only APP}}}} and {{{{kit.end}}}} instead")
         elif current is not None and app not in current:
             hidden.add(number)
     if current is not None:
         raise RenderError("a {{kit.only}} block has no {{kit.end}} line")
-    return hidden | markers, markers
+    return hidden, shown, markers
+
+
+def shown_line(comment: str, source_line: str) -> str:
+    """The comment line a marker becomes, with the source line's own line break."""
+    body = source_line.splitlines()[0] if source_line.splitlines() else ""
+    return comment + source_line[len(body):]
 
 
 def reverse_paths(line: str, values: Values) -> str:
     """Turn hook commands and this machine's own folder paths back into placeholders, on whole path prefixes."""
     for key, command in sorted(values.hooks.items(), key=lambda pair: len(pair[1]), reverse=True):
         if command:
-            pattern = re.compile(r"(?<![\w./\\-])" + re.escape(command) + r"(?=$|[\s\"'`;|&<>)\]])")
+            pattern = re.compile(r"(?<![\w./\\-])" + re.escape(command) + r"(?=$|[\s\"'`;|&<>)\]]|[.,:](?:\s|$))")
             line = pattern.sub(lambda _match, key=key: "{{kit.hook " + key + "}}", line)
     for value, token in values.path_pairs():
         pattern = re.compile(r"(?<![\w.\-/\\~])" + re.escape(value) + r"(?=$|[/\\\s\"'`),;:\]>}]|\.(?:\s|$))")
@@ -144,19 +167,18 @@ def project(source_lines: Sequence[str], rule: LineRule) -> Projection:
     return Projection(lines, index)
 
 
-def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str],
-               markers: Collection[int] = ()) -> List[str]:
+def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str]) -> List[str]:
     """Rebuild source lines so that projecting them again gives the edited lines.
 
     Lines the edit left alone come back from the source unchanged, placeholders and all.
     `reverse(j, line)` maps an edited line j back to source form. Source lines that the
-    projection dropped, such as another app's fields, stay in place. `markers` are the
-    {{kit.only}} and {{kit.end}} lines: an edit that adds lines next to one of them could
-    belong inside the block or outside it, so it raises RenderError instead of guessing.
+    projection dropped, such as another app's fields or lines, stay together in place.
     """
-    mapped = set(old.source_index)
+    index = old.source_index
+    mapped = set(index)
     out: List[str] = []
     cursor = 0
+    unended = None  # Where the edit's last line went, when it has no line break.
 
     def keep_unmapped(until: int) -> None:
         nonlocal cursor
@@ -165,66 +187,86 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
                 out.append(source_lines[k])
         cursor = max(cursor, until)
 
-    opcodes = difflib.SequenceMatcher(None, list(old.lines), list(edited_lines), autojunk=False).get_opcodes()
-    for number, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+    def put(j: int) -> None:
+        nonlocal unended
+        line = edited_lines[j]
+        if j == len(edited_lines) - 1 and line.splitlines() == [line]:
+            unended = len(out)
+        out.append(reverse(j, line))
+
+    matcher = difflib.SequenceMatcher(None, list(old.lines), list(edited_lines), autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for i in range(i1, i2):
-                keep_unmapped(old.source_index[i])
-                out.append(source_lines[old.source_index[i]])
-                cursor = old.source_index[i] + 1
+                keep_unmapped(index[i])
+                out.append(source_lines[index[i]])
+                cursor = index[i] + 1
             continue
-        if tag == "replace" and i2 - i1 == j2 - j1:
+        if i2 - i1 == j2 - j1:
             # Line for line: each edited line takes the place of the line it replaced.
             for i, j in zip(range(i1, i2), range(j1, j2)):
-                keep_unmapped(old.source_index[i])
-                out.append(reverse(j, edited_lines[j]))
-                cursor = old.source_index[i] + 1
+                keep_unmapped(index[i])
+                put(j)
+                cursor = index[i] + 1
             continue
-        if markers and _unclear_at_marker(opcodes, number, old, edited_lines, markers, len(source_lines)):
-            raise RenderError("the edit adds or removes lines at the edge of a {{kit.only}} block, so which apps they are for is unclear; make this change in the module's file")
         if i1 < i2:
-            keep_unmapped(old.source_index[i1])
+            keep_unmapped(index[i1])
         for j in range(j1, j2):
-            out.append(reverse(j, edited_lines[j]))
+            put(j)
         if i1 < i2:
-            last = old.source_index[i2 - 1]
-            for k in range(old.source_index[i1], last + 1):
+            last = index[i2 - 1]
+            for k in range(index[i1], last + 1):
                 if k not in mapped:
                     out.append(source_lines[k])
             cursor = last + 1
     keep_unmapped(len(source_lines))
-    if any(not line.endswith("\n") for line in out[:-1]):
+    if unended is not None and unended != len(out) - 1:
         raise RenderError("the edited copy has no line break after its last line, and lines for other apps follow it in the module's file; add the line break")
     return out
 
 
-def _unclear_at_marker(opcodes, number: int, old: Projection, edited_lines: Sequence[str], markers: Collection[int], total: int) -> bool:
-    """Whether a changed run of lines could equally sit on either side of a {{kit.only}} or {{kit.end}} line.
+def carry_back_blocks(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str],
+                      shown: Dict[int, str]) -> List[str]:
+    """Carry an edit back between the {{kit.only}} comment lines this app's copy shows.
 
-    Lines added or removed next to a line with the same text can be matched one line
-    earlier or later with the same result, so the run is widened over such lines first.
+    The comment lines mark exactly where each block for this app starts and ends, so each
+    stretch between them is carried back on its own, and a line stays on the side of a
+    comment line where the user put it. Blocks for other apps are not in this copy, and
+    stay together in place. An edit that changes the comment lines, or moves a line from
+    one side of a comment line to the other, is refused.
     """
-    tag, i1, i2, j1, j2 = opcodes[number]
-    index = old.source_index
-    lowest = opcodes[number - 1][1] if number > 0 and opcodes[number - 1][0] == "equal" else i1
-    highest = opcodes[number + 1][2] if number + 1 < len(opcodes) and opcodes[number + 1][0] == "equal" else i2
-    moved = list(edited_lines[j1:j2]) if tag == "insert" else list(old.lines[i1:i2]) if tag == "delete" else []
-    left = right = 0
-    if moved:
-        size = len(moved)
-        while i1 - left - 1 >= lowest and old.lines[i1 - left - 1] == moved[(size - 1 - left) % size]:
-            left += 1
-        while i2 + right < highest and old.lines[i2 + right] == moved[right % size]:
-            right += 1
-    first, stop = i1 - left, i2 + right
-    if tag == "delete":
-        if not (left or right):
-            return False
-        low, high = index[first], index[stop - 1]
-    else:
-        low = index[first - 1] if first > 0 else -1
-        high = index[stop] if stop < len(index) else total
-    return any(low < k < high for k in markers)
+    cuts_old = [i for i, k in enumerate(old.source_index) if k in shown]
+    if not cuts_old:
+        return carry_back(source_lines, old, edited_lines, reverse)
+    cuts_new = [j for j, line in enumerate(edited_lines) if SHOWN.match(line)]
+    if [old.lines[i].strip() for i in cuts_old] != [edited_lines[j].strip() for j in cuts_new]:
+        raise RenderError("the edit adds, removes, or changes an agent-kit-sync comment line around lines for some apps; make that change in the module's file")
+    src_cuts = [old.source_index[i] for i in cuts_old]
+    bounds_old, bounds_new, bounds_src = [-1] + cuts_old + [len(old.lines)], [-1] + cuts_new + [len(edited_lines)], [-1] + src_cuts + [len(source_lines)]
+    out: List[str] = []
+    removed: Dict[str, Set[int]] = {}
+    added: Dict[str, Set[int]] = {}
+    for piece in range(len(bounds_old) - 1):
+        o1, o2 = bounds_old[piece] + 1, bounds_old[piece + 1]
+        n1, n2 = bounds_new[piece] + 1, bounds_new[piece + 1]
+        s1, s2 = bounds_src[piece] + 1, bounds_src[piece + 1]
+        old_piece = Projection(list(old.lines[o1:o2]), [k - s1 for k in old.source_index[o1:o2]])
+        new_piece = list(edited_lines[n1:n2])
+        out += carry_back(source_lines[s1:s2], old_piece, new_piece, lambda j, line, n1=n1: reverse(n1 + j, line))
+        if piece < len(src_cuts):
+            out.append(source_lines[src_cuts[piece]])
+        # Comment lines come in start and end pairs, so odd stretches are inside a block.
+        region = piece if piece % 2 else -1
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_piece.lines, new_piece, autojunk=False).get_opcodes():
+            if tag != "equal":
+                for line in old_piece.lines[i1:i2]:
+                    removed.setdefault(line.strip(), set()).add(region)
+                for line in new_piece[j1:j2]:
+                    added.setdefault(line.strip(), set()).add(region)
+    for text, regions in added.items():
+        if text and removed.get(text, set()) - regions:
+            raise RenderError("the edit moves a line into or out of a block of lines for some apps, which would change what other apps see; make this change in the module's file")
+    return out
 
 
 # ---------------------------------------------------------------- plain templates
@@ -232,8 +274,16 @@ def _unclear_at_marker(opcodes, number: int, old: Projection, edited_lines: Sequ
 
 def render_text(source: str, values: Values) -> Projection:
     lines = source.splitlines(keepends=True)
-    hidden, _markers = only_lines(lines, values.app)
-    return project(lines, lambda number, line: None if number in hidden else substitute(line, values))
+    hidden, shown, _markers = only_lines(lines, values.app)
+
+    def rule(number: int, line: str) -> Optional[str]:
+        if number in hidden:
+            return None
+        if number in shown:
+            return shown_line(shown[number], line)
+        return substitute(line, values)
+
+    return project(lines, rule)
 
 
 def carry_back_text(source: str, old_render: str, edited: str, values: Values) -> str:
@@ -241,8 +291,8 @@ def carry_back_text(source: str, old_render: str, edited: str, values: Values) -
     if old.text != old_render:
         raise RenderError("the source no longer renders to the copy that was written, so the edit cannot be carried back exactly")
     source_lines = source.splitlines(keepends=True)
-    _hidden, markers = only_lines(source_lines, values.app)
-    lines = carry_back(source_lines, old, edited.splitlines(keepends=True), lambda _j, line: reverse_paths(line, values), markers)
+    _hidden, shown, _markers = only_lines(source_lines, values.app)
+    lines = carry_back_blocks(source_lines, old, edited.splitlines(keepends=True), lambda _j, line: reverse_paths(line, values), shown)
     return "".join(lines)
 
 
@@ -273,9 +323,9 @@ def front_entries(lines: Sequence[str], start: int, end: int) -> List[Tuple[str,
     return entries
 
 
-def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, Dict[str, str], Set[int]]:
+def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, Dict[str, str], Dict[int, str]]:
     _, start, end = split_frontmatter("".join(lines))
-    drop, markers = only_lines(lines, app)
+    drop, shown, markers = only_lines(lines, app)
     if start >= 0 and any(number <= end for number in markers):
         raise RenderError("a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools")
     renamed: Dict[str, str] = {}
@@ -290,24 +340,26 @@ def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, 
     def rule(number: int, line: str) -> Optional[str]:
         if number in drop:
             return None
+        if number in shown:
+            return shown_line(shown[number], line)
         if start >= 0 and start < number < end:
             match = FRONT_KEY.match(line)
             if match and match.group(1).startswith(own):
                 line = match.group(1)[len(own):] + ":" + match.group(2) + line[match.end():]
         return substitute(line, values)
 
-    return rule, renamed, markers
+    return rule, renamed, shown
 
 
 def render_agent_md(source: str, app: str, values: Values) -> Projection:
     lines = source.splitlines(keepends=True)
-    rule, _renamed, _markers = _md_rule(app, values, lines)
+    rule, _renamed, _shown = _md_rule(app, values, lines)
     return project(lines, rule)
 
 
 def carry_back_agent_md(source: str, app: str, old_render: str, edited: str, values: Values) -> str:
     lines = source.splitlines(keepends=True)
-    rule, renamed, markers = _md_rule(app, values, lines)
+    rule, renamed, shown = _md_rule(app, values, lines)
     old = project(lines, rule)
     if old.text != old_render:
         raise RenderError("the subagent definition changed since this copy was written")
@@ -330,7 +382,7 @@ def carry_back_agent_md(source: str, app: str, old_render: str, edited: str, val
                     line = app + "." + key + ":" + match.group(2) + line[match.end():]
         return line
 
-    return "".join(carry_back(lines, old, edited_lines, reverse, markers))
+    return "".join(carry_back_blocks(lines, old, edited_lines, reverse, shown))
 
 
 def yaml_scalar(raw: str):

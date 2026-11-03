@@ -142,7 +142,9 @@ class Checker:
                     continue
                 findings.append(Finding("format", path, number, f"unknown placeholder {match.group(0)}"))
         try:
-            _hidden, markers = render.only_lines(lines, "claude")
+            _hidden, _shown, markers = render.only_lines(lines, "claude")
+            if markers and PurePosixPath(path).suffix != ".md":
+                findings.append(Finding("format", path, min(markers) + 1, "{{kit.only}} blocks work only in Markdown files, because agent-kit-sync shows their edges as Markdown comments"))
             if "agents" in PurePosixPath(path).parts and markers:
                 _lines, start, end = render.split_frontmatter(text)
                 if start >= 0 and min(markers) <= end:

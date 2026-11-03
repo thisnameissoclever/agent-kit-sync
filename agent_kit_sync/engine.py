@@ -531,8 +531,11 @@ class Engine:
             atomic_write(target, text.encode("utf-8"))
 
     def _hook_commands(self) -> Dict[str, str]:
-        from .plan import hook_commands
-        return hook_commands(self.layout, self.machine, self.carry_modules)
+        """Commands for every hook a copy on this machine can name: the inventory's and the installed ones."""
+        from .plan import hook_command, hook_commands
+        commands = {f"{h['module']}/{h['name']}": hook_command(self.layout, self.machine, h["module"], h["name"]) for h in self.index.hooks}
+        commands.update(hook_commands(self.layout, self.machine, self.carry_modules))
+        return commands
 
     def _check_sources(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]], tree: Tree) -> List[checks.Finding]:
         problems: List[checks.Finding] = []
@@ -646,6 +649,7 @@ class Engine:
         from .tree import ignored
         head = gitops.head(self.checkout)
         paths, failed = [], []
+        templated_paths = self._templated_paths()
         for entry in gitops.status_porcelain(self.checkout):
             status, path = entry[:2], entry[3:]
             if " -> " in path:
@@ -659,7 +663,7 @@ class Engine:
             data = read_or_none(target)
             if data is not None:
                 old = gitops.show(self.checkout, "HEAD", path) if head else None
-                templated = (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
+                templated = path in templated_paths or (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
                 problems = self.checker.file(path, data, own=True, templated=templated, added_lines=checks.added_line_numbers(old, data))
                 if problems:
                     failed.append((path, problems))
@@ -678,6 +682,25 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
+
+    def _templated_paths(self) -> Set[str]:
+        """Config repo paths whose placeholders are replaced: sections, subagent definitions, and skill templates."""
+        found: Set[str] = set()
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError:
+            return found
+        for module in modules:
+            if module.local or module.source:
+                continue
+            base = f"modules/{module.name}"
+            for item in module.items:
+                if item.kind in ("section", "agent"):
+                    found.add(f"{base}/{item.data.get('file', '')}")
+                    found.update(f"{base}/{rel}" for rel in dict(item.data.get("variants", {})).values())
+                elif item.kind == "skill":
+                    found.update(f"{base}/{item.data['dir'].rstrip('/')}/{rel}" for rel in item.data.get("templates", []))
+        return found
 
     def merge_remote(self) -> None:
         # A run started after a file write fetches at most once a minute; every other run fetches.

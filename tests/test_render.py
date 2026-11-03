@@ -27,57 +27,96 @@ Last line.
 """
 
 
+START = "<!-- agent-kit-sync only claude -->\n"
+END = "<!-- agent-kit-sync end only -->\n"
+
+
+def carry(source, app, edit):
+    """Render `source` for `app`, apply `edit` to the copy, and carry it back."""
+    rendered = render.render_text(source, values(app)).text
+    edited = edit(rendered)
+    back = render.carry_back_text(source, rendered, edited, values(app))
+    assert render.render_text(back, values(app)).text == edited
+    return back
+
+
 class OnlyBlockTests(unittest.TestCase):
     def test_section_lines_appear_only_in_their_app(self):
         source = "Shared.\n{{kit.only codex}}\nCodex only.\n{{kit.end}}\nAlso shared.\n"
-        self.assertEqual(render.render_text(source, values("codex")).text, "Shared.\nCodex only.\nAlso shared.\n")
+        self.assertEqual(render.render_text(source, values("codex")).text,
+                         "Shared.\n<!-- agent-kit-sync only codex -->\nCodex only.\n<!-- agent-kit-sync end only -->\nAlso shared.\n")
         self.assertEqual(render.render_text(source, values("claude")).text, "Shared.\nAlso shared.\n")
 
     def test_block_can_list_several_apps(self):
         source = "{{kit.only claude cursor}}\nNot Codex.\n{{kit.end}}\n"
-        self.assertEqual(render.render_text(source, values("cursor")).text, "Not Codex.\n")
+        self.assertEqual(render.render_text(source, values("cursor")).text, "<!-- agent-kit-sync only claude cursor -->\nNot Codex.\n" + END)
         self.assertEqual(render.render_text(source, values("codex")).text, "")
 
     def test_agent_body_block_reaches_markdown_and_not_codex(self):
         claude = render.render_agent_md(AGENT, "claude", values("claude")).text
-        self.assertIn("A hook runs `run guard` for this app only.", claude)
-        self.assertNotIn("kit.only", claude)
-        self.assertNotIn("kit.end", claude)
+        self.assertIn(START + "A hook runs `run guard` for this app only.\n\n" + END, claude)
+        self.assertNotIn("kit.", claude)
         codex = toml.loads(render.render_agent_codex(AGENT, values("codex")))
         self.assertEqual(codex["developer_instructions"], "First line.\n\nLast line.\n")
         self.assertEqual(codex["sandbox_mode"], "read-only")
 
-    def test_edit_outside_a_block_keeps_the_block(self):
-        rendered = render.render_agent_md(AGENT, "claude", values("claude")).text
-        edited = rendered.replace("Last line.", "Final line.")
-        back = render.carry_back_agent_md(AGENT, "claude", rendered, edited, values("claude"))
-        self.assertEqual(back, AGENT.replace("Last line.", "Final line."))
-
-    def test_edit_inside_a_block_stays_inside_it(self):
-        rendered = render.render_agent_md(AGENT, "claude", values("claude")).text
-        edited = rendered.replace("for this app only.", "for Claude Code only.")
-        back = render.carry_back_agent_md(AGENT, "claude", rendered, edited, values("claude"))
-        self.assertEqual(back, AGENT.replace("for this app only.", "for Claude Code only."))
+    def test_edits_in_claude_copy_carry_back(self):
+        for old, new in (("Last line.", "Final line."), ("for this app only.", "for Claude Code only.")):
+            with self.subTest(old=old):
+                rendered = render.render_agent_md(AGENT, "claude", values("claude")).text
+                back = render.carry_back_agent_md(AGENT, "claude", rendered, rendered.replace(old, new), values("claude"))
+                self.assertEqual(back, AGENT.replace(old, new))
 
     def test_codex_edit_keeps_the_other_apps_block(self):
         rendered = render.render_agent_codex(AGENT, values("codex"))
-        edited = rendered.replace("Last line.", "Final line.")
-        back = render.carry_back_agent_codex(AGENT, rendered, edited, values("codex"))
+        back = render.carry_back_agent_codex(AGENT, rendered, rendered.replace("Last line.", "Final line."), values("codex"))
         self.assertEqual(back, AGENT.replace("Last line.", "Final line."))
 
-    def test_lines_added_at_a_block_edge_are_refused(self):
-        source = "Shared.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared.\n"
-        rendered = render.render_text(source, values("codex")).text
-        edited = rendered.replace("Shared.\n", "Shared.\nNew line.\n", 1)
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, edited, values("codex"))
+    def test_a_line_added_on_either_side_of_a_comment_line_stays_there(self):
+        source = "Intro.\n\n{{kit.only claude cursor}}\nA hook runs in a sandbox.\n{{kit.end}}\n\nOutro.\n"
+        inside = carry(source, "claude", lambda t: t.replace("sandbox.\n", "sandbox.\nIt blocks writes.\n"))
+        self.assertEqual(render.render_text(inside, values("codex")).text, "Intro.\n\n\nOutro.\n")
+        self.assertIn("It blocks writes.", render.render_text(inside, values("cursor")).text)
+        outside = carry(source, "claude", lambda t: t.replace("end only -->\n", "end only -->\nIt blocks writes.\n").replace("Outro.", "Outro, reworded."))
+        self.assertEqual(render.render_text(outside, values("codex")).text, "Intro.\n\nIt blocks writes.\n\nOutro, reworded.\n")
 
-    def test_lines_added_away_from_a_block_are_carried_back(self):
-        source = "Top.\nShared.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared.\n"
-        rendered = render.render_text(source, values("codex")).text
-        edited = rendered.replace("Top.\n", "Top.\nNew line.\n", 1)
-        back = render.carry_back_text(source, rendered, edited, values("codex"))
-        self.assertEqual(back, source.replace("Top.\n", "Top.\nNew line.\n", 1))
+    def test_codex_edits_next_to_a_hidden_block_keep_it_whole(self):
+        source = "Shared.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared.\n"
+        back = carry(source, "codex", lambda t: "Shared, reworded.\nNew line.\nAlso shared, reworded.\n")
+        self.assertIn("{{kit.only claude}}\nClaude only.\n{{kit.end}}\n", back)
+        self.assertEqual(render.render_text(back, values("claude")).text.count("Claude only."), 1)
+
+    def test_moving_a_line_across_a_comment_line_is_refused(self):
+        source = "Read the task.\nFollow the plan.\n{{kit.only claude}}\nA hook sandboxes every command.\n{{kit.end}}\nReport back.\n"
+        rendered = render.render_text(source, values("claude")).text
+        moved = rendered.replace("A hook sandboxes every command.\n", "").replace("Read the task.\n", "Read the task.\nA hook sandboxes every command.\n")
+        with self.assertRaises(render.RenderError):
+            render.carry_back_text(source, rendered, moved, values("claude"))
+
+    def test_changing_a_comment_line_is_refused(self):
+        source = "A.\n{{kit.only claude}}\nB.\n{{kit.end}}\nC.\n"
+        rendered = render.render_text(source, values("claude")).text
+        for edited in (rendered.replace(END, ""), rendered.replace(START, "<!-- agent-kit-sync only codex -->\n"), rendered + START):
+            with self.subTest(edited=edited), self.assertRaises(render.RenderError):
+                render.carry_back_text(source, rendered, edited, values("claude"))
+
+    def test_deleting_lines_keeps_each_on_its_side(self):
+        source = "- one\n{{kit.only claude}}\n- two\n{{kit.end}}\n- two\n- three\n"
+        back = carry(source, "claude", lambda t: t.replace(END + "- two\n- three\n", END))
+        self.assertEqual(render.render_text(back, values("codex")).text, "- one\n")
+        back = carry(source, "claude", lambda t: t.replace(START + "- two\n", START))
+        self.assertEqual(render.render_text(back, values("codex")).text, "- one\n- two\n- three\n")
+
+    def test_missing_last_line_break_before_hidden_lines_is_refused(self):
+        source = "Shared.\n{{kit.only codex}}\nCodex note.\n{{kit.end}}\n"
+        rendered = render.render_text(source, values("claude")).text
+        with self.assertRaises(render.RenderError):
+            render.carry_back_text(source, rendered, "Shared, edited.", values("claude"))
+        plain = "One.\nTwo.\n"
+        self.assertEqual(render.carry_back_text(plain, plain, "One.\nTwo, edited.", values("claude")), "One.\nTwo, edited.")
+        form_feed = "Page one.\x0cPage two.\nLast.\n"
+        self.assertEqual(render.carry_back_text(form_feed, form_feed, form_feed.replace("Last.", "Last, edited."), values("claude")),
+                         form_feed.replace("Last.", "Last, edited."))
 
     def test_malformed_blocks_are_refused(self):
         for source in (
@@ -87,6 +126,7 @@ class OnlyBlockTests(unittest.TestCase):
             "{{kit.only vscode}}\nx\n{{kit.end}}\n",
             "Inline {{kit.only claude}} marker.\n",
             "---\nname: a\n{{kit.only claude}}\ntools: Read\n{{kit.end}}\n---\nBody.\n",
+            "Text\n<!-- agent-kit-sync end only -->\n",
         ):
             with self.subTest(source=source), self.assertRaises(render.RenderError):
                 render.render_agent_md(source, "claude", values("claude"))
@@ -104,103 +144,54 @@ class OnlyBlockTests(unittest.TestCase):
             ("a.md", "{{kit.only vscode}}\nx\n{{kit.end}}\n"),
             ("a.md", "{{kit.only claude,cursor}}\nx\n{{kit.end}}\n"),
             ("a.md", "Inline {{kit.only claude}} marker.\n"),
+            ("a.md", "<!-- agent-kit-sync only claude -->\n"),
+            ("a.json", "{{kit.only claude}}\nx\n{{kit.end}}\n"),
             ("m/agents/a.md", "---\nname: a\n{{kit.only claude}}\ntools: Read\n{{kit.end}}\n---\nBody.\n"),
         ):
             with self.subTest(text=text):
                 self.assertTrue(checker.placeholder_findings(path, text))
 
-    def assert_round_trip_or_refused(self, source, app, edited):
-        """Either the edit is refused, or the carried-back source renders to the edit for this app."""
-        rendered = render.render_text(source, values(app)).text
-        try:
-            back = render.carry_back_text(source, rendered, edited, values(app))
-        except render.RenderError:
-            return None
-        self.assertEqual(render.render_text(back, values(app)).text, edited)
-        return back
-
-    def test_insert_beside_a_blank_line_at_a_block_edge_is_refused(self):
-        source = "Intro.\n\n{{kit.only claude cursor}}\nA hook runs in a sandbox.\n{{kit.end}}\n\nOutro.\n"
-        rendered = render.render_text(source, values("claude")).text
-        edited = rendered.replace("sandbox.\n\n", "sandbox.\n\nIt blocks writes.\n\n")
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, edited, values("claude"))
-        source = "Intro.\n\n{{kit.only codex}}\nCodex paragraph.\n\n{{kit.end}}\nOutro.\n"
-        rendered = render.render_text(source, values("codex")).text
-        edited = rendered.replace("paragraph.\n\n", "paragraph.\n\nAnother.\n\n")
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, edited, values("codex"))
-
-    def test_replacement_that_adds_a_line_at_a_block_edge_is_refused(self):
-        source = "First line.\n{{kit.only claude}}\nClaude note.\n{{kit.end}}\nLast line.\n"
-        rendered = render.render_text(source, values("claude")).text
-        edited = rendered.replace("Last line.\n", "Claude: use Read only.\nFinal line.\n")
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, edited, values("claude"))
-
-    def test_rewording_lines_on_both_sides_of_a_hidden_block_keeps_it_in_place(self):
-        source = "Shared.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared.\n"
-        rendered = render.render_text(source, values("codex")).text
-        edited = "Shared, reworded.\nAlso shared, reworded.\n"
-        back = render.carry_back_text(source, rendered, edited, values("codex"))
-        self.assertEqual(back, "Shared, reworded.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\nAlso shared, reworded.\n")
-
-    def test_missing_last_line_break_before_hidden_lines_is_refused(self):
-        source = "Shared.\n{{kit.only claude}}\nClaude note.\n{{kit.end}}\n"
-        rendered = render.render_text(source, values("claude")).text
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, "Shared.\nClaude note, edited.", values("claude"))
-        plain = "One.\nTwo.\n"
-        self.assertEqual(render.carry_back_text(plain, plain, "One.\nTwo, edited.", values("claude")), "One.\nTwo, edited.")
-
-    def test_deleting_a_line_that_matches_one_across_a_marker_is_refused(self):
-        source = "A\n{{kit.only claude}}\nC\n\n{{kit.end}}\n\nE\n"
-        rendered = render.render_text(source, values("claude")).text
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, rendered.replace("\n\n\n", "\n\n"), values("claude"))
-        source = "- one\n{{kit.only claude}}\n- two\n{{kit.end}}\n- two\n- three\n"
-        rendered = render.render_text(source, values("claude")).text
-        with self.assertRaises(render.RenderError):
-            render.carry_back_text(source, rendered, "- one\n- two\n- three\n", values("claude"))
-
-    def test_deleting_a_whole_block_line_is_carried_back(self):
-        source = "Shared.\n{{kit.only claude}}\nClaude one.\nClaude two.\n{{kit.end}}\nAlso shared.\n"
-        rendered = render.render_text(source, values("claude")).text
-        back = render.carry_back_text(source, rendered, rendered.replace("Claude one.\n", ""), values("claude"))
-        self.assertEqual(back, source.replace("Claude one.\n", ""))
-
-    def test_random_edits_keep_the_other_apps_block(self):
+    def test_random_edits_never_move_lines_between_apps(self):
         import random
         rng = random.Random(7)
-        pool = ["Shared.\n", "\n", "Other.\n", "- item\n", "Claude note.\n", "Codex note.\n"]
         source = "Top.\n\n{{kit.only claude}}\nClaude note.\n\n{{kit.end}}\n\nMiddle.\n{{kit.only codex}}\nCodex note.\n{{kit.end}}\n- item\nEnd.\n"
-        codex_block = "{{kit.only codex}}\nCodex note.\n{{kit.end}}\n"
-        carried = 0
-        for _ in range(3000):
-            lines = render.render_text(source, values("claude")).text.splitlines(keepends=True)
-            for _step in range(rng.randint(1, 3)):
-                action = rng.choice(("insert", "delete", "replace"))
-                at = rng.randrange(len(lines) + 1)
-                if action == "insert":
-                    lines.insert(at, rng.choice(pool))
-                elif at < len(lines):
-                    if action == "delete":
-                        del lines[at]
-                    else:
-                        lines[at] = rng.choice(pool)
-            back = self.assert_round_trip_or_refused(source, "claude", "".join(lines))
-            if back is None:
-                continue
-            carried += 1
-            # Claude Code cannot see Codex's block, so no edit made there may change it.
-            self.assertEqual(back.count(codex_block), 1, back)
-            render.render_text(back, values("codex"))
-        self.assertGreater(carried, 1000)
+        pool = ["Shared.\n", "\n", "- item\n", "Claude note.\n", "Codex note.\n", START, END]
+        for app, other_block in (
+            ("claude", "{{kit.only codex}}\nCodex note.\n{{kit.end}}\n"),
+            ("codex", "{{kit.only claude}}\nClaude note.\n\n{{kit.end}}\n"),
+        ):
+            carried = 0
+            for _ in range(3000):
+                lines = render.render_text(source, values(app)).text.splitlines(keepends=True)
+                for _step in range(rng.randint(1, 3)):
+                    action = rng.choice(("insert", "delete", "replace"))
+                    at = rng.randrange(len(lines) + 1)
+                    if action == "insert":
+                        lines.insert(at, rng.choice(pool))
+                    elif at < len(lines):
+                        if action == "delete":
+                            del lines[at]
+                        else:
+                            lines[at] = rng.choice(pool)
+                rendered = render.render_text(source, values(app)).text
+                edited = "".join(lines)
+                try:
+                    back = render.carry_back_text(source, rendered, edited, values(app))
+                except render.RenderError:
+                    continue
+                carried += 1
+                # The copy renders back exactly, and its comment lines come only from the source's
+                # markers, so each line is inside this app's block exactly when the user put it there.
+                self.assertEqual(render.render_text(back, values(app)).text, edited)
+                self.assertEqual(back.count("{{kit.only " + app + "}}\n"), 1, back)
+                # The other app's block is never visible here, so no edit may change it.
+                self.assertEqual(back.count(other_block), 1, back)
+            self.assertGreater(carried, 500, app)
 
     def test_hook_command_is_reversed_only_as_a_whole_command(self):
-        rendered = "Run `run guard` here and run guard-v2 there.\n"
+        rendered = "Run `run guard` here, run guard-v2 there, and finally run guard.\n"
         source = render.carry_back_text("Old.\n", "Old.\n", rendered, values("claude"))
-        self.assertEqual(source, "Run `{{kit.hook m/guard}}` here and run guard-v2 there.\n")
+        self.assertEqual(source, "Run `{{kit.hook m/guard}}` here, run guard-v2 there, and finally {{kit.hook m/guard}}.\n")
 
 
 if __name__ == "__main__":
