@@ -338,6 +338,8 @@ def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny:
             return None  # The combining path adds the alerts, or the empty object Codex needs on stop.
         return 0, stdout, stderr, []
     data = parse_json(stdout)
+    if data is None and alerts and event in ("session_start", "user_prompt"):
+        return None  # Plain text here is context; the combining path keeps it and adds the alerts.
     if not isinstance(data, dict):
         return 0, stdout, stderr, []
     specific = data.get("hookSpecificOutput") if isinstance(data.get("hookSpecificOutput"), dict) else None
@@ -354,7 +356,8 @@ def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny:
     if convert_ask:
         specific["permissionDecision"] = "deny"
         reason = str(specific.get("permissionDecisionReason") or "")
-        specific["permissionDecisionReason"] = (reason + "\n" if reason else "") + "Ask the user before running this; the app does not support confirmation prompts from hooks."
+        note = "Ask the user before running this; the app does not support confirmation prompts from hooks." if ask_is_deny else "Ask the user before running this."
+        specific["permissionDecisionReason"] = (reason + "\n" if reason else "") + note
     return 0, json.dumps(data).encode("utf-8"), stderr, alerts
 
 
@@ -411,7 +414,9 @@ def main(layout_root, launcher, app: str, event: str) -> int:
             pass
     if passed is None:
         code, out = emit(app, event, combined, payload, cursor_ask_is_deny)
-        err = b""
+        # A lone native hook that succeeded keeps its own error text even when its answer is combined.
+        lone = results[0] if len(results) == 1 else None
+        err = lone["stderr"] if lone and lone["hook"].get("protocol", "native") == "native" and not failed(lone) else b""
     else:
         code, out, err, delivered = passed
     if session:

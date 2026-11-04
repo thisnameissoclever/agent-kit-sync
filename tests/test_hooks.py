@@ -135,7 +135,10 @@ class DispatchUnitTests(unittest.TestCase):
         self.assertEqual((code, delivered), (0, [alert]))
         # Exit code 2 and plain text cannot carry an alert, so it waits for the next event.
         self.assertEqual(dispatch.pass_through("claude", "pre_tool_use", [self.native(2, b"", b"No.")], [alert], False), (2, b"", b"No.", []))
-        self.assertEqual(dispatch.pass_through("claude", "session_start", [self.native(0, b"Text.\n")], [alert], False)[3], [])
+        # Plain text on session_start is context, so the combining path keeps it and adds the alert.
+        self.assertIsNone(dispatch.pass_through("claude", "session_start", [self.native(0, b"Text.\n")], [alert], False))
+        combined = dispatch.combine("claude", "session_start", [self.native(0, b"Text.\n")])
+        self.assertEqual(combined.context, ["Text."])
         # With no output to keep, the combining path delivers it.
         self.assertIsNone(dispatch.pass_through("claude", "pre_tool_use", [self.native(0, b"")], [alert], False))
 
@@ -146,7 +149,10 @@ class DispatchUnitTests(unittest.TestCase):
                 _code, out, _err, _delivered = dispatch.pass_through(app, "pre_tool_use", [self.native(0, printed)], [], ask_is_deny)
                 specific = json.loads(out)["hookSpecificOutput"]
                 self.assertEqual(specific["permissionDecision"], "deny")
-                self.assertTrue(specific["permissionDecisionReason"].startswith("Quoted dash.\nAsk the user"))
+                # The same wording emit() uses for each app.
+                combined = dispatch.combine(app, "pre_tool_use", [self.native(0, printed)])
+                expected = json.loads(dispatch.emit(app, "pre_tool_use", combined, {}, ask_is_deny)[1])["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertEqual(specific["permissionDecisionReason"], expected)
         self.assertEqual(dispatch.pass_through("claude", "pre_tool_use", [self.native(0, printed)], [], False)[1], printed)
 
     def test_empty_stop_in_codex_prints_json(self):
@@ -319,6 +325,22 @@ class InstalledToolTests(TwoMachines):
         result = self.cli("update")
         self.assertIn(b"failed", result.stdout)
         self.assertEqual((self.a.layout.tool / "current").read_text().strip(), before)
+
+    def test_lone_hooks_error_text_survives_when_an_alert_is_added(self):
+        self.install()
+        note = self.a.layout.config / "modules/guards/hooks/note.py"
+        manifest = self.a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "note"\nfile = "hooks/note.py"\nevents = ["stop"]\nprotocol = "native"\n')
+        note.write_text("import sys\nsys.stdin.read()\nsys.stderr.write('stop note')\n")
+        git(self.a.layout.config, "add", "-A")
+        git(self.a.layout.config, "commit", "-q", "-m", "note hook")
+        self.assertEqual(self.cli("sync", "--offline").returncode, 0)
+        payload = json.dumps({"session_id": "s9", "hook_event_name": "Stop"}).encode()
+        result = self.cli("hook", "codex", "stop", stdin=payload)
+        self.assertEqual(result.stderr, b"stop note")
+        self.assertIn("Codex", json.loads(result.stdout)["systemMessage"])  # The open approval alert.
+        result = self.cli("hook", "codex", "stop", stdin=payload)
+        self.assertEqual((result.stdout, result.stderr), (b"{}", b"stop note"))
 
     def test_dispatcher_timing(self):
         self.install()
