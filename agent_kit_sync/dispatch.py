@@ -267,8 +267,20 @@ def copies_changed(index: dict) -> bool:
     return False
 
 
+def _seen_path(state: str, session: str) -> str:
+    return os.path.join(state, "seen", session.replace("/", "_").replace("\\", "_")[:120] + ".json")
+
+
+def _seen(state: str, session: str) -> set:
+    try:
+        with open(_seen_path(state, session), encoding="utf-8") as handle:
+            return set(json.load(handle))
+    except (OSError, ValueError):
+        return set()
+
+
 def unseen_alerts(state: str, session: str) -> list:
-    """Open alerts this session has not been shown, marking them shown."""
+    """Open alerts this session has not been shown. mark_shown records the ones delivered."""
     try:
         with open(os.path.join(state, "alerts.json"), encoding="utf-8") as handle:
             alerts = [a for a in json.load(handle) if not a.get("closed")]
@@ -276,24 +288,77 @@ def unseen_alerts(state: str, session: str) -> list:
         return []
     if not alerts:
         return []
-    seen_dir = os.path.join(state, "seen")
-    seen_path = os.path.join(seen_dir, session.replace("/", "_").replace("\\", "_")[:120] + ".json")
+    seen = _seen(state, session)
+    return [a for a in alerts if a.get("id") not in seen]
+
+
+def mark_shown(state: str, session: str, alerts: list) -> None:
+    if not alerts:
+        return
+    path = _seen_path(state, session)
     try:
-        with open(seen_path, encoding="utf-8") as handle:
-            seen = set(json.load(handle))
-    except (OSError, ValueError):
-        seen = set()
-    fresh = [a for a in alerts if a.get("id") not in seen]
-    if fresh:
-        try:
-            os.makedirs(seen_dir, exist_ok=True)
-            tmp = seen_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(sorted(seen | {a["id"] for a in fresh}), handle)
-            os.replace(tmp, seen_path)
-        except OSError:
-            pass
-    return fresh
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(sorted(_seen(state, session) | {a["id"] for a in alerts}), handle)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def alert_lines(event: str, alerts: list) -> tuple:
+    """The text for the user and the line for the agent that deliver these alerts."""
+    user = ["agent-kit-sync: " + alert["message"] for alert in alerts]
+    context = []
+    if alerts and event != "stop":
+        commands = sorted({alert.get("command") or "agent-kit-sync status" for alert in alerts})
+        context.append(f"agent-kit-sync raised {len(alerts)} alert(s) for the user. Run `{commands[0]}` to see them, then follow the agent-kit-sync-resolve skill to help the user decide.")
+    return user, context
+
+
+def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny: bool):
+    """When one native hook ran and did not fail, return its own (exit code, stdout, stderr, delivered alerts).
+
+    The output stays byte for byte what the hook printed unless alerts must be added, or the hook
+    asked for confirmation where the app may not enforce it (Codex, and any machine with Cursor,
+    as in emit), which becomes a refusal telling the agent to ask. Alerts
+    that cannot be added without rewriting the output, after exit code 2 or plain text, wait for
+    the session's next event. Returns None when the combining path must handle the results.
+    """
+    if len(results) != 1:
+        return None
+    result = results[0]
+    if result["hook"].get("protocol", "native") != "native" or failed(result):
+        return None
+    stdout, stderr = result["stdout"], result["stderr"]
+    if result["code"] == 2:
+        return 2, stdout, stderr, []
+    if not stdout.strip():
+        if alerts or (app == "codex" and event in ("stop", "subagent_stop")):
+            return None  # The combining path adds the alerts, or the empty object Codex needs on stop.
+        return 0, stdout, stderr, []
+    data = parse_json(stdout)
+    if data is None and alerts and event in ("session_start", "user_prompt"):
+        return None  # Plain text here is context; the combining path keeps it and adds the alerts.
+    if not isinstance(data, dict):
+        return 0, stdout, stderr, []
+    specific = data.get("hookSpecificOutput") if isinstance(data.get("hookSpecificOutput"), dict) else None
+    convert_ask = (ask_is_deny or app == "codex") and specific is not None and specific.get("permissionDecision") == "ask"
+    if not alerts and not convert_ask:
+        return 0, stdout, stderr, []
+    user, context = alert_lines(event, alerts)
+    if user:
+        data["systemMessage"] = "\n".join(([str(data["systemMessage"])] if data.get("systemMessage") else []) + user)
+    if context and (event not in ("stop", "subagent_stop") or app == "claude"):
+        if specific is None:
+            specific = data["hookSpecificOutput"] = {"hookEventName": APP_EVENTS.get(app, {}).get(event, event)}
+        specific["additionalContext"] = "\n\n".join(([str(specific["additionalContext"])] if specific.get("additionalContext") else []) + context)
+    if convert_ask:
+        specific["permissionDecision"] = "deny"
+        reason = str(specific.get("permissionDecisionReason") or "")
+        note = "Ask the user before running this; the app does not support confirmation prompts from hooks." if ask_is_deny else "Ask the user before running this."
+        specific["permissionDecisionReason"] = (reason + "\n" if reason else "") + note
+    return 0, json.dumps(data).encode("utf-8"), stderr, alerts
 
 
 def main(layout_root, launcher, app: str, event: str) -> int:
@@ -323,17 +388,19 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         env["AGENT_KIT_SYNC_APP"] = calling
         with ThreadPoolExecutor(max_workers=min(8, len(hooks))) as pool:
             results = list(pool.map(lambda h: run_one(h, app, event, raw, payload, env), hooks))
-    combined = combine(app, event, results)
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
+    fresh = []
     if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop"):
         fresh = unseen_alerts(state, session)
-        if fresh:
-            for alert in fresh:
-                combined.user.append("agent-kit-sync: " + alert["message"])
-            if event != "stop":
-                commands = sorted({alert.get("command") or "agent-kit-sync status" for alert in fresh})
-                combined.context.append(f"agent-kit-sync raised {len(fresh)} alert(s) for the user. Run `{commands[0]}` to see them, then follow the agent-kit-sync-resolve skill to help the user decide.")
+    cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
+    passed = pass_through(app, event, results, fresh, cursor_ask_is_deny)
+    if passed is None:
+        combined = combine(app, event, results)
+        user, context = alert_lines(event, fresh)
+        combined.user += user
+        combined.context += context
+        delivered = fresh
     # Start a background sync when this event calls for one.
     want_sync = event == "session_start"
     if event == "post_tool_use" and str(payload.get("tool_name", "")) in WRITE_TOOLS.get(app, []):
@@ -345,8 +412,17 @@ def main(layout_root, launcher, app: str, event: str) -> int:
             detach([sys.executable, "-I", "-S", str(launcher), "sync", "--background", "--quiet-wait" if event == "post_tool_use" else "--now"], layout_root)
         except OSError:
             pass
-    cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
-    code, out = emit(app, event, combined, payload, cursor_ask_is_deny)
+    if passed is None:
+        code, out = emit(app, event, combined, payload, cursor_ask_is_deny)
+        # A lone native hook that succeeded keeps its own error text even when its answer is combined.
+        lone = results[0] if len(results) == 1 else None
+        err = lone["stderr"] if lone and lone["hook"].get("protocol", "native") == "native" and not failed(lone) else b""
+    else:
+        code, out, err, delivered = passed
+    if session:
+        mark_shown(state, session, delivered)
+    if err:
+        sys.stderr.buffer.write(err)
     if out:
         sys.stdout.buffer.write(out)
     return code

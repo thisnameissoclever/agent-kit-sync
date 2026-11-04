@@ -99,6 +99,62 @@ class DispatchUnitTests(unittest.TestCase):
         _code, out = dispatch.emit("codex", "stop", dispatch.combine("codex", "stop", [a]), {}, False)
         self.assertEqual(json.loads(out), {"decision": "block", "reason": "finish the tests"})
 
+    def native(self, code=0, stdout=b"", stderr=b"", protocol="native"):
+        return {"hook": {"module": "m", "name": "h", "protocol": protocol, "on_failure": "open"}, "code": code, "stdout": stdout, "stderr": stderr}
+
+    def test_lone_native_hook_output_passes_through_unchanged(self):
+        printed = b'{"systemMessage": "Writing check: x", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": "x"}}\n'
+        for result, expected in (
+            (self.native(0, printed, b"note"), (0, printed, b"note", [])),
+            (self.native(2, b"", b"Refusing."), (2, b"", b"Refusing.", [])),
+            (self.native(0, b"plain context\n"), (0, b"plain context\n", b"", [])),
+            (self.native(0, b"", b"only a note"), (0, b"", b"only a note", [])),
+        ):
+            with self.subTest(result=result):
+                self.assertEqual(dispatch.pass_through("claude", "pre_tool_use", [result], [], False), expected)
+
+    def test_hooks_the_combining_path_must_handle(self):
+        two = [self.native(0, b"{}"), self.native(0, b"{}")]
+        for results, app, event in (
+            (two, "claude", "pre_tool_use"),
+            ([self.native(1, b"", b"boom")], "claude", "pre_tool_use"),
+            ([self.native(0, b'{"decision": "allow"}', protocol="kit")], "claude", "pre_tool_use"),
+            ([self.native(0, b"")], "codex", "stop"),
+            ([], "claude", "pre_tool_use"),
+        ):
+            with self.subTest(app=app, event=event, n=len(results)):
+                self.assertIsNone(dispatch.pass_through(app, event, results, [], False))
+
+    def test_alerts_join_a_lone_hooks_json(self):
+        alert = {"id": "1", "message": "Something failed.", "command": "agent-kit-sync status"}
+        printed = json.dumps({"systemMessage": "Mine.", "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "Context."}}).encode()
+        code, out, _err, delivered = dispatch.pass_through("claude", "user_prompt", [self.native(0, printed)], [alert], False)
+        data = json.loads(out)
+        self.assertEqual(data["systemMessage"], "Mine.\nagent-kit-sync: Something failed.")
+        self.assertTrue(data["hookSpecificOutput"]["additionalContext"].startswith("Context.\n\nagent-kit-sync raised 1 alert"))
+        self.assertEqual((code, delivered), (0, [alert]))
+        # Exit code 2 and plain text cannot carry an alert, so it waits for the next event.
+        self.assertEqual(dispatch.pass_through("claude", "pre_tool_use", [self.native(2, b"", b"No.")], [alert], False), (2, b"", b"No.", []))
+        # Plain text on session_start is context, so the combining path keeps it and adds the alert.
+        self.assertIsNone(dispatch.pass_through("claude", "session_start", [self.native(0, b"Text.\n")], [alert], False))
+        combined = dispatch.combine("claude", "session_start", [self.native(0, b"Text.\n")])
+        self.assertEqual(combined.context, ["Text."])
+        # With no output to keep, the combining path delivers it.
+        self.assertIsNone(dispatch.pass_through("claude", "pre_tool_use", [self.native(0, b"")], [alert], False))
+
+    def test_lone_hooks_ask_becomes_deny_where_it_is_not_enforced(self):
+        printed = json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": "Quoted dash."}}).encode()
+        for app, ask_is_deny in (("claude", True), ("codex", False)):
+            with self.subTest(app=app):
+                _code, out, _err, _delivered = dispatch.pass_through(app, "pre_tool_use", [self.native(0, printed)], [], ask_is_deny)
+                specific = json.loads(out)["hookSpecificOutput"]
+                self.assertEqual(specific["permissionDecision"], "deny")
+                # The same wording emit() uses for each app.
+                combined = dispatch.combine(app, "pre_tool_use", [self.native(0, printed)])
+                expected = json.loads(dispatch.emit(app, "pre_tool_use", combined, {}, ask_is_deny)[1])["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertEqual(specific["permissionDecisionReason"], expected)
+        self.assertEqual(dispatch.pass_through("claude", "pre_tool_use", [self.native(0, printed)], [], False)[1], printed)
+
     def test_empty_stop_in_codex_prints_json(self):
         _code, out = dispatch.emit("codex", "stop", dispatch.combine("codex", "stop", []), {}, False)
         self.assertEqual(out, b"{}")
@@ -165,14 +221,14 @@ class InstalledToolTests(TwoMachines):
         self.assertEqual(pre["hooks"][0]["args"][-2:], ["claude", "pre_tool_use"])
         codex = json.loads(self.a.read(".codex", "hooks.json"))
         self.assertIn("PreToolUse", codex["hooks"])
-        # A blocked command
+        # A blocked command: the only hook's exit code 2 and its error text reach the app unchanged.
         payload = json.dumps({"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}, "cwd": str(self.a.home)}).encode()
         result = self.cli("hook", "claude", "pre_tool_use", stdin=payload)
-        out = json.loads(result.stdout)
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn("Refusing rm -rf.", out["hookSpecificOutput"]["permissionDecisionReason"])
-        # An allowed command prints nothing
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (2, b"", b"Refusing rm -rf."))
+        # The open Codex approval alert could not ride on that answer, so the next event shows it, once.
         payload = json.dumps({"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "ls"}}).encode()
+        self.assertIn("Codex", json.loads(self.cli("hook", "claude", "pre_tool_use", stdin=payload).stdout)["systemMessage"])
+        # An allowed command prints nothing
         self.assertEqual(self.cli("hook", "claude", "pre_tool_use", stdin=payload).stdout, b"")
         # A kit hook adds context and names the calling app
         payload = json.dumps({"session_id": "s2", "hook_event_name": "SessionStart"}).encode()
@@ -269,6 +325,22 @@ class InstalledToolTests(TwoMachines):
         result = self.cli("update")
         self.assertIn(b"failed", result.stdout)
         self.assertEqual((self.a.layout.tool / "current").read_text().strip(), before)
+
+    def test_lone_hooks_error_text_survives_when_an_alert_is_added(self):
+        self.install()
+        note = self.a.layout.config / "modules/guards/hooks/note.py"
+        manifest = self.a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "note"\nfile = "hooks/note.py"\nevents = ["stop"]\nprotocol = "native"\n')
+        note.write_text("import sys\nsys.stdin.read()\nsys.stderr.write('stop note')\n")
+        git(self.a.layout.config, "add", "-A")
+        git(self.a.layout.config, "commit", "-q", "-m", "note hook")
+        self.assertEqual(self.cli("sync", "--offline").returncode, 0)
+        payload = json.dumps({"session_id": "s9", "hook_event_name": "Stop"}).encode()
+        result = self.cli("hook", "codex", "stop", stdin=payload)
+        self.assertEqual(result.stderr, b"stop note")
+        self.assertIn("Codex", json.loads(result.stdout)["systemMessage"])  # The open approval alert.
+        result = self.cli("hook", "codex", "stop", stdin=payload)
+        self.assertEqual((result.stdout, result.stderr), (b"{}", b"stop note"))
 
     def test_dispatcher_timing(self):
         self.install()
