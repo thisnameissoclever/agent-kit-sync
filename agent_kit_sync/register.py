@@ -79,7 +79,7 @@ def interpreter_only(handler: dict, python: str) -> bool:
     if not isinstance(handler, dict) or handler.get("args"):
         return False
     command = str(handler.get("command", "")).strip()
-    return bool(command) and command in (python, shlex.quote(python))
+    return bool(command) and command in (python, shlex.quote(python), subprocess.list2cmdline([python]))
 
 
 def ours(command: str, launcher: Path) -> bool:

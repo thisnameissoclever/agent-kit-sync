@@ -75,6 +75,18 @@ class RecognizeOwnEntriesTests(unittest.TestCase):
                     self.assertTrue(ours(command, launcher))
             self.assertFalse(ours("python3 /elsewhere/launcher.py hook claude stop", launcher))
 
+    def test_entry_running_only_the_interpreter_is_detected_plain_and_quoted(self):
+        import shlex as _shlex
+        import subprocess as _subprocess
+        from agent_kit_sync.register import interpreter_only
+        for python in ("/opt/homebrew/bin/python3", "/Users/a b/bin/python3", r"C:\Program Files\Python39\python.exe"):
+            for command in (python, _shlex.quote(python), _subprocess.list2cmdline([python]), " " + python + " "):
+                with self.subTest(python=python, command=command):
+                    self.assertTrue(interpreter_only({"type": "command", "command": command}, python))
+            self.assertFalse(interpreter_only({"type": "command", "command": python, "args": ["-I", "launcher.py"]}, python))
+            self.assertFalse(interpreter_only({"type": "command", "command": python + " -I -S launcher.py hook claude stop"}, python))
+            self.assertFalse(interpreter_only({"type": "command", "command": "/usr/bin/other-python"}, python))
+
 
 class DispatchUnitTests(unittest.TestCase):
     def test_matcher_and_tool_kinds(self):
@@ -373,9 +385,8 @@ class InstalledToolTests(TwoMachines):
         self.install()
         path = self.a.path(".claude", "settings.json")
         data = json.loads(path.read_text())
-        machine = self.a.layout.machine_file.read_text()
-        import re as _re
-        python = _re.search(r'^python = "(.*)"$', machine, _re.M).group(1)
+        from agent_kit_sync import toml
+        python = toml.load_file(self.a.layout.machine_file)["python"]
         data["hooks"]["Stop"].append({"matcher": "", "hooks": [{"type": "command", "command": python}]})
         path.write_text(json.dumps(data, indent=2))
         out = self.cli("doctor").stdout.decode()
