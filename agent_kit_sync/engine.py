@@ -152,26 +152,40 @@ class Engine:
         for alert in self.alerts.open():
             if alert.get("key", "").startswith("size:"):
                 self.alerts.close(alert["key"])
-        try:
-            inventory, modules = self.load_modules()
-        except ConfigError as error:
-            self.alerts.raise_("config", f"agent-kit-sync cannot read the config repo: {error}", "agent-kit-sync status")
-            self.report.errors.append(str(error))
+        modules = self._load_or_alert()
+        if modules is None:
             return self.report
-        self.alerts.close("config")
         changes = self.find_local_changes(modules)
         if changes:
             self.carry_modules = modules
             self.carry_back(modules, changes)
         self.commit_local("Sync edits from " + self.machine.name)
-        inventory, modules = self.load_modules()
+        modules = self._load_or_alert()
+        if modules is None:
+            return self._finish()
         self.install(modules, incoming=False)
         if network and gitops.has_remote(self.checkout):
             self.merge_remote()
-            inventory, modules = self.load_modules()
+            # A config repo another machine broke stops the run here; this machine keeps what it has installed.
+            modules = self._load_or_alert()
+            if modules is None:
+                return self._finish()
         self.install(modules, incoming=True)
         if network and gitops.has_remote(self.checkout) and not self.machine.cloud:
             self.push()
+        return self._finish()
+
+    def _load_or_alert(self) -> Optional[List[Module]]:
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError as error:
+            self.alerts.raise_("config", f"agent-kit-sync cannot read the config repo: {error}", "agent-kit-sync status")
+            self.report.errors.append(str(error))
+            return None
+        self.alerts.close("config")
+        return modules
+
+    def _finish(self) -> Report:
         self.refresh_signatures()
         self.index.save()
         self.record.data["edits"] = sorted(set(self.report.edits))
@@ -765,13 +779,27 @@ class Engine:
             if module.name not in touched or module.local:
                 continue
             tree = Tree(module.root)
+            previous = self._module_at(module, parent) if parent else None
+            if previous is False:
+                continue  # The module did not load before this commit, so nothing here is known to be this machine's.
             for item in module.items:
-                before = self._item_at(module, item.name, parent) if parent else None
+                before = next((i for i in previous[0].items if i.name == item.name), None) if previous else None
                 if before is not None:
                     info = self.index.items.get(item.key) or {}
-                    if info.get("fp") != item_fingerprint(module, before[0], before[1]):
+                    if info.get("fp") != item_fingerprint(module, before, previous[1]):
                         continue  # Not what this machine had installed; leave it to the policy.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
+
+    def _module_at(self, module: Module, commit: str):
+        """The module as it was at `commit`, with its tree; None when it did not exist; False when it did not load."""
+        prefix = module.root.relative_to(self.checkout).as_posix()
+        tree = CommitTree(self.checkout, commit, prefix)
+        if tree.read("module.toml") is None:
+            return None
+        try:
+            return load_module(module.root, module.name, False, tree=tree), tree
+        except ConfigError:
+            return False
 
     def _templated_paths(self) -> Tuple[Set[str], Set[str]]:
         """Config repo paths whose placeholders are replaced, and those among them that may start with a --- header block.

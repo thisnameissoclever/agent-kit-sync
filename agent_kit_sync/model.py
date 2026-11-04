@@ -165,6 +165,12 @@ def _check_files(module: Module, tree=None) -> None:
         if not (isinstance(templates, list) or (templates is True and item.kind == "file")):
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} has templates that are neither a list of paths nor, for a single file, true")
         extra = list(dict(item.data.get("variants", {})).values()) + list(item.data.get("tests", [])) + (list(templates) if isinstance(templates, list) else [])
+        if templates is True and (tree.files(rel) if tree is not None else (module.root / rel).is_dir()):
+            raise ConfigError(f"module {module.name}: file {item.name} sets templates = true, but {rel} is a folder; list the files to fill in instead")
+        if isinstance(templates, list) and item.kind in ("skill", "file"):
+            for template in templates:
+                if isinstance(template, str) and safe_rel(template) and not _exists(module, tree, f"{rel.rstrip('/')}/{template}"):
+                    raise ConfigError(f"module {module.name}: {item.kind} {item.name} lists template {template}, which is not in {rel}")
         if not safe_rel(rel) or not all(safe_rel(path) for path in extra):
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} lists a path outside the module")
         if not _exists(module, tree, rel):

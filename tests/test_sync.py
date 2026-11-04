@@ -260,6 +260,29 @@ class PolicyTests(TwoMachines):
         self.assertIn("writing/review", [e.get("item_key") for e in engine.held.all()])
         self.assertNotIn("report each problem", b.read(".claude", "skills", "review", "SKILL.md"))
 
+    def test_repairing_a_broken_module_does_not_approve_a_held_change(self):
+        self.standard_config()
+        ask = {"new_items": "apply", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a")
+        b = self.machine("b", policy=ask)
+        a.sync()
+        b.sync()
+        a.write(a.path(".claude", "skills", "review", "SKILL.md"), a.read(".claude", "skills", "review", "SKILL.md").replace("report problems", "report each problem"))
+        a.sync()
+        # Another machine then breaks the module's manifest.
+        manifest = a.layout.config / "modules/writing/module.toml"
+        good = manifest.read_text()
+        manifest.write_text(good + "\n[[skills]]\nname = \"gone\"\ndir = \"skills/gone\"\n")
+        git(a.layout.config, "commit", "-qam", "break")
+        git(a.layout.config, "push", "-q")
+        engine, report = b.sync()
+        self.assertTrue([x for x in engine.alerts.open() if x["key"] == "config"], report.errors)
+        # This machine repairs it by hand in its checkout.
+        (b.layout.config / "modules/writing/module.toml").write_text(good)
+        engine, _report = b.sync()
+        self.assertNotIn("report each problem", b.read(".claude", "skills", "review", "SKILL.md"))
+        self.assertIn("writing/review", [e.get("item_key") for e in engine.held.all()])
+
     def test_incoming_code_change_is_held_and_never_installed(self):
         self.standard_config()
         self.seed_files({
@@ -510,6 +533,19 @@ class ReviewRegressionTests(TwoMachines):
         })
         _engine, report = self.machine("a").sync()
         self.assertTrue(any("one copy serves every app" in e for e in report.errors), report.errors)
+
+    def test_template_lists_are_checked(self):
+        for files, manifest, expected in (
+            ({"modules/rules/docs/index.md": "x\n"}, '[[files]]\nname = "docs"\npath = "docs"\ntemplates = true\n', "is a folder"),
+            ({"modules/rules/docs/index.md": "x\n"}, '[[files]]\nname = "docs"\npath = "docs"\ntemplates = ["nope.md"]\n', "lists template nope.md"),
+            ({"modules/rules/skills/s/SKILL.md": "---\nname: s\ndescription: d\n---\nx\n"}, '[[skills]]\nname = "s"\ndir = "skills/s"\ntemplates = ["SKILL.mdx"]\n', "lists template SKILL.mdx"),
+        ):
+            with self.subTest(expected=expected):
+                self.tearDown()
+                self.setUp()
+                self.seed_files(dict(files, **{"kit.toml": 'format = 1\n\n[[modules]]\nname = "rules"\n', "modules/rules/module.toml": manifest}))
+                _engine, report = self.machine("a").sync()
+                self.assertTrue(any(expected in e for e in report.errors), report.errors)
 
     def test_templates_on_a_file_must_be_a_list_or_true(self):
         self.seed_files({
