@@ -299,6 +299,36 @@ class AdoptionTests(TwoMachines):
         self.assertTrue([e for e in engine.held.all() if e["kind"] == "collision"])
         self.assertIn("Read the draft", a.read(".agents", "skills", "review", "SKILL.md"))
 
+    def test_size_alert_from_an_earlier_version_is_closed(self):
+        self.standard_config()
+        a = self.machine("a")
+        engine, _report = a.sync()
+        engine.alerts.raise_("size:codex", "AGENTS.md is 35,000 bytes, past 32 KiB.", "agent-kit-sync status")
+        engine, _report = a.sync()
+        self.assertFalse([x for x in engine.alerts.open() if x["key"].startswith("size:")])
+
+    def test_resolving_each_apps_collision_closes_its_alert(self):
+        self.standard_config()
+        a = self.machine("a")
+        for parts in ((".claude", "agents", "helper.md"), (".codex", "agents", "helper.toml")):
+            mine = a.path(*parts)
+            mine.parent.mkdir(parents=True, exist_ok=True)
+            mine.write_text("my own helper\n")
+        engine, _report = a.sync()
+        collisions = [e for e in engine.held.all() if e["kind"] == "collision"]
+        self.assertEqual(sorted(e["app"] for e in collisions), ["claude", "codex"])
+        from agent_kit_sync.resolve import resolve
+        with a.env():
+            resolve(a.layout, collisions[0]["id"], "config-replaces-local")
+            open_keys = [x["key"] for x in engine.alerts.open()]
+            self.assertNotIn(f"collision:{collisions[0]['app']}|writing/helper", open_keys)
+            self.assertIn(f"collision:{collisions[1]['app']}|writing/helper", open_keys)
+            resolve(a.layout, collisions[1]["id"], "config-replaces-local")
+        self.assertFalse([x for x in engine.alerts.open() if x["key"].startswith("collision:")])
+        a.sync()
+        self.assertNotEqual(a.read(".claude", "agents", "helper.md"), "my own helper\n")
+        self.assertNotEqual(a.read(".codex", "agents", "helper.toml"), "my own helper\n")
+
 
 class ReviewRegressionTests(TwoMachines):
     def test_merges_do_not_create_endless_commits(self):

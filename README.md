@@ -185,7 +185,7 @@ Write plainly.
 
 agent-kit-sync changes only text between its own markers. New sections are added at the end of the file; move a block anywhere and it stays there. A section can have different wording for one app with `variants = { codex = "sections/plain.codex.md" }`.
 
-When an instruction file first grows past 32 KiB, agent-kit-sync raises one alert listing the largest sections, because Codex cuts off instruction files it finds in project folders at that size. Codex reads `AGENTS.override.md` instead of `AGENTS.md` when that file exists, and `agent-kit-sync doctor` reports it.
+`agent-kit-sync status` shows the size of each instruction file. Codex reads its global `AGENTS.md` in full; its 32 KiB limit applies only to `AGENTS.md` files in project folders, which agent-kit-sync does not write. Codex reads `AGENTS.override.md` instead of `AGENTS.md` when that file exists, and `agent-kit-sync doctor` reports it.
 
 ## Hooks
 

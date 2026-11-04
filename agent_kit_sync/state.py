@@ -47,7 +47,6 @@ class Index:
         self.instruction_sigs: Dict[str, list] = dict(raw.get("instruction_sigs", {}))
         self.approvals: Dict[str, str] = dict(raw.get("approvals", {}))
         self.always_restore: List[str] = list(raw.get("always_restore", []))
-        self.alerted_sizes: List[str] = list(raw.get("alerted_sizes", []))
         self.last_fetch: float = float(raw.get("last_fetch", 0))
         self._dropped_approvals: set = set()
         self._cleared_force: set = set()
@@ -105,7 +104,6 @@ class Index:
             "instruction_sigs": self.instruction_sigs,
             "approvals": self.approvals,
             "always_restore": self.always_restore,
-            "alerted_sizes": self.alerted_sizes,
             "last_fetch": self.last_fetch,
         })
 
