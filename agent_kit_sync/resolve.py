@@ -41,6 +41,21 @@ def resolve(layout: Layout, held_id: str, choice: str) -> int:
         return _resolve_locked(layout, machine, held, entry, choice)
 
 
+# The alert the engine raises with each kind of held change. Several held deletions share one alert.
+ALERT_KEYS = {
+    "edit": "held:{item_key}", "outgoing": "held:{item_key}", "setting": "setting:{setting_key}",
+    "incoming": "incoming:{item_key}", "new-item": "incoming:{item_key}", "removal": "incoming:{item_key}",
+    "collision": "collision:{app}|{item_key}", "deletion": "deletions",
+}
+
+
+def alert_key(entry: dict):
+    template = ALERT_KEYS.get(entry.get("kind", ""))
+    if template is None:
+        return None
+    return template.format(item_key=entry.get("item_key", ""), setting_key=entry.get("setting_key", ""), app=entry.get("app", ""))
+
+
 def _resolve_locked(layout, machine, held, entry, choice) -> int:
     index = Index(layout)
     alerts = Alerts(layout)
@@ -56,9 +71,9 @@ def _resolve_locked(layout, machine, held, entry, choice) -> int:
     if info and info.get("frozen") == entry["id"]:
         info.pop("frozen", None)
     index.save()
-    for key in (f"held:{item_key}", f"incoming:{item_key}", f"setting:{entry.get('setting_key', '')}", f"collision:{entry.get('app', '')}|{item_key}", "deletions"):
-        if not any(e.get("key", "").endswith(item_key) for e in held.all()):
-            alerts.close(key)
+    key = alert_key(entry)
+    if key and not any(alert_key(other) == key for other in held.all()):
+        alerts.close(key)
     print(message + " Run agent-kit-sync sync to apply it now, or wait for the next sync.")
     return 0
 

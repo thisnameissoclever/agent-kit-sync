@@ -18,7 +18,6 @@ from .plan import Copy, Plan, Planner, SectionBlock, SettingWrite, INSTRUCTION_F
 from .state import Alerts, Held, Index, Journal, RunRecord
 from .tree import CommitTree, Tree
 
-SIZE_LIMIT = 32 * 1024
 DELETION_GUARD = 3
 QUIET_SECONDS = 15
 
@@ -1269,19 +1268,6 @@ class Engine:
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
             self.index.save()
             self.journal.finish()
-            self._size_alert(app, path, new_text)
-
-    def _size_alert(self, app: str, path: Path, text: str) -> None:
-        size = len(text.encode("utf-8"))
-        key = f"size:{app}"
-        if size > SIZE_LIMIT and key not in self.index.alerted_sizes:
-            blocks = sorted(((len(content.encode("utf-8")), block_key) for block_key, content in sections.extract(text).items()), reverse=True)[:5]
-            largest = ", ".join(f"{name} ({count:,} bytes)" for count, name in blocks)
-            self.alerts.raise_(key, f"{path} is {size:,} bytes, past 32 KiB. Codex cuts off instruction files it finds in project folders at that size. Largest synced sections: {largest or 'none'}.", "agent-kit-sync status")
-            self.index.alerted_sizes.append(key)
-        elif size <= SIZE_LIMIT and key in self.index.alerted_sizes:
-            self.index.alerted_sizes.remove(key)
-            self.alerts.close(key)
 
     def _write_settings(self, plan: Plan) -> None:
         wanted = {}
