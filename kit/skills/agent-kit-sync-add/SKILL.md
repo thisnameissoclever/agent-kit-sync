@@ -12,6 +12,8 @@ description: Add a skill, subagent definition, hook, instruction section, settin
 5. Open the module's `module.toml` and check the new entry:
     - For a hook, set `tools` to the tools it handles, `timeout`, and `on_failure` (`closed` only when the action must not proceed if the hook fails), and list its tests under `tests`.
     - For a skill whose `SKILL.md` mentions paths, use placeholders such as `{{kit.literal home}}` and list the file under `templates`.
+    - For a subagent definition, write a header field that only one app understands with that app's name in front, such as `claude.tools`. Put body lines that only some apps should see between a `{{kit.literal only claude}}` line and a `{{kit.literal end}}` line; this works in Markdown files only.
+    - For a hook that runs only while one subagent works, set the hook's `events = []` and call it from the subagent definition with `{{kit.literal hook MODULE/HOOK}}`.
 6. Run `{{kit.cli}} test MODULE`, then `{{kit.cli}} sync`.
 
 A setting is added by hand to `module.toml`:

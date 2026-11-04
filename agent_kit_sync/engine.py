@@ -47,6 +47,20 @@ class LocalChange:
     new: Optional[bytes] = None
 
 
+def same_line_breaks(edited: bytes, written: Optional[bytes]) -> bytes:
+    """An edited text copy with the line breaks of the copy agent-kit-sync wrote.
+
+    Editors on Windows can save a whole file with CRLF line breaks. When every line of the
+    edit ends that way and the written copy used LF, the line breaks are formatting, not
+    part of the edit, so they are put back before the edit is compared or carried back.
+    """
+    if written is None or b"\r\n" in written or b"\r\n" not in edited:
+        return edited
+    if edited.replace(b"\r\n", b"").count(b"\n") or edited.replace(b"\r\n", b"").count(b"\r"):
+        return edited  # Mixed line breaks: keep them, so the edit is compared as the user saved it.
+    return edited.replace(b"\r\n", b"\n")
+
+
 def item_fingerprint(module: Module, item: Item, tree: Tree) -> str:
     digest = hashlib.sha256(json.dumps(item.data, sort_keys=True, default=str).encode("utf-8"))
     for rel in item_source_files(module, item, tree):
@@ -103,6 +117,7 @@ class Engine:
         self.failed_modules: Set[str] = set()   # modules that could not be rendered this run
         self.throttle_fetch = False             # set for runs started after a file write
         self.approve_new: Set[str] = set()      # item keys approved during setup
+        self.carry_modules: List[Module] = []   # the modules edits are carried back to, for {{kit.hook}} commands
         self.replace_existing: Set[str] = set() # "app|module/item" allowed to overwrite unmanaged files
         self.carried: Dict[str, Optional[str]] = {}  # copy or block keys carried back, with their hash when found
         self.restoring = False                  # uninstall: put back files the tool replaced
@@ -142,6 +157,7 @@ class Engine:
         self.alerts.close("config")
         changes = self.find_local_changes(modules)
         if changes:
+            self.carry_modules = modules
             self.carry_back(modules, changes)
         self.commit_local("Sync edits from " + self.machine.name)
         inventory, modules = self.load_modules()
@@ -218,6 +234,10 @@ class Engine:
             if current is None:
                 changes.append(LocalChange("delete", item_key, module, item, entry["app"], copy_key, path))
             elif sha256(current) != entry["hash"]:
+                if entry.get("render_kind", "copy") != "copy":
+                    current = same_line_breaks(current, self.index.rendered(copy_key))
+                    if sha256(current) == entry["hash"]:
+                        continue  # Only the line breaks changed, as an editor on Windows may do; nothing to carry back.
                 changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current))
         changes += self._new_skill_files(known)
         for app, path in self._instruction_paths().items():
@@ -236,7 +256,9 @@ class Engine:
                     if text is not None:
                         changes.append(LocalChange("section-delete", entry["item_key"], module, item, app, block_key, path))
                 elif sha256(blocks[entry["key"]].encode("utf-8")) != entry["hash"]:
-                    changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, blocks[entry["key"]].encode("utf-8")))
+                    block = same_line_breaks(blocks[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
+                    if sha256(block) != entry["hash"]:
+                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block))
         for setting_key, entry in sorted(self.index.settings.items()):
             if entry.get("force") or (entry.get("held") and self.held.find(entry["held"])):
                 continue
@@ -345,7 +367,9 @@ class Engine:
             raise render.RenderError("this item comes with agent-kit-sync itself; put local changes in an override instead")
         for change in changes:
             if change.kind != "setting":
-                self.carried[change.copy_key] = sha256(change.new) if change.new is not None else None
+                # The file as it is on disk, which can differ from change.new in its line breaks only.
+                on_disk = read_or_none(change.path) if change.kind == "edit" and change.path is not None else change.new
+                self.carried[change.copy_key] = sha256(on_disk) if on_disk is not None else None
         settings_changes = [c for c in changes if c.kind == "setting"]
         for change in settings_changes:
             self._hold_setting(module, item, change)
@@ -410,16 +434,22 @@ class Engine:
             return
         if change.kind == "section-edit":
             entry = self.index.blocks[change.copy_key]
-            values = values_for(self.layout, self.machine, module.name, change.app, {})
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
             _p, edited_base, _a = sections.split_local(change.new.decode("utf-8"))
             if render.render_text(source.decode("utf-8"), values).text != edited_base:
                 raise render.RenderError("rendering the carried-back section does not reproduce the edit")
+            self._renders_for_every_app(module, "text", source.decode("utf-8"))
             return
         entry = self.index.copies[change.copy_key]
         kind = entry["render_kind"]
-        if kind.startswith("override-"):
-            return  # Checked by the planner on the next render; the edit went to this machine's override file.
-        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+        if kind.startswith("override-replace-"):
+            return  # The edit went to this machine's replacement file; the config repo's version is unchanged.
+        if kind.startswith("override-local-"):
+            # Compare without this machine's own text, which went to its prepend and append files.
+            kind = kind[len("override-local-"):]
+            edited_text, _prepend, _append = sections.unwrap_local(change.new.decode("utf-8"))
+            change = LocalChange(change.kind, change.item_key, change.module, change.item, change.app, change.copy_key, change.path, edited_text.encode("utf-8"))
+        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
         text = source.decode("utf-8") if kind != "copy" else None
         if kind == "copy":
             again = source
@@ -430,9 +460,27 @@ class Engine:
         else:
             again = render.render_agent_codex(text, values).encode("utf-8")
             if toml.loads(again.decode("utf-8")) == toml.loads(change.new.decode("utf-8")):
-                return  # Same values; Codex reads TOML, so formatting differences do not matter.
+                again = change.new  # Same values; Codex reads TOML, so formatting differences do not matter.
         if again != change.new:
             raise render.RenderError("rendering the carried-back source does not reproduce the edited file exactly")
+        if text is not None:
+            header = item.kind == "skill" and source_rel.endswith(".md")
+            self._renders_for_every_app(module, "text" if kind == "text" else "agent", text, header)
+
+    def _renders_for_every_app(self, module: Module, kind: str, text: str, header: bool = False) -> None:
+        """Raise RenderError unless the carried-back source still renders for every app the module installs to, such as a header Codex can hold."""
+        from .paths import SUPPORTED_APPS
+        for app in [app for app in module.apps if app in SUPPORTED_APPS]:
+            values = values_for(self.layout, self.machine, module.name, app, self._hook_commands(module))
+            try:
+                if kind == "text":
+                    render.render_text(text, values, header=header)
+                elif app == "codex":
+                    render.render_agent_codex(text, values)
+                else:
+                    render.render_agent_md(text, app, values)
+            except render.RenderError as error:
+                raise render.RenderError(f"after this edit, the {self._app_label(app)} copy cannot be written: {error}") from None
 
     def _app_label(self, app: str) -> str:
         return {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "kit": "hook"}.get(app, app)
@@ -480,7 +528,7 @@ class Engine:
             prepend, edited_base, append = sections.split_local(edited)
             self._update_local_text(module.name, item.name, prepend, append)
             _p, old_base, _a = sections.split_local(old_render)
-            values = values_for(self.layout, self.machine, module.name, change.app, {})
+            values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
             return render.carry_back_text(source.decode("utf-8"), old_base, edited_base, values).encode("utf-8")
         entry = self.index.copies[change.copy_key]
         old_render = self.index.rendered(change.copy_key)
@@ -497,7 +545,7 @@ class Engine:
             self._update_local_text(module.name, item.name, prepend, append)
             change = LocalChange(change.kind, change.item_key, change.module, change.item, change.app, change.copy_key, change.path, edited_text.encode("utf-8"))
             old_render = old_text.encode("utf-8")
-        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands())
+        values = values_for(self.layout, self.machine, module.name, change.app, self._hook_commands(module))
         if kind == "copy":
             if source != old_render:
                 raise render.RenderError("the source changed since this copy was written")
@@ -528,13 +576,22 @@ class Engine:
                 target = self.layout.root / target
             atomic_write(target, text.encode("utf-8"))
 
-    def _hook_commands(self) -> Dict[str, str]:
-        from .plan import hook_command
-        commands = {}
-        for entry in self.index.hooks:
-            key = f"{entry['module']}/{entry['name']}"
-            commands[key] = hook_command(self.layout, self.machine, entry["module"], entry["name"])
-        return commands
+    def _hook_commands(self, module: Module) -> Dict[str, str]:
+        """Commands for every hook an item in `module` can name with {{kit.hook}}.
+
+        These are the hooks in the inventory and the ones installed here. A module in the
+        config repo reaches other machines, so it can name only hooks from the config repo;
+        a hook from a local module stays a plain command there, and the checks hold it.
+        """
+        from .plan import hook_command, hook_commands
+        commands = {f"{h['module']}/{h['name']}": hook_command(self.layout, self.machine, h["module"], h["name"]) for h in self.index.hooks}
+        commands.update(hook_commands(self.layout, self.machine, self.carry_modules))
+        if module.local:
+            return commands
+        local = {m.name for m in self.carry_modules if m.local}
+        if self.layout.local_modules.is_dir():
+            local |= {folder.name for folder in self.layout.local_modules.iterdir() if folder.is_dir()}
+        return {key: command for key, command in commands.items() if key.split("/", 1)[0] not in local}
 
     def _check_sources(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]], tree: Tree) -> List[checks.Finding]:
         problems: List[checks.Finding] = []
@@ -548,7 +605,9 @@ class Engine:
             if data is None:
                 continue
             old = tree.read(source_rel)
-            problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, added_lines=checks.added_line_numbers(old, data))
+            header = item.kind == "agent" or (item.kind == "skill" and source_rel.endswith(".md"))
+            problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, header=header,
+                                          added_lines=checks.added_line_numbers(old, data))
         return problems
 
     def _run_hook_tests(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]]) -> List[checks.Finding]:
@@ -648,6 +707,7 @@ class Engine:
         from .tree import ignored
         head = gitops.head(self.checkout)
         paths, failed = [], []
+        templated_paths, header_paths = self._templated_paths()
         for entry in gitops.status_porcelain(self.checkout):
             status, path = entry[:2], entry[3:]
             if " -> " in path:
@@ -661,8 +721,9 @@ class Engine:
             data = read_or_none(target)
             if data is not None:
                 old = gitops.show(self.checkout, "HEAD", path) if head else None
-                templated = (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
-                problems = self.checker.file(path, data, own=True, templated=templated, added_lines=checks.added_line_numbers(old, data))
+                templated = path in templated_paths or (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
+                header = path in header_paths or ("/agents/" in path and path.endswith(".md"))
+                problems = self.checker.file(path, data, own=True, templated=templated, header=header, added_lines=checks.added_line_numbers(old, data))
                 if problems:
                     failed.append((path, problems))
                     continue
@@ -680,6 +741,34 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
+
+    def _templated_paths(self) -> Tuple[Set[str], Set[str]]:
+        """Config repo paths whose placeholders are replaced, and those among them that may start with a --- header block.
+
+        Placeholders are replaced in sections, subagent definitions, and skill templates. Subagent
+        definitions and Markdown skill templates may start with a header block.
+        """
+        found: Set[str] = set()
+        headers: Set[str] = set()
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError:
+            return found, headers
+        for module in modules:
+            if module.local or module.source:
+                continue
+            base = f"modules/{module.name}"
+            for item in module.items:
+                if item.kind in ("section", "agent"):
+                    found.add(f"{base}/{item.data.get('file', '')}")
+                    found.update(f"{base}/{rel}" for rel in dict(item.data.get("variants", {})).values())
+                    if item.kind == "agent":
+                        headers.add(f"{base}/{item.data.get('file', '')}")
+                elif item.kind == "skill":
+                    paths = {f"{base}/{item.data['dir'].rstrip('/')}/{rel}" for rel in item.data.get("templates", [])}
+                    found |= paths
+                    headers |= {path for path in paths if path.endswith(".md")}
+        return found, headers
 
     def merge_remote(self) -> None:
         # A run started after a file write fetches at most once a minute; every other run fetches.

@@ -157,7 +157,17 @@ name = "review"
 dir = "skills/review"
 ```
 
-Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. In a skill, placeholders are replaced only in the files listed under `templates`. Write `{{kit.literal home}}` to show a placeholder literally.
+Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. `{{kit.hook MODULE/HOOK}}` becomes the command that runs one synced hook, for a hook that belongs inside a subagent definition. In a skill, placeholders are replaced only in the files listed under `templates`. Write `{{kit.literal home}}` to show a placeholder literally.
+
+Lines that only some apps should see go between two marker lines, each alone on its line, in a Markdown file:
+
+```markdown
+{{kit.only claude cursor}}
+A hook in this file runs every shell command in a read-only sandbox.
+{{kit.end}}
+```
+
+The listed apps' copies show the block with a comment line at each edge, `<!-- agent-kit-sync only claude cursor -->` and `<!-- agent-kit-sync end only -->`, and the other apps' copies leave the whole block out. A line added in a copy between the comment lines stays in the block; a line added outside them reaches every app. An edit that changes a comment line, or moves a line from one side of one to the other, is held; make that change in the module's file. A block cannot sit in a subagent definition's header; write a field for one app with that app's name in front, such as `claude.tools`.
 
 These files never sync: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `__pycache__`, `*.pyc`, `.pytest_cache`, `node_modules`, `.git`, and editor backups. A module can add patterns with `ignore = [...]`.
 

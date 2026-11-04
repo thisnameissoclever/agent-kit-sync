@@ -96,6 +96,58 @@ class EditTests(TwoMachines):
         self.assertIn("Help carefully.", source)
         self.assertIn("Help carefully.", a.read(".claude", "agents", "helper.md"))
 
+    def test_one_app_block_with_hook_reaches_only_that_app(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guarded"\n',
+            "modules/guarded/module.toml": """
+                description = "A subagent with its own hook"
+
+                [[agents]]
+                name = "reviewer"
+                file = "agents/reviewer.md"
+
+                [[hooks]]
+                name = "guard"
+                file = "hooks/guard.py"
+                events = []
+            """,
+            "modules/guarded/hooks/guard.py": "import sys\nsys.exit(0)\n",
+            "modules/guarded/agents/reviewer.md": """
+                ---
+                name: reviewer
+                description: Reviews
+                claude.hooks: {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "{{kit.hook guarded/guard}}"}]}]}
+                codex.sandbox_mode: read-only
+                ---
+                Review the work.
+
+                {{kit.only claude cursor}}
+                A hook runs each Bash command through {{kit.hook guarded/guard}}.
+
+                {{kit.end}}
+                Report what you find.
+            """,
+        })
+        a = self.machine("a")
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        claude = a.read(".claude", "agents", "reviewer.md")
+        self.assertIn("run-hook guarded/guard", claude)
+        self.assertIn("A hook runs each Bash command", claude)
+        self.assertNotIn("kit.", claude)
+        codex = toml.loads(a.read(".codex", "agents", "reviewer.toml"))
+        self.assertEqual(codex["developer_instructions"], "Review the work.\n\nReport what you find.\n")
+        self.assertNotIn("hooks", codex)
+        path = a.path(".codex", "agents", "reviewer.toml")
+        a.write(path, path.read_text().replace("Report what you find.", "Report every finding."))
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        source = (a.layout.config / "modules/guarded/agents/reviewer.md").read_text()
+        self.assertIn("Report every finding.", source)
+        self.assertIn("{{kit.only claude cursor}}", source)
+        self.assertIn("through {{kit.hook guarded/guard}}.", source)
+        self.assertIn("Report every finding.", a.read(".claude", "agents", "reviewer.md"))
+
     def test_edit_with_machine_path_is_held(self):
         self.standard_config()
         a = self.machine("a")
@@ -362,6 +414,70 @@ class ReviewRegressionTests(TwoMachines):
         a.sync()
         self.assertIn("Only on this machine.", a.read(".claude", "skills", "review", "SKILL.md"))
         self.assertNotIn("Only on this machine.", (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text())
+
+
+    def test_hook_from_a_local_module_never_becomes_a_shared_placeholder(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        mine = a.layout.local_modules / "mine"
+        (mine / "hooks").mkdir(parents=True)
+        (mine / "hooks" / "guard.py").write_text("import sys\nsys.exit(0)\n")
+        (mine / "module.toml").write_text('description = "Mine"\n\n[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = []\n')
+        engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        from agent_kit_sync.plan import hook_command
+        command = hook_command(a.layout, engine.machine, "mine", "guard")
+        path = a.path(".claude", "CLAUDE.md")
+        a.write(path, path.read_text().replace("Write plainly.", f"Write plainly. Check with `{command}` first."))
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_text()
+        self.assertNotIn("kit.hook", source)
+        self.assertNotIn("run-hook", source)
+        _engine, report = b.sync()
+        self.assertEqual(report.errors, [])
+        self.assertIn("Write plainly.", b.read(".claude", "CLAUDE.md"))
+
+    def test_typed_block_in_a_copy_with_local_text_is_held(self):
+        self.standard_config()
+        a = self.machine("a")
+        extra = a.layout.root / "local" / "helper-extra.md"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("Only on this machine.\n")
+        data = a.machine_data()
+        data.setdefault("overrides", {})["writing/helper"] = {"kind": "append", "file": str(extra)}
+        a.write_machine(data)
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("Help with the task.\n", "Help with the task.\n{{kit.only codex}}\nSecret.\n{{kit.end}}\n"))
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        self.assertNotIn("Secret.", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+        self.assertNotIn("Secret.", a.read(".codex", "agents", "helper.toml"))
+
+
+    def test_header_edit_codex_cannot_hold_is_held(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("description: Helps\n", "description: >\n  Helps with reviews.\n"))
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        self.assertIn("description: Helps\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+
+    def test_header_check_uses_only_the_modules_apps(self):
+        self.standard_config()
+        manifest = self.seed / "modules/writing/module.toml"
+        self.seed_files({"modules/writing/module.toml": 'apps = ["claude", "cursor"]\n' + manifest.read_text()}, "claude and cursor only")
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("description: Helps\n", "description: >\n  Helps with reviews.\n"))
+        _engine, report = a.sync()
+        self.assertEqual(report.held, [])
+        self.assertIn("  Helps with reviews.\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
 
 
 if __name__ == "__main__":
