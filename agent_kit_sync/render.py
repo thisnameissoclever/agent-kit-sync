@@ -57,6 +57,8 @@ class Values:
             raise RenderError(f"{{{{kit.{name}}}}} takes no argument")
         if name in ("home", "projects", "worktrees", "module", "app", "os", "cli"):
             value = getattr(self, name)
+            if value == "" and name == "app":
+                raise RenderError("{{kit.app}} has no value in a support file, because one copy serves every app")
             if value == "":
                 raise RenderError(f"{{{{kit.{name}}}}} has no value on this machine")
             return value

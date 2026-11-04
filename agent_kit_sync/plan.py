@@ -171,6 +171,24 @@ def values_for(layout: Layout, machine: Machine, module: str, app: str, hooks: D
     )
 
 
+def item_templates(item) -> List[str]:
+    """Module paths of the files whose placeholders are replaced, for a skill or a files item.
+
+    A files item lists its templates relative to its folder, or `templates = true` when its
+    path is a single file.
+    """
+    listed = item.data.get("templates", [])
+    if item.kind == "skill":
+        base = item.data["dir"].rstrip("/")
+    elif item.kind == "file":
+        base = item.data["path"].rstrip("/")
+        if listed is True:
+            return [base]
+    else:
+        return []
+    return [f"{base}/{rel}" for rel in listed] if isinstance(listed, list) else []
+
+
 def skill_dest(machine: Machine, app: str, name: str) -> Optional[Path]:
     homes = machine.app_homes
     if app == "claude":
@@ -400,15 +418,23 @@ class Planner:
         entries = tree.files(rel, module.ignore)
         targets = [(f"{rel}/{sub}", sub, executable) for sub, executable in entries] if entries else [(rel, PurePosixPath(rel).name, tree.executable(rel))]
         base = self.layout.installed_module(module.name)
+        templates = set(item_templates(item))
         for source_rel, _sub, executable in targets:
             raw = tree.read(source_rel)
             if raw is None:
                 continue
-            raw, local = self._overridden(module, item, raw, len(targets) == 1)
+            kind = "copy"
+            if source_rel in templates:
+                # A support file holds this machine's values; it has no app of its own.
+                data = render.render_text(raw.decode("utf-8"), self._values(module, ""), header=source_rel.endswith(".md")).text.encode("utf-8")
+                kind = "text"
+            else:
+                data = raw
+            data, local = self._overridden(module, item, data, len(targets) == 1)
             plan.copies.append(Copy(
                 key=f"kit|{item.key}|{source_rel}", app="kit", module=module.name, item=item.name, kind="file",
-                path=base / Path(*PurePosixPath(source_rel).parts), source_rel=source_rel, data=raw,
-                executable=executable, render_kind=("override-" + local + "-copy") if local else "copy", code=is_code_path(source_rel, "file", raw, executable), local=module.local,
+                path=base / Path(*PurePosixPath(source_rel).parts), source_rel=source_rel, data=data,
+                executable=executable, render_kind=("override-" + local + "-" + kind) if local else kind, code=is_code_path(source_rel, "file", raw, executable), local=module.local,
             ))
 
     def _setting(self, plan: Plan, module: Module, item: Item) -> None:
