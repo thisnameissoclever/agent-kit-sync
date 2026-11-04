@@ -330,6 +330,8 @@ def carry_back_text(source: str, old_render: str, edited: str, values: Values, l
 
 
 def _refuse_header_blocks(source: str, markers: Collection[int]) -> None:
+    if not markers:
+        return
     _lines, start, end = split_frontmatter(source)
     if start >= 0 and any(number <= end for number in markers):
         raise RenderError("a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools")

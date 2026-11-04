@@ -141,6 +141,15 @@ class OnlyBlockTests(unittest.TestCase):
         findings = checker.text_findings("a.md", line, own=True)
         self.assertTrue(any(f.check == "machine-specific" for f in findings))
 
+    def test_markdown_template_with_an_unclosed_rule_renders(self):
+        source = "---\nSee {{kit.module}}/notes.md for details.\n"
+        self.assertEqual(render.render_text(source, values("claude"), header=True).text, "---\nSee /h/m/notes.md for details.\n")
+
+    def test_documentation_of_run_hook_is_not_machine_specific(self):
+        checker = Checker(own_values=[])
+        line = "To try a hook by hand, run `python3 launcher.py run-hook MODULE/HOOK` in the kit folder.\n"
+        self.assertFalse([f for f in checker.text_findings("a.md", line, own=True) if f.check == "machine-specific"])
+
     def test_codex_errors_count_lines_from_the_top_of_the_file(self):
         source = "---\nname: a\ndescription: d\n---\nBody.\n{{kit.end}}\n"
         with self.assertRaisesRegex(render.RenderError, "line 6:"):

@@ -446,9 +446,9 @@ class Engine:
             self._renders_for_every_app(module, "text" if kind == "text" else "agent", text, header)
 
     def _renders_for_every_app(self, module: Module, kind: str, text: str, header: bool = False) -> None:
-        """Raise RenderError unless the carried-back source still renders for every app, such as a header Codex can hold."""
+        """Raise RenderError unless the carried-back source still renders for every app the module installs to, such as a header Codex can hold."""
         from .paths import SUPPORTED_APPS
-        for app in SUPPORTED_APPS:
+        for app in [app for app in module.apps if app in SUPPORTED_APPS]:
             values = values_for(self.layout, self.machine, module.name, app, self._hook_commands(module))
             try:
                 if kind == "text":

@@ -20,7 +20,7 @@ SECRET_PATTERNS = [
 ]
 USER_ROOTS = re.compile(r"(?<![\w.~-])(?:/Users/[^/\s\"'`]+|/home/[^/\s\"'`]+|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"'`]+)(?=[/\\\s\"'`),;:]|$)")
 DRIVE = re.compile(r"(?<![\w%$])[A-Za-z]:[\\/](?=[\w.\-])")
-HOOK_COMMAND = re.compile(r"launcher\.py[\"']?\s+run-hook\s")
+HOOK_COMMAND = re.compile(r"\s-I\s+-S\s+[\"']?\S*launcher\.py[\"']?\s+run-hook\s")
 FIXED_INTERPRETERS = re.compile(r"(?<![\w.-])(?:/opt/homebrew/bin/|/usr/local/bin/|/opt/local/bin/)(?:python3?(?:\.\d+)?|node|bash|zsh)\b")
 TEXT_SUFFIXES = (".md", ".txt", ".toml", ".json", ".yaml", ".yml", ".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".cfg", ".ini", "")
 

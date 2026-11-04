@@ -467,5 +467,18 @@ class ReviewRegressionTests(TwoMachines):
         self.assertIn("description: Helps\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
 
 
+    def test_header_check_uses_only_the_modules_apps(self):
+        self.standard_config()
+        manifest = self.seed / "modules/writing/module.toml"
+        self.seed_files({"modules/writing/module.toml": 'apps = ["claude", "cursor"]\n' + manifest.read_text()}, "claude and cursor only")
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("description: Helps\n", "description: >\n  Helps with reviews.\n"))
+        _engine, report = a.sync()
+        self.assertEqual(report.held, [])
+        self.assertIn("  Helps with reviews.\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
