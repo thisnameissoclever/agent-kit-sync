@@ -214,6 +214,8 @@ tests = ["tests/test_no_rm.py"]
 
 A hook fails when it exits with a code other than 0 or 2, prints output the dispatcher cannot read, or runs past its timeout. Where an app cannot ask the user to confirm, `ask` becomes `deny` with a reason telling the agent to ask.
 
+When only one `native` hook runs for an event and it does not fail, the dispatcher returns that hook's output, error text, and exit code unchanged, so an existing hook behaves as it did when the app ran it directly. Two cases change the output: agent-kit-sync adds its own alerts to JSON output, and `ask` becomes `deny` as above. An alert that cannot be added, after exit code 2 or plain-text output, is shown at the session's next event. When several hooks run, the dispatcher combines their answers, and a refusal from any hook wins.
+
 If Python moves, such as after an upgrade, the registered commands cannot start. Run `agent-kit-sync repair` in a terminal; the command falls back to any `python3` on the path, or run `python3 ~/.agent-kit-sync/launcher.py repair` directly.
 
 ## Agent settings
