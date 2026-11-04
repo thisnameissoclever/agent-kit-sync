@@ -157,7 +157,7 @@ name = "review"
 dir = "skills/review"
 ```
 
-Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. `{{kit.hook MODULE/HOOK}}` becomes the command that runs one synced hook, for a hook that belongs inside a subagent definition. In a skill, placeholders are replaced only in the files listed under `templates`. Write `{{kit.literal home}}` to show a placeholder literally.
+Text in sections and subagent definitions can use placeholders, which become this machine's values: `{{kit.home}}`, `{{kit.projects}}`, `{{kit.worktrees}}`, `{{kit.module}}`, `{{kit.app}}`, `{{kit.os}}`, and `{{kit.cli}}`. `{{kit.hook MODULE/HOOK}}` becomes the command that runs one synced hook, for a hook that belongs inside a subagent definition. In a skill, placeholders are replaced only in the files listed under `templates`. A support file, which installs under the kit folder's `installed/MODULE/` for hooks and agents to read, works the same way: list its templates relative to its folder, or write `templates = true` when its `path` is a single file. `{{kit.app}}` has no value in a support file, because one copy serves every app. Write `{{kit.literal home}}` to show a placeholder literally.
 
 Lines that only some apps should see go between two marker lines, each alone on its line, in a Markdown file:
 

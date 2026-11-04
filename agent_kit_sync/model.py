@@ -161,7 +161,10 @@ def _check_files(module: Module, tree=None) -> None:
             continue
         if not isinstance(rel, str) or not rel:
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} has no file")
-        extra = list(dict(item.data.get("variants", {})).values()) + list(item.data.get("tests", [])) + list(item.data.get("templates", []))
+        templates = item.data.get("templates", [])
+        if not (isinstance(templates, list) or (templates is True and item.kind == "file")):
+            raise ConfigError(f"module {module.name}: {item.kind} {item.name} has templates that are neither a list of paths nor, for a single file, true")
+        extra = list(dict(item.data.get("variants", {})).values()) + list(item.data.get("tests", [])) + (list(templates) if isinstance(templates, list) else [])
         if not safe_rel(rel) or not all(safe_rel(path) for path in extra):
             raise ConfigError(f"module {module.name}: {item.kind} {item.name} lists a path outside the module")
         if not _exists(module, tree, rel):

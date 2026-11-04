@@ -14,7 +14,7 @@ from . import checks, gitops, render, sections, settings, toml, tomledit
 from .fsutil import ChangedUnderneath, atomic_write, prune_empty_dirs, read_or_none, real, remove_file, sha256, stat_signature
 from .model import ConfigError, Inventory, Item, Machine, Module, load_inventory, load_local_modules, load_machine, load_module
 from .paths import Layout
-from .plan import Copy, Plan, Planner, SectionBlock, SettingWrite, INSTRUCTION_FILES, SETTINGS_FILES, is_code_path, values_for
+from .plan import Copy, Plan, Planner, SectionBlock, SettingWrite, INSTRUCTION_FILES, SETTINGS_FILES, is_code_path, item_templates, values_for
 from .state import Alerts, Held, Index, Journal, RunRecord
 from .tree import CommitTree, Tree
 
@@ -468,7 +468,7 @@ class Engine:
         if again != change.new:
             raise render.RenderError("rendering the carried-back source does not reproduce the edited file exactly")
         if text is not None:
-            header = item.kind == "skill" and source_rel.endswith(".md")
+            header = item.kind in ("skill", "file") and source_rel.endswith(".md")
             self._renders_for_every_app(module, "text" if kind == "text" else "agent", text, header)
 
     def _renders_for_every_app(self, module: Module, kind: str, text: str, header: bool = False) -> None:
@@ -602,14 +602,13 @@ class Engine:
         templated = set()
         if item.kind in ("section", "agent"):
             templated = set(new_files)
-        elif item.kind == "skill":
-            base = item.data["dir"].rstrip("/")
-            templated = {f"{base}/{t}" for t in item.data.get("templates", [])}
+        elif item.kind in ("skill", "file"):
+            templated = set(item_templates(item))
         for source_rel, data in new_files.items():
             if data is None:
                 continue
             old = tree.read(source_rel)
-            header = item.kind == "agent" or (item.kind == "skill" and source_rel.endswith(".md"))
+            header = item.kind == "agent" or (item.kind in ("skill", "file") and source_rel.endswith(".md") and source_rel in templated)
             problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, header=header,
                                           added_lines=checks.added_line_numbers(old, data))
         return problems
@@ -745,6 +744,34 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
+            self._approve_own_items(paths, head)
+
+    def _approve_own_items(self, paths: List[str], parent: Optional[str]) -> None:
+        """Items this machine just committed, such as a `remember` entry or an `add`, are its own
+        work, so the policy for changes from the config repo does not hold them here.
+
+        An item is approved only when it is new in this commit, or when this machine had
+        installed exactly the version before this commit, so a held change from another
+        machine is never approved along with it.
+        """
+        touched = {PurePosixPath(path).parts[1] for path in paths if path.startswith("modules/") and len(PurePosixPath(path).parts) > 2}
+        if not touched:
+            return
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError:
+            return
+        for module in modules:
+            if module.name not in touched or module.local:
+                continue
+            tree = Tree(module.root)
+            for item in module.items:
+                before = self._item_at(module, item.name, parent) if parent else None
+                if before is not None:
+                    info = self.index.items.get(item.key) or {}
+                    if info.get("fp") != item_fingerprint(module, before[0], before[1]):
+                        continue  # Not what this machine had installed; leave it to the policy.
+                self.index.approvals[item.key] = item_fingerprint(module, item, tree)
 
     def _templated_paths(self) -> Tuple[Set[str], Set[str]]:
         """Config repo paths whose placeholders are replaced, and those among them that may start with a --- header block.
@@ -768,8 +795,8 @@ class Engine:
                     found.update(f"{base}/{rel}" for rel in dict(item.data.get("variants", {})).values())
                     if item.kind == "agent":
                         headers.add(f"{base}/{item.data.get('file', '')}")
-                elif item.kind == "skill":
-                    paths = {f"{base}/{item.data['dir'].rstrip('/')}/{rel}" for rel in item.data.get("templates", [])}
+                elif item.kind in ("skill", "file"):
+                    paths = {f"{base}/{rel}" for rel in item_templates(item)}
                     found |= paths
                     headers |= {path for path in paths if path.endswith(".md")}
         return found, headers

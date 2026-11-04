@@ -221,6 +221,45 @@ class PolicyTests(TwoMachines):
         held = [entry for entry in engine.held.all() if entry["kind"] == "new-item"]
         self.assertTrue(held)
 
+    def test_an_item_this_machine_adds_is_not_held_here(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        b = self.machine("b", policy=ask)
+        engine, _report = a.sync()
+        for entry in engine.held.all():
+            with a.env():
+                from agent_kit_sync.resolve import resolve
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        from agent_kit_sync.commands import cmd_remember
+        from types import SimpleNamespace
+        with a.env():
+            self.assertEqual(cmd_remember(SimpleNamespace(text="Keep replies short."), a.layout), 0)
+        engine, _report = a.sync()
+        self.assertEqual([e["item_key"] for e in engine.held.all()], [])
+        self.assertIn("Keep replies short.", a.read(".claude", "CLAUDE.md"))
+        # Another machine still asks before installing it.
+        engine, _report = b.sync()
+        self.assertIn("shared-memory/entries", [e.get("item_key") for e in engine.held.all()])
+
+    def test_own_commit_does_not_approve_another_machines_held_change(self):
+        self.standard_config()
+        ask = {"new_items": "apply", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a")
+        b = self.machine("b", policy=ask)
+        a.sync()
+        b.sync()
+        a.write(a.path(".claude", "skills", "review", "SKILL.md"), a.read(".claude", "skills", "review", "SKILL.md").replace("report problems", "report each problem"))
+        a.sync()
+        engine, _report = b.sync()
+        self.assertIn("writing/review", [e.get("item_key") for e in engine.held.all()])
+        # b now edits a different item of the same module; its commit must not approve a's change.
+        b.write(b.path(".claude", "agents", "helper.md"), b.read(".claude", "agents", "helper.md").replace("Help with the task.", "Help with the whole task."))
+        engine, _report = b.sync()
+        self.assertIn("writing/review", [e.get("item_key") for e in engine.held.all()])
+        self.assertNotIn("report each problem", b.read(".claude", "skills", "review", "SKILL.md"))
+
     def test_incoming_code_change_is_held_and_never_installed(self):
         self.standard_config()
         self.seed_files({
@@ -431,6 +470,56 @@ class ReviewRegressionTests(TwoMachines):
         _engine, report = b.sync()
         self.assertIn("From A.", b.read(".claude", "skills", "review", "SKILL.md"))
         self.assertNotIn("someone", (b.layout.config / "modules/writing/skills/review/SKILL.md").read_text())
+
+    def test_support_file_templates_get_this_machines_values_and_carry_back(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "rules"\n',
+            "modules/rules/module.toml": """
+                [[files]]
+                name = "guide"
+                path = "guide.md"
+                templates = true
+
+                [[files]]
+                name = "docs"
+                path = "docs"
+                templates = ["index.md"]
+            """,
+            "modules/rules/guide.md": "Read {{kit.projects}}/notes.md first.\n",
+            "modules/rules/docs/index.md": "See {{kit.module}}/guide.md.\n",
+            "modules/rules/docs/raw.md": "Keep {{kit.projects}} as typed.\n",
+        })
+        a = self.machine("a")
+        a.sync()
+        guide = a.layout.installed / "rules" / "guide.md"
+        self.assertEqual(guide.read_text(), f"Read {a.home / 'Projects'}/notes.md first.\n")
+        self.assertEqual((a.layout.installed / "rules" / "docs" / "index.md").read_text(), f"See {a.layout.installed / 'rules'}/guide.md.\n")
+        self.assertEqual((a.layout.installed / "rules" / "docs" / "raw.md").read_text(), "Keep {{kit.projects}} as typed.\n")
+        a.write(guide, guide.read_text().replace("first.", "before you start."))
+        a.sync()
+        self.assertEqual((a.layout.config / "modules/rules/guide.md").read_text(), "Read {{kit.projects}}/notes.md before you start.\n")
+        b = self.machine("b")
+        b.sync()
+        self.assertEqual((b.layout.installed / "rules" / "guide.md").read_text(), f"Read {b.home / 'Projects'}/notes.md before you start.\n")
+
+    def test_app_placeholder_in_a_support_file_is_refused(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "rules"\n',
+            "modules/rules/module.toml": '[[files]]\nname = "guide"\npath = "guide.md"\ntemplates = true\n',
+            "modules/rules/guide.md": "For {{kit.app}} only.\n",
+        })
+        _engine, report = self.machine("a").sync()
+        self.assertTrue(any("one copy serves every app" in e for e in report.errors), report.errors)
+
+    def test_templates_on_a_file_must_be_a_list_or_true(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "rules"\n',
+            "modules/rules/module.toml": '[[files]]\nname = "guide"\npath = "guide.md"\ntemplates = "guide.md"\n',
+            "modules/rules/guide.md": "Text.\n",
+        })
+        a = self.machine("a")
+        _engine, report = a.sync()
+        self.assertTrue(any("templates" in e for e in report.errors), report.errors)
 
     def test_append_override_on_a_skill(self):
         self.standard_config()
