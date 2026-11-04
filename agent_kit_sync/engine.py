@@ -147,6 +147,11 @@ class Engine:
 
     def run(self, network: bool = True) -> Report:
         self.recover()
+        # Version 0.1.0 raised an alert for instruction files over 32 KiB, citing a Codex limit that
+        # does not apply to the files this tool writes. Close any such alert left open by that version.
+        for alert in self.alerts.open():
+            if alert.get("key", "").startswith("size:"):
+                self.alerts.close(alert["key"])
         try:
             inventory, modules = self.load_modules()
         except ConfigError as error:

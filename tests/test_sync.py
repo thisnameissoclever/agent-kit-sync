@@ -299,6 +299,14 @@ class AdoptionTests(TwoMachines):
         self.assertTrue([e for e in engine.held.all() if e["kind"] == "collision"])
         self.assertIn("Read the draft", a.read(".agents", "skills", "review", "SKILL.md"))
 
+    def test_size_alert_from_an_earlier_version_is_closed(self):
+        self.standard_config()
+        a = self.machine("a")
+        engine, _report = a.sync()
+        engine.alerts.raise_("size:codex", "AGENTS.md is 35,000 bytes, past 32 KiB.", "agent-kit-sync status")
+        engine, _report = a.sync()
+        self.assertFalse([x for x in engine.alerts.open() if x["key"].startswith("size:")])
+
     def test_resolving_each_apps_collision_closes_its_alert(self):
         self.standard_config()
         a = self.machine("a")
