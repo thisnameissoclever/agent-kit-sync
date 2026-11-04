@@ -20,6 +20,7 @@ SECRET_PATTERNS = [
 ]
 USER_ROOTS = re.compile(r"(?<![\w.~-])(?:/Users/[^/\s\"'`]+|/home/[^/\s\"'`]+|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"'`]+)(?=[/\\\s\"'`),;:]|$)")
 DRIVE = re.compile(r"(?<![\w%$])[A-Za-z]:[\\/](?=[\w.\-])")
+HOOK_COMMAND = re.compile(r"launcher\.py[\"']?\s+run-hook\s")
 FIXED_INTERPRETERS = re.compile(r"(?<![\w.-])(?:/opt/homebrew/bin/|/usr/local/bin/|/opt/local/bin/)(?:python3?(?:\.\d+)?|node|bash|zsh)\b")
 TEXT_SUFFIXES = (".md", ".txt", ".toml", ".json", ".yaml", ".yml", ".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".cfg", ".ini", "")
 
@@ -121,12 +122,15 @@ class Checker:
                 findings.append(Finding("machine-specific", path, number, f"contains the user folder path {match.group(0)!r}"))
             elif DRIVE.search(line):
                 findings.append(Finding("machine-specific", path, number, "contains a drive letter path"))
+            if HOOK_COMMAND.search(line):
+                findings.append(Finding("machine-specific", path, number, "contains the command that runs a synced hook on this machine; write {{kit.literal hook MODULE/HOOK}} for a hook in the config repo"))
             match = FIXED_INTERPRETERS.search(line)
             if match:
                 findings.append(Finding("machine-specific", path, number, f"calls the fixed interpreter path {match.group(0)!r}; call it by name"))
         return findings
 
-    def placeholder_findings(self, path: str, text: str) -> List[Finding]:
+    def placeholder_findings(self, path: str, text: str, header: bool = False) -> List[Finding]:
+        """Check placeholders and {{kit.only}} blocks. With `header`, the file's --- header block cannot hold a block."""
         findings = []
         lines = text.splitlines(keepends=True)
         for number, line in enumerate(lines, start=1):
@@ -145,7 +149,7 @@ class Checker:
             _hidden, _shown, markers = render.only_lines(lines, "claude")
             if markers and PurePosixPath(path).suffix != ".md":
                 findings.append(Finding("format", path, min(markers) + 1, "{{kit.only}} blocks work only in Markdown files, because agent-kit-sync shows their edges as Markdown comments"))
-            if markers:
+            if markers and header:
                 _lines, start, end = render.split_frontmatter(text)
                 if start >= 0 and min(markers) <= end:
                     findings.append(Finding("format", path, min(markers) + 1, "a {{kit.only}} block is in the header block; write a field for one app with its name in front, such as claude.tools"))
@@ -162,7 +166,7 @@ class Checker:
             return [Finding("python-syntax", path, 0, str(error))]
         return []
 
-    def file(self, path: str, data: bytes, *, own: bool, templated: bool = False, added_lines: Optional[Iterable[int]] = None) -> List[Finding]:
+    def file(self, path: str, data: bytes, *, own: bool, templated: bool = False, header: bool = False, added_lines: Optional[Iterable[int]] = None) -> List[Finding]:
         """Check one file. `own` is True for the user's files and False for files from a source."""
         findings: List[Finding] = []
         if PurePosixPath(path).suffix == ".py":
@@ -174,7 +178,7 @@ class Checker:
             added_lines = None
         findings += self.text_findings(path, text, own=own, lines=added_lines)
         if templated:
-            findings += self.placeholder_findings(path, text)
+            findings += self.placeholder_findings(path, text, header)
         return findings
 
 

@@ -112,7 +112,34 @@ class OnlyBlockTests(unittest.TestCase):
         source = "---\nname: s\n{{kit.only claude}}\nallowed-tools: Read\n{{kit.end}}\n---\nBody.\n"
         with self.assertRaises(render.RenderError):
             render.render_text(source, values("claude"), header=True)
-        self.assertTrue(Checker(own_values=[]).placeholder_findings("m/skills/s/SKILL.md", source))
+        self.assertTrue(Checker(own_values=[]).placeholder_findings("m/skills/s/SKILL.md", source, header=True))
+
+    def test_insertion_next_to_a_hidden_block_is_refused(self):
+        source = "## Tools\nUse the shell.\n{{kit.only claude}}\nClaude only.\n{{kit.end}}\n## Reporting\n"
+        rendered = render.render_text(source, values("codex")).text
+        edited = rendered.replace("## Reporting\n", "## Notes\nKeep notes short.\n## Reporting\n")
+        with self.assertRaises(render.RenderError):
+            render.carry_back_text(source, rendered, edited, values("codex"))
+        back = carry(source, "codex", lambda t: "Intro.\n" + t)
+        self.assertEqual(back, "Intro.\n" + source)
+
+    def test_comment_line_without_a_line_break_before_hidden_lines_is_refused(self):
+        source = "A\n{{kit.only claude}}\nB\n{{kit.end}}\n{{kit.only codex}}\nC\n{{kit.end}}\n"
+        rendered = render.render_text(source, values("claude")).text
+        with self.assertRaisesRegex(render.RenderError, "add the line break"):
+            render.carry_back_text(source, rendered, rendered.rstrip("\n"), values("claude"))
+
+    def test_section_with_a_horizontal_rule_can_hold_a_block(self):
+        text = "---\nIntro rule.\n{{kit.only claude}}\nClaude rule.\n{{kit.end}}\n---\nMore.\n"
+        checker = Checker(own_values=[])
+        self.assertEqual(checker.placeholder_findings("modules/w/sections/plain.md", text), [])
+        self.assertTrue(checker.placeholder_findings("modules/w/agents/a.md", text, header=True))
+
+    def test_installed_hook_command_is_machine_specific(self):
+        checker = Checker(own_values=[])
+        line = "Check with `/usr/bin/python3 -I -S {{kit.home}}/.agent-kit-sync/launcher.py run-hook mine/guard` first.\n"
+        findings = checker.text_findings("a.md", line, own=True)
+        self.assertTrue(any(f.check == "machine-specific" for f in findings))
 
     def test_codex_errors_count_lines_from_the_top_of_the_file(self):
         source = "---\nname: a\ndescription: d\n---\nBody.\n{{kit.end}}\n"
@@ -189,7 +216,7 @@ class OnlyBlockTests(unittest.TestCase):
             ("m/agents/a.md", "---\nname: a\n{{kit.only claude}}\ntools: Read\n{{kit.end}}\n---\nBody.\n"),
         ):
             with self.subTest(text=text):
-                self.assertTrue(checker.placeholder_findings(path, text))
+                self.assertTrue(checker.placeholder_findings(path, text, header="/agents/" in path))
 
     def test_random_edits_never_move_lines_between_apps(self):
         import random

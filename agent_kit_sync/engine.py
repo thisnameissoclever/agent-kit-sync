@@ -416,6 +416,7 @@ class Engine:
             _p, edited_base, _a = sections.split_local(change.new.decode("utf-8"))
             if render.render_text(source.decode("utf-8"), values).text != edited_base:
                 raise render.RenderError("rendering the carried-back section does not reproduce the edit")
+            self._renders_for_every_app(module, "text", source.decode("utf-8"))
             return
         entry = self.index.copies[change.copy_key]
         kind = entry["render_kind"]
@@ -437,9 +438,27 @@ class Engine:
         else:
             again = render.render_agent_codex(text, values).encode("utf-8")
             if toml.loads(again.decode("utf-8")) == toml.loads(change.new.decode("utf-8")):
-                return  # Same values; Codex reads TOML, so formatting differences do not matter.
+                again = change.new  # Same values; Codex reads TOML, so formatting differences do not matter.
         if again != change.new:
             raise render.RenderError("rendering the carried-back source does not reproduce the edited file exactly")
+        if text is not None:
+            header = item.kind == "skill" and source_rel.endswith(".md")
+            self._renders_for_every_app(module, "text" if kind == "text" else "agent", text, header)
+
+    def _renders_for_every_app(self, module: Module, kind: str, text: str, header: bool = False) -> None:
+        """Raise RenderError unless the carried-back source still renders for every app, such as a header Codex can hold."""
+        from .paths import SUPPORTED_APPS
+        for app in SUPPORTED_APPS:
+            values = values_for(self.layout, self.machine, module.name, app, self._hook_commands(module))
+            try:
+                if kind == "text":
+                    render.render_text(text, values, header=header)
+                elif app == "codex":
+                    render.render_agent_codex(text, values)
+                else:
+                    render.render_agent_md(text, app, values)
+            except render.RenderError as error:
+                raise render.RenderError(f"after this edit, the {self._app_label(app)} copy cannot be written: {error}") from None
 
     def _app_label(self, app: str) -> str:
         return {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "kit": "hook"}.get(app, app)
@@ -564,7 +583,9 @@ class Engine:
             if data is None:
                 continue
             old = tree.read(source_rel)
-            problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, added_lines=checks.added_line_numbers(old, data))
+            header = item.kind == "agent" or (item.kind == "skill" and source_rel.endswith(".md"))
+            problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, header=header,
+                                          added_lines=checks.added_line_numbers(old, data))
         return problems
 
     def _run_hook_tests(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]]) -> List[checks.Finding]:
@@ -664,7 +685,7 @@ class Engine:
         from .tree import ignored
         head = gitops.head(self.checkout)
         paths, failed = [], []
-        templated_paths = self._templated_paths()
+        templated_paths, header_paths = self._templated_paths()
         for entry in gitops.status_porcelain(self.checkout):
             status, path = entry[:2], entry[3:]
             if " -> " in path:
@@ -679,7 +700,8 @@ class Engine:
             if data is not None:
                 old = gitops.show(self.checkout, "HEAD", path) if head else None
                 templated = path in templated_paths or (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
-                problems = self.checker.file(path, data, own=True, templated=templated, added_lines=checks.added_line_numbers(old, data))
+                header = path in header_paths or ("/agents/" in path and path.endswith(".md"))
+                problems = self.checker.file(path, data, own=True, templated=templated, header=header, added_lines=checks.added_line_numbers(old, data))
                 if problems:
                     failed.append((path, problems))
                     continue
@@ -698,13 +720,18 @@ class Engine:
         if commit:
             self.record.data["commits"].append(commit)
 
-    def _templated_paths(self) -> Set[str]:
-        """Config repo paths whose placeholders are replaced: sections, subagent definitions, and skill templates."""
+    def _templated_paths(self) -> Tuple[Set[str], Set[str]]:
+        """Config repo paths whose placeholders are replaced, and those among them that may start with a --- header block.
+
+        Placeholders are replaced in sections, subagent definitions, and skill templates. Subagent
+        definitions and Markdown skill templates may start with a header block.
+        """
         found: Set[str] = set()
+        headers: Set[str] = set()
         try:
             _inventory, modules = self.load_modules()
         except ConfigError:
-            return found
+            return found, headers
         for module in modules:
             if module.local or module.source:
                 continue
@@ -713,9 +740,13 @@ class Engine:
                 if item.kind in ("section", "agent"):
                     found.add(f"{base}/{item.data.get('file', '')}")
                     found.update(f"{base}/{rel}" for rel in dict(item.data.get("variants", {})).values())
+                    if item.kind == "agent":
+                        headers.add(f"{base}/{item.data.get('file', '')}")
                 elif item.kind == "skill":
-                    found.update(f"{base}/{item.data['dir'].rstrip('/')}/{rel}" for rel in item.data.get("templates", []))
-        return found
+                    paths = {f"{base}/{item.data['dir'].rstrip('/')}/{rel}" for rel in item.data.get("templates", [])}
+                    found |= paths
+                    headers |= {path for path in paths if path.endswith(".md")}
+        return found, headers
 
     def merge_remote(self) -> None:
         # A run started after a file write fetches at most once a minute; every other run fetches.

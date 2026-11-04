@@ -429,8 +429,11 @@ class ReviewRegressionTests(TwoMachines):
         command = hook_command(a.layout, engine.machine, "mine", "guard")
         path = a.path(".claude", "CLAUDE.md")
         a.write(path, path.read_text().replace("Write plainly.", f"Write plainly. Check with `{command}` first."))
-        a.sync()
-        self.assertNotIn("kit.hook", (a.layout.config / "modules/writing/sections/plain.md").read_text())
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_text()
+        self.assertNotIn("kit.hook", source)
+        self.assertNotIn("run-hook", source)
         _engine, report = b.sync()
         self.assertEqual(report.errors, [])
         self.assertIn("Write plainly.", b.read(".claude", "CLAUDE.md"))
@@ -451,6 +454,17 @@ class ReviewRegressionTests(TwoMachines):
         self.assertEqual(len(report.held), 1)
         self.assertNotIn("Secret.", (a.layout.config / "modules/writing/agents/helper.md").read_text())
         self.assertNotIn("Secret.", a.read(".codex", "agents", "helper.toml"))
+
+
+    def test_header_edit_codex_cannot_hold_is_held(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        a.write(path, path.read_text().replace("description: Helps\n", "description: >\n  Helps with reviews.\n"))
+        _engine, report = a.sync()
+        self.assertEqual(len(report.held), 1)
+        self.assertIn("description: Helps\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
 
 
 if __name__ == "__main__":

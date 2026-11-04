@@ -167,6 +167,11 @@ def project(source_lines: Sequence[str], rule: LineRule) -> Projection:
     return Projection(lines, index)
 
 
+HIDDEN_EDGE = ("the edit adds lines next to a block of lines for other apps, or changes how many lines surround it, "
+               "so where that block belongs among the new lines is unclear; make this change in the module's file")
+NO_LINE_BREAK = "the edited copy has no line break after its last line, and lines for other apps follow it in the module's file; add the line break"
+
+
 def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Sequence[str], reverse: Callable[[int, str], str],
                blocks: Collection[int] = ()) -> List[str]:
     """Rebuild source lines so that projecting them again gives the edited lines.
@@ -176,8 +181,9 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
     projection dropped, such as another app's fields or lines, stay together in place.
     `blocks` are the source lines of {{kit.only}} blocks this copy leaves out. When the
     edit replaces lines around one, each edited line takes its replaced line's place, so
-    the block keeps its place among the other lines; when the number of lines changes,
-    that place is unclear and the edit is refused.
+    the block keeps its place among the other lines. When the edit adds lines next to
+    one, or changes how many lines surround it, the block's place among the new lines is
+    unclear, so the edit is refused.
     """
     index = old.source_index
     mapped = set(index)
@@ -209,9 +215,14 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
                 out.append(source_lines[index[i]])
                 cursor = index[i] + 1
             continue
+        if blocks and j2 - j1 > i2 - i1:
+            before = index[i1 - 1] if i1 > 0 else -1
+            after = index[i2] if i2 < len(index) else len(source_lines)
+            if any(before < k < (index[i1] if i1 < i2 else after) or (i1 < i2 and index[i2 - 1] < k < after) for k in blocks):
+                raise RenderError(HIDDEN_EDGE)
         if blocks and i1 < i2 and any(index[i1] < k < index[i2 - 1] for k in blocks):
             if i2 - i1 != j2 - j1:
-                raise RenderError("the edit replaces lines on both sides of a block of lines for other apps and changes how many there are, so where that block belongs is unclear; make this change in the module's file")
+                raise RenderError(HIDDEN_EDGE)
             # Line for line: each edited line takes the place of the line it replaced.
             for i, j in zip(range(i1, i2), range(j1, j2)):
                 keep_unmapped(index[i])
@@ -230,7 +241,7 @@ def carry_back(source_lines: Sequence[str], old: Projection, edited_lines: Seque
             cursor = last + 1
     keep_unmapped(len(source_lines))
     if unended is not None and unended != len(out) - 1:
-        raise RenderError("the edited copy has no line break after its last line, and lines for other apps follow it in the module's file; add the line break")
+        raise RenderError(NO_LINE_BREAK)
     return out
 
 
@@ -283,6 +294,8 @@ def carry_back_blocks(source_lines: Sequence[str], old: Projection, edited_lines
     for text, regions in added.items():
         if text and removed.get(text, set()) - regions:
             raise RenderError("the edit moves a line into or out of a block of lines for some apps, which would change what other apps see; make this change in the module's file")
+    if any(line.splitlines() == [line] for line in out[:-1]):
+        raise RenderError(NO_LINE_BREAK)
     return out
 
 
