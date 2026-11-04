@@ -70,8 +70,23 @@ def shell_join(parts: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def interpreter_only(handler: dict, python: str) -> bool:
+    """True for an entry that runs only this machine's Python, with no script or arguments.
+
+    Python then reads the hook's input as a program and fails on every event. An agent-kit-sync
+    entry looks like this after a program rewrote the settings file and dropped its arguments.
+    """
+    if not isinstance(handler, dict) or handler.get("args"):
+        return False
+    command = str(handler.get("command", "")).strip()
+    return bool(command) and command in (python, shlex.quote(python))
+
+
 def ours(command: str, launcher: Path) -> bool:
-    return str(launcher) in command or str(launcher).replace("\\", "/") in command
+    """True when a command runs this kit's launcher, written plainly or quoted for a shell."""
+    path = str(launcher)
+    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path])}
+    return any(form in command for form in forms)
 
 
 def _entry_command(handler: dict) -> str:
@@ -144,7 +159,14 @@ def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict
         native = APP_EVENTS[app][event]
         parts = command_parts(layout, machine, app, event)
         if app == "claude":
-            handler = {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
+            # The whole command sits in one string, because a program that rewrites settings.json
+            # may keep only each handler's type and command; losing the timeout then leaves Claude
+            # Code's own default instead of an entry that runs Python with no script. Windows keeps
+            # the exec form, so a path with spaces needs no shell quoting.
+            if os_name() == "windows":
+                handler = {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
+            else:
+                handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
             if spec["closed"] and on_failure_supported and event not in ("stop", "subagent_stop"):
                 handler["onFailure"] = "block"
         else:

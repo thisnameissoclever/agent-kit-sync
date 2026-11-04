@@ -189,7 +189,7 @@ agent-kit-sync changes only text between its own markers. New sections are added
 
 ## Hooks
 
-Each agent app gets one registered command per event, the dispatcher, which runs every synced hook for that event. Changing a hook's code never changes an app's settings. Codex asks you to approve each registered entry once, in its `/hooks` screen.
+Each agent app gets one registered command per event, the dispatcher, which runs every synced hook for that event. Changing a hook's code never changes an app's settings. Codex asks you to approve each registered entry once, in its `/hooks` screen. On macOS and Linux, each Claude Code entry holds its whole command in one string, so a program that rewrites `settings.json` and keeps only each entry's `type` and `command` leaves it working, and the next sync puts back its 60-second timeout. `agent-kit-sync doctor` reports an entry that runs only Python with no script, which is what an entry with its arguments stripped looks like.
 
 ```toml
 [[hooks]]

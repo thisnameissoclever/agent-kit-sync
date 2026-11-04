@@ -355,6 +355,10 @@ def cmd_doctor(args, layout: Layout) -> int:
         data = _json(path)
         mine = _registered(data, layout)
         notes.append(f"Claude Code: {len(mine)} agent-kit-sync hook entries in {path}.")
+        broken = _interpreter_only(data, machine.python or sys.executable)
+        if broken:
+            problems.append(f"{path} has {len(broken)} hook entries that run only {machine.python or sys.executable}, with no script ({', '.join(broken)}). "
+                            "Each fails on every event. Another program probably rewrote the file and dropped the arguments. Delete those entries, then run agent-kit-sync repair.")
         if not mine:
             problems.append("No agent-kit-sync hook entries in Claude Code's settings. Run agent-kit-sync repair.")
         version = claude_version()
@@ -415,6 +419,17 @@ def _json(path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def _interpreter_only(data: dict, python: str) -> List[str]:
+    from .register import interpreter_only
+    found = []
+    for event, groups in (data.get("hooks") or {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                if interpreter_only(handler, python):
+                    found.append(event)
+    return found
 
 
 def _registered(data: dict, layout: Layout) -> List[str]:

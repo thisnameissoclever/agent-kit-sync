@@ -59,6 +59,23 @@ CRASH = """
 """
 
 
+class RecognizeOwnEntriesTests(unittest.TestCase):
+    def test_launcher_path_is_recognized_plain_and_quoted(self):
+        import shlex as _shlex
+        import subprocess as _subprocess
+        from agent_kit_sync.register import ours
+        for path in ("/home/o'brien/.agent-kit-sync/launcher.py", "/Users/a b/.agent-kit-sync/launcher.py", r"C:\Users\a b\.agent-kit-sync\launcher.py"):
+            launcher = Path(path)
+            for command in (
+                "python3 -I -S " + _shlex.quote(str(launcher)) + " hook claude stop",
+                _subprocess.list2cmdline(["python.exe", "-I", "-S", str(launcher), "hook", "codex", "stop"]),
+                "python3 -I -S " + str(launcher) + " hook claude stop",
+            ):
+                with self.subTest(path=path, command=command):
+                    self.assertTrue(ours(command, launcher))
+            self.assertFalse(ours("python3 /elsewhere/launcher.py hook claude stop", launcher))
+
+
 class DispatchUnitTests(unittest.TestCase):
     def test_matcher_and_tool_kinds(self):
         self.assertEqual(dispatch.tool_kind("claude", "Bash"), "shell")
@@ -160,6 +177,11 @@ class DispatchUnitTests(unittest.TestCase):
         self.assertEqual(out, b"{}")
 
 
+def dispatch_event(native):
+    """The tool's name for one of Claude Code's events."""
+    return next(key for key, value in dispatch.APP_EVENTS["claude"].items() if value == native)
+
+
 class InstalledToolTests(TwoMachines):
     """Install the tool into a fake kit folder and call it through the launcher."""
 
@@ -218,7 +240,13 @@ class InstalledToolTests(TwoMachines):
         self.assertEqual(events, ["PostToolUse", "PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
         pre = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(pre["matcher"], "^(?:Bash|PowerShell)$")
-        self.assertEqual(pre["hooks"][0]["args"][-2:], ["claude", "pre_tool_use"])
+        handler = pre["hooks"][0]
+        if os.name == "nt":
+            self.assertEqual(handler["args"][-2:], ["claude", "pre_tool_use"])
+        else:
+            # One command string, so a program that keeps only type and command keeps a working entry.
+            self.assertEqual(sorted(handler), ["command", "timeout", "type"])
+            self.assertTrue(handler["command"].endswith(" hook claude pre_tool_use"), handler["command"])
         codex = json.loads(self.a.read(".codex", "hooks.json"))
         self.assertIn("PreToolUse", codex["hooks"])
         # A blocked command: the only hook's exit code 2 and its error text reach the app unchanged.
@@ -291,6 +319,68 @@ class InstalledToolTests(TwoMachines):
         self.assertIn("hooks: 3", result.stdout.decode())
         result = self.cli("doctor")
         self.assertIn("Codex has not approved", result.stdout.decode())
+
+    def test_entries_survive_a_rewrite_that_keeps_only_type_and_command(self):
+        self.install()
+        path = self.a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        # Another program rewrites the file and keeps two fields of each handler, as DevBar did.
+        for groups in data["hooks"].values():
+            for group in groups:
+                group["hooks"] = [{"type": h["type"], "command": h["command"]} for h in group["hooks"]]
+        path.write_text(json.dumps(data, indent=2))
+        if os.name != "nt":
+            # Every rewritten entry still runs the launcher for its own event.
+            for event, groups in json.loads(path.read_text())["hooks"].items():
+                for group in groups:
+                    for h in group["hooks"]:
+                        self.assertIn("launcher.py", h["command"], (event, h))
+                        self.assertTrue(h["command"].endswith(" " + dispatch_event(event)), (event, h))
+        result = self.cli("sync")
+        self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        after = json.loads(path.read_text())
+        for event, groups in after["hooks"].items():
+            mine = [h for g in groups for h in g["hooks"] if "launcher.py" in h["command"] + " ".join(h.get("args", []))]
+            self.assertEqual(len(mine), 1, (event, groups))
+            self.assertEqual(mine[0].get("timeout"), 60, (event, mine[0]))
+        result = self.cli("doctor")
+        self.assertIn("Claude Code: %d agent-kit-sync hook entries" % len(after["hooks"]), result.stdout.decode())
+
+    def test_exec_form_entries_from_an_earlier_version_are_replaced(self):
+        self.install()
+        path = self.a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        # Entries in the form earlier versions wrote: the program, its arguments, and a timeout.
+        for groups in data["hooks"].values():
+            for group in groups:
+                for h in group["hooks"]:
+                    if "launcher.py" in h["command"] and "args" not in h:
+                        import shlex as _shlex
+                        parts = _shlex.split(h["command"])
+                        h.clear()
+                        h.update({"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60})
+        path.write_text(json.dumps(data, indent=2))
+        result = self.cli("sync")
+        self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        after = json.loads(path.read_text())
+        for event, groups in after["hooks"].items():
+            mine = [h for g in groups for h in g["hooks"] if "launcher.py" in h["command"] + " ".join(h.get("args", []))]
+            self.assertEqual(len(mine), 1, (event, groups))
+            if os.name != "nt":
+                self.assertNotIn("args", mine[0])
+
+    def test_doctor_reports_an_entry_that_runs_only_python(self):
+        self.install()
+        path = self.a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        machine = self.a.layout.machine_file.read_text()
+        import re as _re
+        python = _re.search(r'^python = "(.*)"$', machine, _re.M).group(1)
+        data["hooks"]["Stop"].append({"matcher": "", "hooks": [{"type": "command", "command": python}]})
+        path.write_text(json.dumps(data, indent=2))
+        out = self.cli("doctor").stdout.decode()
+        self.assertIn("1 hook entries that run only", out)
+        self.assertIn("(Stop)", out)
 
     def test_missing_version_prints_repair_command(self):
         self.install()
