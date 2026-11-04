@@ -537,5 +537,11 @@ def carry_back_agent_codex(source: str, old_render: str, edited: str, values: Va
     old_body = str(old.get("developer_instructions", ""))
     new_body = str(new.get("developer_instructions", ""))
     source_body = "".join(lines[end + 1:])
+    rendered_body = render_text(source_body, values, end + 1).text
+    if rendered_body != old_body and rendered_body.replace("\r\n", "\n") == old_body:
+        # TOML readers turn CRLF line breaks in a multi-line string into LF, so a source
+        # with CRLF line breaks is compared, and carried back, with its own line breaks.
+        old_body = rendered_body
+        new_body = new_body.replace("\r\n", "\n").replace("\n", "\r\n")
     body = source_body if old_body == new_body else carry_back_text(source_body, old_body, new_body, values, end + 1)
     return "".join(header) + lines[end] + body

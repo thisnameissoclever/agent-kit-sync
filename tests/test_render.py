@@ -150,6 +150,12 @@ class OnlyBlockTests(unittest.TestCase):
         line = "To try a hook by hand, run `python3 launcher.py run-hook MODULE/HOOK` in the kit folder.\n"
         self.assertFalse([f for f in checker.text_findings("a.md", line, own=True) if f.check == "machine-specific"])
 
+    def test_codex_edit_of_a_source_with_crlf_line_breaks_carries_back(self):
+        source = AGENT.replace("\n", "\r\n")
+        rendered = render.render_agent_codex(source, values("codex"))
+        back = render.carry_back_agent_codex(source, rendered, rendered.replace("Last line.", "Final line."), values("codex"))
+        self.assertEqual(back, source.replace("Last line.", "Final line."))
+
     def test_codex_errors_count_lines_from_the_top_of_the_file(self):
         source = "---\nname: a\ndescription: d\n---\nBody.\n{{kit.end}}\n"
         with self.assertRaisesRegex(render.RenderError, "line 6:"):

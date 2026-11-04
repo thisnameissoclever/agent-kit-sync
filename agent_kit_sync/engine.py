@@ -47,6 +47,20 @@ class LocalChange:
     new: Optional[bytes] = None
 
 
+def same_line_breaks(edited: bytes, written: Optional[bytes]) -> bytes:
+    """An edited text copy with the line breaks of the copy agent-kit-sync wrote.
+
+    Editors on Windows can save a whole file with CRLF line breaks. When every line of the
+    edit ends that way and the written copy used LF, the line breaks are formatting, not
+    part of the edit, so they are put back before the edit is compared or carried back.
+    """
+    if written is None or b"\r\n" in written or b"\r\n" not in edited:
+        return edited
+    if edited.replace(b"\r\n", b"").count(b"\n") or edited.replace(b"\r\n", b"").count(b"\r"):
+        return edited  # Mixed line breaks: keep them, so the edit is compared as the user saved it.
+    return edited.replace(b"\r\n", b"\n")
+
+
 def item_fingerprint(module: Module, item: Item, tree: Tree) -> str:
     digest = hashlib.sha256(json.dumps(item.data, sort_keys=True, default=str).encode("utf-8"))
     for rel in item_source_files(module, item, tree):
@@ -220,6 +234,10 @@ class Engine:
             if current is None:
                 changes.append(LocalChange("delete", item_key, module, item, entry["app"], copy_key, path))
             elif sha256(current) != entry["hash"]:
+                if entry.get("render_kind", "copy") != "copy":
+                    current = same_line_breaks(current, self.index.rendered(copy_key))
+                    if sha256(current) == entry["hash"]:
+                        continue  # Only the line breaks changed, as an editor on Windows may do; nothing to carry back.
                 changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current))
         changes += self._new_skill_files(known)
         for app, path in self._instruction_paths().items():
@@ -238,7 +256,9 @@ class Engine:
                     if text is not None:
                         changes.append(LocalChange("section-delete", entry["item_key"], module, item, app, block_key, path))
                 elif sha256(blocks[entry["key"]].encode("utf-8")) != entry["hash"]:
-                    changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, blocks[entry["key"]].encode("utf-8")))
+                    block = same_line_breaks(blocks[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
+                    if sha256(block) != entry["hash"]:
+                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block))
         for setting_key, entry in sorted(self.index.settings.items()):
             if entry.get("force") or (entry.get("held") and self.held.find(entry["held"])):
                 continue
@@ -347,7 +367,9 @@ class Engine:
             raise render.RenderError("this item comes with agent-kit-sync itself; put local changes in an override instead")
         for change in changes:
             if change.kind != "setting":
-                self.carried[change.copy_key] = sha256(change.new) if change.new is not None else None
+                # The file as it is on disk, which can differ from change.new in its line breaks only.
+                on_disk = read_or_none(change.path) if change.kind == "edit" and change.path is not None else change.new
+                self.carried[change.copy_key] = sha256(on_disk) if on_disk is not None else None
         settings_changes = [c for c in changes if c.kind == "setting"]
         for change in settings_changes:
             self._hold_setting(module, item, change)
