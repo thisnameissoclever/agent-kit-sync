@@ -759,7 +759,7 @@ class HookTestRequirementTests(TwoMachines):
         with a.env():
             self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 1)
         self.assertEqual(manifest.read_text(), later)
-        manifest.write_text(engine.held.blob(entry, "set-back").decode())
+        manifest.write_bytes(engine.held.blob(entry, "set-back"))
         with a.env():
             self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 0)
         self.assertIn('name = "bare"', manifest.read_text())
