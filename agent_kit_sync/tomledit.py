@@ -64,6 +64,18 @@ def remove_entry(text: str, array: str, name: str) -> str:
     return text
 
 
+def replace_entry(text: str, array: str, name: str, raw: Optional[str]) -> str:
+    """Put `raw` in place of the entry, or remove the entry when `raw` is None; append `raw` when there is no entry."""
+    if raw is None:
+        return remove_entry(text, array, name)
+    lines = text.splitlines(keepends=True)
+    for start, stop, data in _entries(text, array):
+        if _match(data, array, name):
+            body = raw if raw.endswith("\n") else raw + "\n"
+            return "".join(lines[:start]) + body + "".join(lines[stop:])
+    return append_entry_text(text, raw)
+
+
 def append_entry_text(text: str, raw: str) -> str:
     if text and not text.endswith("\n"):
         text += "\n"

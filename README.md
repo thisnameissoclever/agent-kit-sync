@@ -129,8 +129,12 @@ Every check runs on your machine. Nothing uses a hosted service.
 | Blocklist | Any term in `~/.agent-kit-sync/blocklist.txt` | Your own files |
 | Secrets | Text shaped like a GitHub token, cloud key, private key, or API key | Your own files |
 | Python syntax | A Python file that does not compile | Everything |
+| Portability | A script line that fails on macOS, Windows, or Linux, such as starting `npx` without a shell, a test that writes a `#!/bin/sh` program, a fixed `/bin/sh` path, PATH entries joined with `:`, or a module only one system has | Your own scripts, for each system the module installs on |
+| Hook tests | A synced hook with no tests, or tests that fail or cannot run on this machine | Your own hooks, before each push, and every hook before each install |
 
 An edit that fails is held on this machine and never committed. The blocklist is a plain text file with one term per line; edit it any time.
+
+The portability check reports only patterns it knows, and the tests run only on the machine running them, so a hook is tested on Windows only when a Windows machine installs it. That machine runs the tests before it installs a new or changed hook, and keeps the hook off with an alert when they fail there. A module that belongs on fewer systems can say so with `requires = { os = ["macos"] }`; it then installs only there, and the portability check looks only for problems there. A line the check reports that is safe, because it only names a program or only runs on one system, can carry the comment `agent-kit-sync: portable because REASON`; `agent-kit-sync test` lists every such line.
 
 ## Add something to sync
 
@@ -171,7 +175,7 @@ The listed apps' copies show the block with a comment line at each edge, `<!-- a
 
 These files never sync: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `__pycache__`, `*.pyc`, `.pytest_cache`, `node_modules`, `.git`, and editor backups. A module can add patterns with `ignore = [...]`.
 
-Before adding a hook or script, have an agent follow the bundled `portable-scripts` skill. It finds anything that works on only one machine and offers a rewrite with tests.
+Before adding a hook or script, have an agent follow the bundled `portable-scripts` skill. It finds anything that works on only one machine or operating system, reports a verdict for macOS, Windows, and Linux, and offers a rewrite with tests. Add a hook with its tests: `agent-kit-sync add hooks/guard.py --module MODULE --events pre_tool_use --tests tests/test_guard.py`.
 
 ## Instruction sections
 
@@ -210,6 +214,7 @@ tests = ["tests/test_no_rm.py"]
 | `protocol` | `native`: the hook reads and writes the app's own format, as an existing Claude Code or Codex hook does. `kit`: the hook reads one translated event and writes `{"decision": "allow" | "deny" | "ask" | "continue", "reason", "agent_context", "user_message"}`, the same on every app |
 | `args` | Arguments for the hook, which may use placeholders, such as `["--app", "{{kit.app}}"]` |
 | `runtime` | `python` (default), `node`, or `bash` |
+| `tests` | Test files, run as separate programs; required for every synced hook |
 | `on_failure` | `open`: a crash or timeout is reported and the action continues. `closed`: the action is blocked |
 
 A hook fails when it exits with a code other than 0 or 2, prints output the dispatcher cannot read, or runs past its timeout. Where an app cannot ask the user to confirm, `ask` becomes `deny` with a reason telling the agent to ask.
@@ -328,7 +333,7 @@ Your protections are the checks, the policy settings `code_changes`, `outgoing`,
 
 - Cursor's instructions and settings, and Antigravity, are not supported yet.
 - Skills from other repositories, such as public skill collections, cannot be added as sources yet.
-- Windows is tested by the hosted tests only.
+- agent-kit-sync itself is tested on Windows by the hosted tests only. Your own hooks are tested on Windows only when a Windows machine installs them.
 
 ## Contributing
 

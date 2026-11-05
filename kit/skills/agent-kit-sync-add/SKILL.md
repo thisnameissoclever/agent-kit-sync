@@ -7,14 +7,14 @@ description: Add a skill, subagent definition, hook, instruction section, settin
 
 1. Ask the user which module it belongs to. A module groups items that work together, such as a rule's instruction section and the hook that enforces it. Recommend an existing module when one fits; otherwise suggest a short lowercase name with hyphens.
 2. Ask whether it should sync to every machine or stay on this one. Recommend a local module for anything about one employer, one machine, or one service only this machine runs.
-3. For a hook or script, follow the portable-scripts skill first.
-4. Run `{{kit.cli}} add PATH --module MODULE`. Add `--local` for a local module. For one section of `CLAUDE.md` or `AGENTS.md`, add `--heading "HEADING"`; the original text is wrapped in markers in place. For a hook, add `--events` with the events it handles, such as `pre_tool_use,stop`.
+3. For a hook or script, or a skill or support file that holds one, follow the portable-scripts skill first. It is required: report its macOS, Windows, and Linux verdict to the user, and stop until every system the module installs on passes or the user decides otherwise.
+4. Run `{{kit.cli}} add PATH --module MODULE`. Add `--local` for a local module. For one section of `CLAUDE.md` or `AGENTS.md`, add `--heading "HEADING"`; the original text is wrapped in markers in place. For a hook, add `--events` with the events it handles, such as `pre_tool_use,stop`, and `--tests` with its test files; a synced hook without tests is refused.
 5. Open the module's `module.toml` and check the new entry:
-    - For a hook, set `tools` to the tools it handles, `timeout`, and `on_failure` (`closed` only when the action must not proceed if the hook fails), and list its tests under `tests`.
+    - For a hook, set `tools` to the tools it handles, `timeout`, and `on_failure` (`closed` only when the action must not proceed if the hook fails), and check that its tests are listed under `tests`.
     - For a skill whose `SKILL.md` mentions paths, use placeholders such as `{{kit.literal home}}` and list the file under `templates`.
     - For a subagent definition, write a header field that only one app understands with that app's name in front, such as `claude.tools`. Put body lines that only some apps should see between a `{{kit.literal only claude}}` line and a `{{kit.literal end}}` line; this works in Markdown files only.
     - For a hook that runs only while one subagent works, set the hook's `events = []` and call it from the subagent definition with `{{kit.literal hook MODULE/HOOK}}`.
-6. Run `{{kit.cli}} test MODULE`, then `{{kit.cli}} sync`.
+6. Run `{{kit.cli}} test MODULE`. Fix every failure before you sync, including a line the portability check reports. Then run `{{kit.cli}} sync`.
 
 A setting is added by hand to `module.toml`:
 

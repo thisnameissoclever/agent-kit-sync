@@ -45,7 +45,7 @@ def resolve(layout: Layout, held_id: str, choice: str) -> int:
 ALERT_KEYS = {
     "edit": "held:{item_key}", "outgoing": "held:{item_key}", "setting": "setting:{setting_key}",
     "incoming": "incoming:{item_key}", "new-item": "incoming:{item_key}", "removal": "incoming:{item_key}",
-    "collision": "collision:{app}|{item_key}", "deletion": "deletions",
+    "collision": "collision:{app}|{item_key}", "deletion": "deletions", "checkout-edit": "checkout:{path}",
 }
 
 
@@ -53,7 +53,7 @@ def alert_key(entry: dict):
     template = ALERT_KEYS.get(entry.get("kind", ""))
     if template is None:
         return None
-    return template.format(item_key=entry.get("item_key", ""), setting_key=entry.get("setting_key", ""), app=entry.get("app", ""))
+    return template.format(item_key=entry.get("item_key", ""), setting_key=entry.get("setting_key", ""), app=entry.get("app", ""), path=entry.get("path", ""))
 
 
 def _resolve_locked(layout, machine, held, entry, choice) -> int:
@@ -65,7 +65,11 @@ def _resolve_locked(layout, machine, held, entry, choice) -> int:
     if handler is None:
         print(f"agent-kit-sync cannot resolve a held change of kind {kind}.")
         return 2
-    message = handler(layout, machine, index, entry, choice)
+    try:
+        message = handler(layout, machine, index, entry, choice)
+    except Refused as refusal:
+        print(str(refusal))
+        return 1
     held.remove(entry["id"])
     info = index.items.get(item_key)
     if info and info.get("frozen") == entry["id"]:
@@ -191,6 +195,28 @@ def _merge(layout, machine, index, entry, choice):
     return f"Kept the other machine's version of {path}."
 
 
+class Refused(Exception):
+    """A choice that cannot be applied now; the held change stays."""
+
+
+def _checkout_edit(layout, machine, index, entry, choice):
+    path = entry.get("path")
+    if choice == "use-this" and path:
+        held = Held(layout)
+        blob = held.blob(entry, "ours")
+        if blob is not None:
+            target = layout.config / path
+            expected = None if entry.get("set_back_absent") else held.blob(entry, "set-back")
+            current = read_or_none(target)
+            if current != expected and current != blob:
+                saved = entry.get("files", {}).get("ours", "")
+                raise Refused(f"{path} changed after agent-kit-sync set it back, so the saved version would replace those changes. "
+                              f"Compare {saved} with {target}, copy what you need by hand, then resolve this with discard.")
+            atomic_write(target, blob)
+            return f"The saved version of {path} is back in the config repo checkout. Fix what the checks reported before the next sync, or it is set back again."
+    return f"Discarded the saved version of {path}."
+
+
 def _edit_conflict(layout, machine, index, entry, choice):
     if choice == "use-this":
         return "Copy the saved version back into the installed copy you want, then sync; agent-kit-sync carries it back."
@@ -213,6 +239,7 @@ def _collision(layout, machine, index, entry, choice):
 HANDLERS = {
     "edit": _edit, "outgoing": _edit, "setting": _setting, "incoming": _incoming, "new-item": _incoming, "removal": _incoming,
     "deletion": _deletion, "merge-conflict": _merge, "edit-conflict": _edit_conflict, "collision": _collision,
+    "checkout-edit": _checkout_edit,
 }
 
 

@@ -20,6 +20,7 @@ HOOK_MODULE = """
     [[hooks]]
     name = "no-rm"
     file = "hooks/no_rm.py"
+    tests = ["tests/test_pass.py"]
     events = ["pre_tool_use"]
     tools = ["shell"]
     protocol = "native"
@@ -29,12 +30,14 @@ HOOK_MODULE = """
     [[hooks]]
     name = "kit-ctx"
     file = "hooks/kit_ctx.py"
+    tests = ["tests/test_pass.py"]
     events = ["session_start"]
     protocol = "kit"
 
     [[hooks]]
     name = "crash"
     file = "hooks/crash.py"
+    tests = ["tests/test_pass.py"]
     events = ["user_prompt"]
     protocol = "native"
     on_failure = "closed"
@@ -205,6 +208,7 @@ class InstalledToolTests(TwoMachines):
             "modules/guards/hooks/no_rm.py": NO_RM,
             "modules/guards/hooks/kit_ctx.py": KIT_CTX,
             "modules/guards/hooks/crash.py": CRASH,
+            "modules/guards/tests/test_pass.py": "import sys\nsys.exit(0)\n",
         })
         self.a = self.machine("a")
         tool = self.tmp / "tool"
@@ -431,7 +435,7 @@ class InstalledToolTests(TwoMachines):
         self.install()
         note = self.a.layout.config / "modules/guards/hooks/note.py"
         manifest = self.a.layout.config / "modules/guards/module.toml"
-        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "note"\nfile = "hooks/note.py"\nevents = ["stop"]\nprotocol = "native"\n')
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "note"\nfile = "hooks/note.py"\nevents = ["stop"]\nprotocol = "native"\ntests = ["tests/test_pass.py"]\n')
         note.write_text("import sys\nsys.stdin.read()\nsys.stderr.write('stop note')\n")
         git(self.a.layout.config, "add", "-A")
         git(self.a.layout.config, "commit", "-q", "-m", "note hook")

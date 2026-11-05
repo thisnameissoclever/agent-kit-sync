@@ -110,8 +110,10 @@ class EditTests(TwoMachines):
                 name = "guard"
                 file = "hooks/guard.py"
                 events = []
+                tests = ["hooks/test_guard.py"]
             """,
             "modules/guarded/hooks/guard.py": "import sys\nsys.exit(0)\n",
+            "modules/guarded/hooks/test_guard.py": "import sys\nsys.exit(0)\n",
             "modules/guarded/agents/reviewer.md": """
                 ---
                 name: reviewer
@@ -286,7 +288,8 @@ class PolicyTests(TwoMachines):
     def test_incoming_code_change_is_held_and_never_installed(self):
         self.standard_config()
         self.seed_files({
-            "modules/writing/module.toml": (self.seed / "modules/writing/module.toml").read_text() + '\n[[hooks]]\nname = "check"\nfile = "hooks/check.py"\nevents = ["stop"]\n',
+            "modules/writing/module.toml": (self.seed / "modules/writing/module.toml").read_text() + '\n[[hooks]]\nname = "check"\nfile = "hooks/check.py"\nevents = ["stop"]\ntests = ["hooks/test_check.py"]\n',
+            "modules/writing/hooks/test_check.py": "import sys\nsys.exit(0)\n",
             "modules/writing/hooks/check.py": "print('v1')\n",
         }, "add hook")
         a = self.machine("a")
@@ -633,6 +636,190 @@ class ReviewRegressionTests(TwoMachines):
         _engine, report = a.sync()
         self.assertEqual(report.held, [])
         self.assertIn("  Helps with reviews.\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+
+class HookTestRequirementTests(TwoMachines):
+    """Every synced hook has tests, and each machine runs them before installing it."""
+
+    def hook_config(self, tests='tests = ["hooks/test_guard.py"]\n', test_body="import sys\nsys.exit(0)\n", extra=""):
+        files = {
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n',
+            "modules/guards/module.toml": f'[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\n{tests}{extra}',
+            "modules/guards/hooks/guard.py": "import sys\nsys.exit(0)\n",
+        }
+        if test_body is not None:
+            files["modules/guards/hooks/test_guard.py"] = test_body
+        self.seed_files(files)
+
+    def installed(self, machine):
+        return (machine.layout.installed / "guards" / "hooks" / "guard.py").exists()
+
+    def alert_messages(self, engine):
+        return [alert["message"] for alert in engine.alerts.open()]
+
+    def test_new_hook_with_passing_tests_installs(self):
+        self.hook_config()
+        a = self.machine("a")
+        engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        self.assertTrue(self.installed(a))
+        self.assertFalse([m for m in self.alert_messages(engine) if "guards/guard" in m])
+
+    def test_new_hook_without_tests_is_not_installed(self):
+        self.hook_config(tests="", test_body=None)
+        a = self.machine("a")
+        engine, _report = a.sync()
+        self.assertFalse(self.installed(a))
+        self.assertTrue([m for m in self.alert_messages(engine) if "guards/guard has no tests" in m])
+
+    def test_new_hook_whose_tests_fail_is_not_installed(self):
+        self.hook_config(test_body="import sys\nprint('broken on this machine')\nsys.exit(1)\n")
+        a = self.machine("a")
+        engine, _report = a.sync()
+        self.assertFalse(self.installed(a))
+        self.assertTrue([m for m in self.alert_messages(engine) if "failed its tests here" in m and "broken on this machine" in m])
+
+    def test_hook_whose_test_cannot_run_is_not_installed(self):
+        self.hook_config(tests='tests = ["hooks/test_guard.rb"]\n', test_body=None, extra="")
+        self.seed_files({"modules/guards/hooks/test_guard.rb": "exit 0\n"}, "ruby test")
+        a = self.machine("a")
+        engine, _report = a.sync()
+        self.assertFalse(self.installed(a))
+        self.assertTrue([m for m in self.alert_messages(engine) if "did not run" in m])
+
+    def test_fixed_hook_installs_and_closes_its_alert(self):
+        self.hook_config(test_body="import sys\nsys.exit(1)\n")
+        a = self.machine("a")
+        a.sync()
+        self.seed_files({"modules/guards/hooks/test_guard.py": "import sys\nsys.exit(0)\n"}, "fix test")
+        engine, _report = a.sync()
+        self.assertTrue(self.installed(a))
+        self.assertFalse([m for m in self.alert_messages(engine) if "guards/guard" in m])
+
+    def test_edit_to_a_hook_that_breaks_its_tests_is_held(self):
+        self.hook_config(test_body="import pathlib, sys\nsys.exit(0 if 'exit(0)' in (pathlib.Path(__file__).parent / 'guard.py').read_text() else 1)\n")
+        a = self.machine("a")
+        a.sync()
+        installed = a.layout.installed / "guards" / "hooks" / "guard.py"
+        a.write(installed, "import sys\nsys.exit(3)\n")
+        engine, _report = a.sync()
+        self.assertTrue([e for e in engine.held.all() if e["kind"] == "edit" and e.get("item_key") == "guards/guard"])
+        self.assertIn("exit(0)", (a.layout.config / "modules/guards/hooks/guard.py").read_text())
+
+    def test_hook_added_in_the_checkout_without_tests_is_not_committed(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "bare"\nfile = "hooks/bare.py"\nevents = ["stop"]\n')
+        (a.layout.config / "modules/guards/hooks/bare.py").write_text("import sys\nsys.exit(0)\n")
+        engine, _report = a.sync()
+        self.assertNotIn("bare", git(a.layout.config, "show", "HEAD:modules/guards/module.toml"))
+        self.assertFalse((a.layout.config / "modules/guards/hooks/bare.py").exists())
+        held = [e for e in engine.held.all() if e["kind"] == "checkout-edit"]
+        self.assertTrue(held)
+        self.assertTrue([m for m in self.alert_messages(engine) if "guards/bare has no tests" in m])
+        from agent_kit_sync.resolve import resolve
+        with a.env():
+            for entry in held:
+                self.assertEqual(resolve(a.layout, entry["id"], "discard"), 0)
+
+    def test_failing_hook_sets_back_only_its_own_entry(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "bare"\nfile = "hooks/bare.py"\nevents = ["stop"]\n'
+                            + '\n[[skills]]\nname = "t"\ndir = "skills/t"\n')
+        (a.layout.config / "modules/guards/hooks/bare.py").write_text("import sys\nsys.exit(0)\n")
+        (a.layout.config / "modules/guards/skills/t").mkdir(parents=True)
+        (a.layout.config / "modules/guards/skills/t/SKILL.md").write_text("---\nname: t\ndescription: d\n---\nKept.\n")
+        engine, _report = a.sync()
+        committed = git(a.layout.config, "show", "HEAD:modules/guards/module.toml")
+        self.assertIn('name = "t"', committed)
+        self.assertNotIn('name = "bare"', committed)
+        self.assertIn('name = "guard"', committed)
+        self.assertEqual(a.read(".claude", "skills", "t", "SKILL.md").strip().splitlines()[-1], "Kept.")
+        held = {e["path"]: e for e in engine.held.all() if e["kind"] == "checkout-edit"}
+        self.assertIn("modules/guards/module.toml", held)
+        self.assertIn('name = "bare"', engine.held.blob(held["modules/guards/module.toml"], "ours").decode())
+
+    def test_use_this_refuses_to_replace_later_edits(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "bare"\nfile = "hooks/bare.py"\nevents = ["stop"]\n')
+        (a.layout.config / "modules/guards/hooks/bare.py").write_text("import sys\nsys.exit(0)\n")
+        engine, _report = a.sync()
+        entry = next(e for e in engine.held.all() if e.get("path") == "modules/guards/module.toml")
+        later = manifest.read_text() + '\n[[skills]]\nname = "later"\ndir = "skills/later"\n'
+        manifest.write_text(later)
+        from agent_kit_sync.resolve import resolve
+        with a.env():
+            self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 1)
+        self.assertEqual(manifest.read_text(), later)
+        manifest.write_bytes(engine.held.blob(entry, "set-back"))
+        with a.env():
+            self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 0)
+        self.assertIn('name = "bare"', manifest.read_text())
+
+    def test_untested_hook_does_not_block_other_changes_to_its_module(self):
+        self.hook_config(tests="", test_body=None, extra='\n[[skills]]\nname = "s"\ndir = "skills/s"\n')
+        self.seed_files({"modules/guards/skills/s/SKILL.md": "---\nname: s\ndescription: d\n---\nFirst.\n"}, "skill")
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[skills]]\nname = "t"\ndir = "skills/t"\n')
+        (a.layout.config / "modules/guards/skills/t").mkdir(parents=True)
+        (a.layout.config / "modules/guards/skills/t/SKILL.md").write_text("---\nname: t\ndescription: d\n---\nSecond.\n")
+        engine, _report = a.sync()
+        self.assertIn('name = "t"', git(a.layout.config, "show", "HEAD:modules/guards/module.toml"))
+        self.assertFalse([e for e in engine.held.all() if e["kind"] == "checkout-edit"])
+
+    def test_script_that_fails_on_windows_is_not_committed(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        installed = a.layout.installed / "guards" / "hooks" / "guard.py"
+        a.write(installed, "import fcntl, sys\nsys.exit(0)\n")
+        engine, _report = a.sync()
+        held = [e for e in engine.held.all() if e["kind"] == "edit" and e.get("item_key") == "guards/guard"]
+        self.assertTrue(held)
+        self.assertIn("fails on Windows", held[0]["summary"])
+
+    def test_module_for_one_system_is_checked_for_that_system_only(self):
+        self.hook_config(extra='\n[requires]\nos = ["macos", "linux"]\n')
+        a = self.machine("a")
+        a.sync()
+        with a.env():
+            from agent_kit_sync.engine import Engine
+            module = next(m for m in Engine(a.layout).load_modules()[1] if m.name == "guards")
+            self.assertEqual(Engine.module_systems(module), ("macos", "linux"))
+        from agent_kit_sync import checks
+        checker = checks.Checker(own_values=[])
+        self.assertFalse([f for f in checker.file("modules/guards/hooks/guard.py", b"import fcntl\n", own=True, systems=("macos", "linux")) if f.check == "portability"])
+
+    def test_add_refuses_a_synced_hook_without_tests(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        source = a.home / "new_hook.py"
+        source.write_text("import sys\nsys.exit(0)\n")
+        from agent_kit_sync.cli import main
+        with a.env():
+            self.assertEqual(main(["add", str(source), "--module", "guards", "--events", "stop"]), 2)
+            self.assertFalse((a.layout.config / "modules/guards/hooks/new_hook.py").exists())
+            test = a.home / "tests" / "test_new_hook.py"
+            test.parent.mkdir()
+            test.write_text("import sys\nsys.exit(0)\n")
+            self.assertEqual(main(["add", str(source), "--module", "guards", "--events", "stop", "--tests", str(test)]), 0)
+        manifest = (a.layout.config / "modules/guards/module.toml").read_text()
+        self.assertIn('tests = ["hooks/tests/test_new_hook.py"]', manifest)
+        self.assertTrue((a.layout.config / "modules/guards/hooks/tests/test_new_hook.py").is_file())
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        self.assertTrue((a.layout.installed / "guards" / "hooks" / "new_hook.py").exists())
 
 
 if __name__ == "__main__":

@@ -37,6 +37,127 @@ class Finding:
         return f"{self.check}: {where}: {self.detail}"
 
 
+SYSTEMS =("macos", "windows", "linux")
+SYSTEM_LABELS = {"macos": "macOS", "windows": "Windows", "linux": "Linux"}
+CODE_SUFFIXES = (".py", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl")
+SHELL_SUFFIXES = (".sh", ".bash", ".zsh")
+WINDOWS_SUFFIXES = (".ps1", ".bat", ".cmd")
+PORTABLE_MARK = re.compile(r"agent-kit-sync:\s*portable because\s+(\S.*?)\s*(?:\*/|-->)?\s*$")
+# Code that checks which system it runs on, or that falls back when a module is missing. A comment does not count.
+PLATFORM_TEST = re.compile(r"^(?!\s*(?:#|//)).*(?:\bsys\.platform\b|\bplatform\.system\(|\bos\.name\b|\bos_name\(|\bprocess\.platform\b|\bos\.platform\(|\bcommand -v\b|\$OSTYPE\b|\$\(uname\b|\buname -s\b|\bexcept\s+\(?\s*(?:ImportError|ModuleNotFoundError)\b)", re.M)
+NODE_PROGRAMS = "npx|npm|pnpm|pnpx|yarn|bunx|tsc|jest|eslint|prettier"
+SPAWN_PROGRAM = re.compile(r"\b(?:spawn|spawnSync|execFile|execFileSync)\(\s*['\"`](" + NODE_PROGRAMS + r")['\"`]")
+SHELL_OPTION = re.compile(r"\bshell\s*[:=]\s*(?:true|True)\b")
+NOT_WINDOWS = ("windows",)
+NOT_UNIX = ("macos", "linux")
+# Each entry: (pattern, systems it fails on, guarded, problem). A guarded pattern is not reported in a file that
+# checks which system it runs on, because such code usually runs only on the system it was written for.
+PORTABILITY_PATTERNS = [
+    (re.compile(r"(?:\b(?:spawn|spawnSync|execFile|execFileSync)\(\s*|\b(?:command|cmd|program|bin|executable)\s*[:=]\s*|\b(?:run|call|check_call|check_output|Popen)\(\s*\[\s*)['\"`](npx|npm|pnpm|pnpx|yarn|bunx|tsc|jest|eslint|prettier)['\"`]"), NOT_WINDOWS, False,
+     "starts {0} without a shell; on Windows {0} is a .cmd file, which Node's spawn refuses and Python finds only by its full name. Run the package's JavaScript file with the Node interpreter instead"),
+    (re.compile(r"node_modules['\"]?\s*[,/\\+]\s*['\"]?\.bin\b|node_modules(?:/|\\{1,2})\.bin\b"), NOT_WINDOWS, False,
+     "runs a program from node_modules/.bin; on Windows those are .cmd files, which spawn cannot start. Run the package's JavaScript file with process.execPath instead"),
+    (re.compile(r"['\"`]#!\s*/[\w/.+-]+(?:\s+[\w.+-]+)?(?:\\n|$)"), NOT_WINDOWS, False,
+     "writes a script that starts with #! to run as a program; Windows cannot run a file by its #! line. Write the fake program in Python or JavaScript and start it with the interpreter"),
+    (re.compile(r":/usr/(?:local/)?s?bin\b|\bPATH\b.*(?:['\"]:['\"]|\}:\$?\{|['\"]:\$|:\$PATH)"), NOT_WINDOWS, False,
+     "joins PATH entries with ':'; Windows separates them with ';'. Use os.pathsep in Python or path.delimiter in Node"),
+    (re.compile(r"\bshell\s*=\s*True\b|\bshell:\s*true\b|\bos\.system\(|\bos\.popen\(|(?<![\w.])execSync\(|(?<![\w.])exec\(\s*['\"`]|\bchild_process\.exec(?:Sync)?\("), NOT_WINDOWS, False,
+     "runs a command line through the shell, which on Windows is cmd.exe and reads quotes, pipes, and variables differently from sh. Pass a list of arguments to subprocess.run, or to spawn, without a shell"),
+    (re.compile(r"^\s*(?:import|from)\s+(fcntl|pwd|grp|termios|tty|pty|resource|posix|crypt|syslog)\b"), NOT_WINDOWS, True,
+     "imports {0}, which Windows does not have"),
+    (re.compile(r"\b(os\.(?:fork|forkpty|getuid|geteuid|getgid|getegid|killpg|setsid|getpgid|setpgid|mkfifo|uname)|signal\.(?:alarm|SIGALRM|SIGKILL|SIGHUP|SIGUSR1|SIGUSR2|SIGQUIT)|process\.(?:getuid|geteuid|getgid))\b"), NOT_WINDOWS, True,
+     "uses {0}, which Windows does not have"),
+    (re.compile(r"['\"](/(?:usr/(?:local/)?)?s?bin/[\w.+-]+)"), NOT_WINDOWS, True,
+     "calls {0}, which does not exist on Windows. Call the program by name, or do the work in Python or JavaScript"),
+    (re.compile(r"\b(osascript|launchctl|pbcopy|pbpaste|xcrun|xcode-select|mdfind)\b"), ("windows", "linux"), True,
+     "runs {0}, which only macOS has"),
+    (re.compile(r"\b(xdg-open|notify-send|systemctl)\b"), ("macos", "windows"), True,
+     "runs {0}, which only Linux has"),
+    (re.compile(r"^\s*(?:import|from)\s+(winreg|msvcrt|winsound)\b|['\"](powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd\.exe)['\"]|['\"](cmd)['\"]\s*,\s*['\"]/[cCkK]['\"]"), NOT_UNIX, True,
+     "uses {0}, which only Windows has"),
+]
+
+
+def is_code(path: str, data: bytes) -> bool:
+    """A file that runs: a script by its suffix, or any file whose first line starts with #!."""
+    return PurePosixPath(path).suffix.lower() in CODE_SUFFIXES or data.startswith(b"#!")
+
+
+def system_list(systems: Iterable[str]) -> str:
+    labels = [SYSTEM_LABELS.get(system, system) for system in SYSTEMS if system in systems]
+    return " and ".join(labels) if len(labels) < 3 else "macOS, Windows, and Linux"
+
+
+def portability_findings(path: str, text: str, systems: Sequence[str] = SYSTEMS, lines: Optional[Iterable[int]] = None, marks: Optional[list] = None) -> List[Finding]:
+    """Known ways a script works on one operating system and fails on another.
+
+    Only problems on the systems in `systems`, the ones the module installs on, are reported. A line
+    that holds `agent-kit-sync: portable because REASON` is not reported; it is added to `marks`.
+    """
+    findings: List[Finding] = []
+    wanted = set(lines) if lines is not None else None
+    suffix = PurePosixPath(path).suffix.lower()
+    if wanted is None:
+        whole = []
+        if suffix in SHELL_SUFFIXES and "windows" in systems:
+            whole.append("fails on Windows: a shell script, and Windows has no sh unless Git Bash or WSL is installed. Write it in Python, which every agent-kit-sync machine has")
+        if suffix in WINDOWS_SUFFIXES and set(systems) & set(NOT_UNIX):
+            whole.append(f"fails on {system_list(set(systems) & set(NOT_UNIX))}: a Windows script. Write it in Python, which every agent-kit-sync machine has")
+        # A mark in the file's first lines accepts a problem with the whole file.
+        mark = next((m for m in (PORTABLE_MARK.search(line) for line in text.splitlines()[:10]) if m), None) if whole else None
+        for detail in whole:
+            if mark:
+                if marks is not None:
+                    marks.append(Finding("portability", path, 0, f"marked portable: {mark.group(1)}"))
+            else:
+                findings.append(Finding("portability", path, 0, detail))
+    guarded = bool(PLATFORM_TEST.search(text))
+    for number, line in enumerate(text.splitlines(), start=1):
+        if wanted is not None and number not in wanted:
+            continue
+        if number == 1 and line.startswith("#!"):
+            continue
+        if line.lstrip().startswith(("#", "//", "/*", "* ")) and not PORTABLE_MARK.search(line):
+            continue  # A comment never runs.
+        hits = []
+        for index, (pattern, fails_on, guardable, problem) in enumerate(PORTABILITY_PATTERNS):
+            broken = [system for system in fails_on if system in systems]
+            if not broken or (guardable and guarded):
+                continue
+            if index == 0 and SHELL_OPTION.search(line):
+                continue  # Started through a shell, which finds the .cmd file; the shell pattern reports the line instead.
+            match = pattern.search(line)
+            if match:
+                named = next((group for group in match.groups() if group), match.group(0)) if match.groups() else match.group(0)
+                hits.append(f"fails on {system_list(broken)}: {problem.format(named)}")
+        if not hits:
+            continue
+        mark = PORTABLE_MARK.search(line)
+        if mark:
+            if marks is not None:
+                marks.append(Finding("portability", path, number, f"marked portable: {mark.group(1)}"))
+            continue
+        findings.extend(Finding("portability", path, number, hit) for hit in hits)
+    if "windows" in systems:
+        # A call split across lines, such as spawn( on one line and 'npx' on the next, which the line patterns miss.
+        reported = {finding.line for finding in findings}
+        all_lines = text.splitlines()
+        for match in SPAWN_PROGRAM.finditer(text):
+            first = text.count("\n", 0, match.start()) + 1
+            last = text.count("\n", 0, match.end()) + 1
+            if first == last or last in reported or (wanted is not None and not set(range(first, last + 1)) & wanted):
+                continue
+            if any(SHELL_OPTION.search(line) for line in all_lines[first - 1:last + 3]):
+                continue
+            mark = next((m for m in (PORTABLE_MARK.search(line) for line in all_lines[first - 1:last]) if m), None)
+            if mark:
+                if marks is not None:
+                    marks.append(Finding("portability", path, last, f"marked portable: {mark.group(1)}"))
+                continue
+            findings.append(Finding("portability", path, last, "fails on Windows: " + PORTABILITY_PATTERNS[0][3].format(match.group(1))))
+    return findings
+
+
 def read_terms(path: Path) -> List[str]:
     if not path.is_file():
         return []
@@ -166,17 +287,25 @@ class Checker:
             return [Finding("python-syntax", path, 0, str(error))]
         return []
 
-    def file(self, path: str, data: bytes, *, own: bool, templated: bool = False, header: bool = False, added_lines: Optional[Iterable[int]] = None) -> List[Finding]:
-        """Check one file. `own` is True for the user's files and False for files from a source."""
+    def file(self, path: str, data: bytes, *, own: bool, templated: bool = False, header: bool = False, added_lines: Optional[Iterable[int]] = None,
+             systems: Optional[Sequence[str]] = SYSTEMS) -> List[Finding]:
+        """Check one file. `own` is True for the user's files and False for files from a source.
+
+        `systems` lists the operating systems the file's module installs on, for the portability
+        check; None skips that check, for a module that never leaves this machine.
+        """
         findings: List[Finding] = []
         if PurePosixPath(path).suffix == ".py":
             findings += self.python_findings(path, data)
         text = decode_any(data)
-        if "\0" in text:
+        binary = "\0" in text
+        if binary:
             # Binary: look for blocked terms and secrets in the printable runs only.
             text = "\n".join(re.findall(r"[\x20-\x7e]{6,}", text))
             added_lines = None
         findings += self.text_findings(path, text, own=own, lines=added_lines)
+        if own and systems and not binary and is_code(path, data):
+            findings += portability_findings(path, text, systems, added_lines)
         if templated:
             findings += self.placeholder_findings(path, text, header)
         return findings

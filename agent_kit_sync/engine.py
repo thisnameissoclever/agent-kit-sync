@@ -143,6 +143,16 @@ class Engine:
     def tree(self, module: Module) -> Tree:
         return Tree(module.root)
 
+    @staticmethod
+    def module_systems(module: Module) -> Tuple[str, ...]:
+        """The operating systems a module installs on, for the portability check; none for a local module."""
+        if module.local:
+            return ()
+        wanted = module.requires.get("os")
+        if not wanted:
+            return checks.SYSTEMS
+        return tuple(system for system in checks.SYSTEMS if system in wanted)
+
     # ------------------------------------------------------------ the run
 
     def run(self, network: bool = True) -> Report:
@@ -624,13 +634,16 @@ class Engine:
             old = tree.read(source_rel)
             header = item.kind == "agent" or (item.kind in ("skill", "file") and source_rel.endswith(".md") and source_rel in templated)
             problems += self.checker.file(source_rel, data, own=True, templated=source_rel in templated, header=header,
-                                          added_lines=checks.added_line_numbers(old, data))
+                                          added_lines=checks.added_line_numbers(old, data), systems=self.module_systems(module))
         return problems
 
     def _run_hook_tests(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]]) -> List[checks.Finding]:
         """Run a hook's tests against the edited files, in a copy of the module, with the user's folders redirected."""
         import tempfile
-        from .testing import run_test
+        from .testing import missing_tests, run_test
+        missing = missing_tests(module, item)
+        if missing:
+            return [checks.Finding("module-tests", item.data.get("file", item.key), 0, missing)]
         tests = list(item.data.get("tests", []))
         if not tests:
             return []
@@ -652,9 +665,16 @@ class Engine:
             return findings
 
     def _incoming_tests_fail(self, module: Module, item: Item, tree: Tree) -> Optional[str]:
-        from .testing import run_test
-        if item.kind != "hook" or not item.data.get("tests") or tree.commit is not None:
+        """Why a new or changed hook from the config repo must not be installed here, or None.
+
+        A hook with no tests is refused, and so is one whose tests fail or cannot run on this machine.
+        """
+        from .testing import missing_tests, run_test
+        if item.kind != "hook" or module.local or getattr(tree, "commit", None) is not None:
             return None
+        missing = missing_tests(module, item)
+        if missing:
+            return missing
         for rel in item.data["tests"]:
             result, detail = run_test(module.root, rel)
             if result == "failed":
@@ -725,6 +745,7 @@ class Engine:
         head = gitops.head(self.checkout)
         paths, failed = [], []
         templated_paths, header_paths = self._templated_paths()
+        systems = self._systems_by_module()
         for entry in gitops.status_porcelain(self.checkout):
             status, path = entry[:2], entry[3:]
             if " -> " in path:
@@ -740,25 +761,53 @@ class Engine:
                 old = gitops.show(self.checkout, "HEAD", path) if head else None
                 templated = path in templated_paths or (path.endswith(".md") and "/sections/" in path) or "/agents/" in path
                 header = path in header_paths or ("/agents/" in path and path.endswith(".md"))
-                problems = self.checker.file(path, data, own=True, templated=templated, header=header, added_lines=checks.added_line_numbers(old, data))
+                parts = PurePosixPath(path).parts
+                module_systems = systems.get(parts[1], checks.SYSTEMS) if len(parts) > 2 and parts[0] == "modules" else checks.SYSTEMS
+                problems = self.checker.file(path, data, own=True, templated=templated, header=header, added_lines=checks.added_line_numbers(old, data), systems=module_systems)
                 if problems:
                     failed.append((path, problems))
                     continue
             paths.append(path)
+        test_failures, manifest_fixes = self._hook_test_failures(paths)
+        for path, problems in test_failures:
+            paths.remove(path)
+            failed.append((path, problems))
+        for path, (fixed, names, problems) in manifest_fixes.items():
+            # Only the failing hooks' entries go back to their last commit; the rest of module.toml is committed.
+            target = self.checkout / path
+            current = read_or_none(target)
+            if current is not None:
+                self._hold_checkout_file(path, f"The entries for {', '.join(names)} in {path} failed the checks, so they were set back: " + "; ".join(str(p) for p in problems[:3]), current, fixed)
+            atomic_write(target, fixed)
+            self.alerts.raise_(f"checkout:{path}", f"agent-kit-sync did not commit the entries for {', '.join(names)} in {path}, because they failed the checks: " + "; ".join(str(p) for p in problems[:3]) + ". They were set back to the last synced version.", "agent-kit-sync status")
         for path, problems in failed:
-            # Put the failing file back to its last commit so it never blocks a later merge.
-            if head and gitops.show(self.checkout, "HEAD", path) is not None:
+            # Save the failing file as a held change, then put it back to its last commit so it never blocks a later merge.
+            data = read_or_none(self.checkout / path)
+            committed = gitops.show(self.checkout, "HEAD", path) if head else None
+            if data is not None:
+                self._hold_checkout_file(path, f"{path} was changed in the config repo checkout but failed the checks, so it was set back: " + "; ".join(str(p) for p in problems[:3]), data, committed)
+            if committed is not None:
                 gitops.run(self.checkout, "checkout", "HEAD", "--", path, check=False)
-            elif "?" not in path:
-                gitops.run(self.checkout, "rm", "-fq", "--", path, check=False)
-            held = self.held.by_key(f"checkout:{path}")
+            else:
+                # Never committed: unstage it if staged, then delete it.
+                gitops.run(self.checkout, "rm", "-fq", "--cached", "--ignore-unmatch", "--", path, check=False)
+                remove_file(self.checkout / path)
+                prune_empty_dirs((self.checkout / path).parent, self.checkout)
             self.alerts.raise_(f"checkout:{path}", f"agent-kit-sync did not commit {path} in the config repo, because it failed the checks: " + "; ".join(str(p) for p in problems[:3]) + ". It was set back to the last synced version.", "agent-kit-sync status")
         for path in paths:
-            self.alerts.close(f"checkout:{path}")
+            if path not in manifest_fixes:
+                self.alerts.close(f"checkout:{path}")
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
             self._approve_own_items(paths, head)
+
+    def _hold_checkout_file(self, path: str, summary: str, ours: bytes, set_back: Optional[bytes]) -> None:
+        """Save a checkout file that was set back, with what it was set back to, so `use-this` can tell if it changed since."""
+        data = {"ours": ours}
+        if set_back is not None:
+            data["set-back"] = set_back
+        self.held.add(f"checkout:{path}", "checkout-edit", summary, ["discard", "use-this"], data, path=path, set_back_absent=set_back is None)
 
     def _approve_own_items(self, paths: List[str], parent: Optional[str]) -> None:
         """Items this machine just committed, such as a `remember` entry or an `add`, are its own
@@ -800,6 +849,69 @@ class Engine:
             return load_module(module.root, module.name, False, tree=tree), tree
         except ConfigError:
             return False
+
+    def _hook_test_failures(self, paths: List[str]) -> Tuple[List[Tuple[str, List[checks.Finding]]], Dict[str, Tuple[bytes, List[str], List[checks.Finding]]]]:
+        """Changed checkout files of synced hooks with no tests or with failing tests.
+
+        Returns the hook files to leave uncommitted, with their problems, and, for each module.toml
+        that changed a failing hook's entry, that file with only those entries set back to their last
+        commit, the hooks' names, and the problems. The rest of module.toml is committed as usual.
+        """
+        from .testing import missing_tests, run_test
+        changed = set(paths)
+        touched = {PurePosixPath(path).parts[1] for path in paths if path.startswith("modules/") and len(PurePosixPath(path).parts) > 2}
+        if not touched:
+            return [], {}
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError:
+            return [], {}
+        failures: Dict[str, List[checks.Finding]] = {}
+        manifests: Dict[str, Tuple[bytes, List[str], List[checks.Finding]]] = {}
+        head = gitops.head(self.checkout)
+        for module in modules:
+            if module.name not in touched or module.local or module.source:
+                continue
+            base = f"modules/{module.name}"
+            manifest_rel = f"{base}/module.toml"
+            tree = Tree(module.root)
+            previous = self._module_at(module, head) if head else None
+            before = {item.name: item.data for item in previous[0].of("hook")} if previous else {}
+            old_manifest = gitops.show(self.checkout, "HEAD", manifest_rel) if head else None
+            for item in module.of("hook"):
+                files = {f"{base}/{rel}" for rel in item_source_files(module, item, tree)}
+                entry_changed = before.get(item.name) != item.data and manifest_rel in changed
+                hit = sorted(files & changed)
+                if not hit and not entry_changed:
+                    continue
+                problem = missing_tests(module, item)
+                if problem is None:
+                    for rel in item.data["tests"]:
+                        result, detail = run_test(module.root, rel)
+                        if result == "failed":
+                            problem = f"{item.key}: {rel} failed: {detail.strip().splitlines()[-1] if detail.strip() else 'failed'}"
+                            break
+                if problem is None:
+                    continue
+                finding = checks.Finding("module-tests", item.data.get("file", item.key), 0, problem)
+                for path in hit:
+                    failures.setdefault(path, []).append(finding)
+                if entry_changed:
+                    current = manifests[manifest_rel][0] if manifest_rel in manifests else (read_or_none(self.checkout / manifest_rel) or b"")
+                    old_raw = tomledit.entry_text(old_manifest.decode("utf-8"), "hooks", item.name) if old_manifest else None
+                    fixed = tomledit.replace_entry(current.decode("utf-8"), "hooks", item.name, old_raw).encode("utf-8")
+                    names = (manifests[manifest_rel][1] if manifest_rel in manifests else []) + [item.key]
+                    found = (manifests[manifest_rel][2] if manifest_rel in manifests else []) + [finding]
+                    manifests[manifest_rel] = (fixed, names, found)
+        return sorted(failures.items()), manifests
+
+    def _systems_by_module(self) -> Dict[str, Tuple[str, ...]]:
+        """The operating systems each config repo module installs on, by module name."""
+        try:
+            _inventory, modules = self.load_modules()
+        except ConfigError:
+            return {}
+        return {module.name: self.module_systems(module) for module in modules if not module.local and not module.source}
 
     def _templated_paths(self) -> Tuple[Set[str], Set[str]]:
         """Config repo paths whose placeholders are replaced, and those among them that may start with a --- header block.
@@ -871,7 +983,7 @@ class Engine:
         for entry in gitops.status_porcelain(self.checkout):
             path = entry[3:].split(" -> ", 1)[-1]
             data = read_or_none(self.checkout / path)
-            self.held.add(f"checkout:{path}", "checkout-edit", f"{path} was changed in the config repo checkout but failed the checks, so it was set aside before merging.", ["discard", "use-this"], {"ours": data or b""}, path=path)
+            self._hold_checkout_file(path, f"{path} was changed in the config repo checkout but failed the checks, so it was set aside before merging.", data or b"", gitops.show(self.checkout, "HEAD", path))
         gitops.run(self.checkout, "reset", "-q", "--hard", "HEAD", check=False)
         gitops.run(self.checkout, "clean", "-fdq", check=False)
 
@@ -1013,7 +1125,12 @@ class Engine:
                 approved = self.index.approvals.get(item.key) == fingerprint
                 if info is None or "fp" not in info:
                     if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new or approved:
-                        kept.append(item)
+                        failure = self._incoming_tests_fail(module, item, tree)
+                        if failure is None:
+                            self.alerts.close(f"tests:{item.key}")
+                            kept.append(item)
+                            continue
+                        self.alerts.raise_(f"tests:{item.key}", f"agent-kit-sync did not install the new hook {item.key} on this machine, because it failed its tests here. {failure[:300]}", "agent-kit-sync test")
                         continue
                     self._hold_incoming(item, "new-item", f"{item.key} is new from the config repo.", head, item_is_code(module, item, tree))
                     continue
@@ -1025,9 +1142,10 @@ class Engine:
                 if policy == "apply" or approved:
                     failure = self._incoming_tests_fail(module, item, tree)
                     if failure is None:
+                        self.alerts.close(f"tests:{item.key}")
                         kept.append(item)
                         continue
-                    self.alerts.raise_(f"tests:{item.key}", f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version. {failure[:200]}", "agent-kit-sync test")
+                    self.alerts.raise_(f"tests:{item.key}", f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version. {failure[:300]}", "agent-kit-sync test")
                     old = self._item_at(module, item.name, info["commit"])
                     if old is not None:
                         kept.append(old[0])
