@@ -724,6 +724,46 @@ class HookTestRequirementTests(TwoMachines):
             for entry in held:
                 self.assertEqual(resolve(a.layout, entry["id"], "discard"), 0)
 
+    def test_failing_hook_sets_back_only_its_own_entry(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "bare"\nfile = "hooks/bare.py"\nevents = ["stop"]\n'
+                            + '\n[[skills]]\nname = "t"\ndir = "skills/t"\n')
+        (a.layout.config / "modules/guards/hooks/bare.py").write_text("import sys\nsys.exit(0)\n")
+        (a.layout.config / "modules/guards/skills/t").mkdir(parents=True)
+        (a.layout.config / "modules/guards/skills/t/SKILL.md").write_text("---\nname: t\ndescription: d\n---\nKept.\n")
+        engine, _report = a.sync()
+        committed = git(a.layout.config, "show", "HEAD:modules/guards/module.toml")
+        self.assertIn('name = "t"', committed)
+        self.assertNotIn('name = "bare"', committed)
+        self.assertIn('name = "guard"', committed)
+        self.assertEqual(a.read(".claude", "skills", "t", "SKILL.md").strip().splitlines()[-1], "Kept.")
+        held = {e["path"]: e for e in engine.held.all() if e["kind"] == "checkout-edit"}
+        self.assertIn("modules/guards/module.toml", held)
+        self.assertIn('name = "bare"', engine.held.blob(held["modules/guards/module.toml"], "ours").decode())
+
+    def test_use_this_refuses_to_replace_later_edits(self):
+        self.hook_config()
+        a = self.machine("a")
+        a.sync()
+        manifest = a.layout.config / "modules/guards/module.toml"
+        manifest.write_text(manifest.read_text() + '\n[[hooks]]\nname = "bare"\nfile = "hooks/bare.py"\nevents = ["stop"]\n')
+        (a.layout.config / "modules/guards/hooks/bare.py").write_text("import sys\nsys.exit(0)\n")
+        engine, _report = a.sync()
+        entry = next(e for e in engine.held.all() if e.get("path") == "modules/guards/module.toml")
+        later = manifest.read_text() + '\n[[skills]]\nname = "later"\ndir = "skills/later"\n'
+        manifest.write_text(later)
+        from agent_kit_sync.resolve import resolve
+        with a.env():
+            self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 1)
+        self.assertEqual(manifest.read_text(), later)
+        manifest.write_text(engine.held.blob(entry, "set-back").decode())
+        with a.env():
+            self.assertEqual(resolve(a.layout, entry["id"], "use-this"), 0)
+        self.assertIn('name = "bare"', manifest.read_text())
+
     def test_untested_hook_does_not_block_other_changes_to_its_module(self):
         self.hook_config(tests="", test_body=None, extra='\n[[skills]]\nname = "s"\ndir = "skills/s"\n')
         self.seed_files({"modules/guards/skills/s/SKILL.md": "---\nname: s\ndescription: d\n---\nFirst.\n"}, "skill")

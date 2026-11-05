@@ -65,7 +65,11 @@ def _resolve_locked(layout, machine, held, entry, choice) -> int:
     if handler is None:
         print(f"agent-kit-sync cannot resolve a held change of kind {kind}.")
         return 2
-    message = handler(layout, machine, index, entry, choice)
+    try:
+        message = handler(layout, machine, index, entry, choice)
+    except Refused as refusal:
+        print(str(refusal))
+        return 1
     held.remove(entry["id"])
     info = index.items.get(item_key)
     if info and info.get("frozen") == entry["id"]:
@@ -191,12 +195,24 @@ def _merge(layout, machine, index, entry, choice):
     return f"Kept the other machine's version of {path}."
 
 
+class Refused(Exception):
+    """A choice that cannot be applied now; the held change stays."""
+
+
 def _checkout_edit(layout, machine, index, entry, choice):
     path = entry.get("path")
     if choice == "use-this" and path:
-        blob = Held(layout).blob(entry, "ours")
+        held = Held(layout)
+        blob = held.blob(entry, "ours")
         if blob is not None:
-            atomic_write(layout.config / path, blob)
+            target = layout.config / path
+            expected = None if entry.get("set_back_absent") else held.blob(entry, "set-back")
+            current = read_or_none(target)
+            if current != expected and current != blob:
+                saved = entry.get("files", {}).get("ours", "")
+                raise Refused(f"{path} changed after agent-kit-sync set it back, so the saved version would replace those changes. "
+                              f"Compare {saved} with {target}, copy what you need by hand, then resolve this with discard.")
+            atomic_write(target, blob)
             return f"The saved version of {path} is back in the config repo checkout. Fix what the checks reported before the next sync, or it is set back again."
     return f"Discarded the saved version of {path}."
 

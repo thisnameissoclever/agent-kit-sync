@@ -79,6 +79,46 @@ class PortabilityTests(unittest.TestCase):
         self.assertEqual(checks.portability_findings("h.py", text, lines=[2]), [])
         self.assertEqual(len(checks.portability_findings("h.py", text, lines=[1])), 1)
 
+    def test_node_bin_paths_in_any_form_are_reported(self):
+        for path, text in (
+            ("w.mjs", "const bin = path.join(root, 'node_modules/.bin/jest');\n"),
+            ("w.mjs", "spawnSync('./node_modules/.bin/jest', args);\n"),
+            ("w.py", "subprocess.run(['node_modules/.bin/jest'])\n"),
+            ("w.mjs", "execFileSync(`${root}/node_modules/.bin/jest`);\n"),
+            ("w.py", "Path(root) / 'node_modules' / '.bin' / 'jest'\n"),
+            ("w.cjs", "const bin = root + '\\\\node_modules\\\\.bin\\\\jest';\n"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(len(details(path, text)), 1, details(path, text))
+
+    def test_comments_are_not_reported(self):
+        self.assertEqual(details("w.mjs", "// runs node_modules/.bin/jest through spawn('npx')\n"), [])
+        self.assertEqual(details("h.py", "    # import fcntl is Unix only\n"), [])
+
+    def test_a_call_split_across_lines_is_reported(self):
+        found = checks.portability_findings("w.mjs", "const child = spawn(\n  'npx',\n  ['jest'],\n);\n")
+        self.assertEqual([f.line for f in found], [2])
+        # Started through a shell: reported once, for the shell, not for a missing one.
+        found = details("w.mjs", "spawn(\n  'npx',\n  ['jest'],\n  { shell: true },\n);\n")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("through the shell", found[0])
+
+    def test_a_shell_option_is_not_reported_as_without_a_shell(self):
+        found = details("w.mjs", "execFileSync('npm', ['ci'], { shell: true });\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("through the shell", found[0])
+
+    def test_regex_exec_is_not_a_shell(self):
+        self.assertEqual(details("w.mjs", "const m = re.exec('abc');\nconst n = /x/.exec(\"abc\");\n"), [])
+        self.assertEqual(len(details("w.mjs", "child_process.exec('ls -l');\n")), 1)
+
+    def test_guards_and_unix_calls(self):
+        self.assertEqual(len(details("h.py", "import os\nprint(os.uname())\n")), 1)
+        self.assertEqual(len(details("h.py", "def f():\n    import fcntl\n")), 1)
+        self.assertEqual(details("h.py", "try:\n    import fcntl\nexcept ImportError:\n    fcntl = None\n"), [])
+        # A comment that mentions the platform is not a guard.
+        self.assertEqual(len(details("h.py", "# check sys.platform first\nimport fcntl\n")), 1)
+
     def test_checker_runs_it_on_own_scripts_only(self):
         checker = checks.Checker(own_values=[])
         data = b"import fcntl\n"
