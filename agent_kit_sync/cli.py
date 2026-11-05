@@ -380,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local", action="store_true", help="Add to a local module that never syncs")
     p.add_argument("--heading", help="For an instruction file: the heading of the section to add")
     p.add_argument("--events", help="For a hook: comma-separated events")
+    p.add_argument("--tests", help="For a hook: comma-separated test files, copied beside the hook; required unless --local")
     p = sub.add_parser("remember", help="Add a shared memory entry")
     p.add_argument("text")
     p = sub.add_parser("forget", help="Remove a shared memory entry")

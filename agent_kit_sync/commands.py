@@ -177,10 +177,32 @@ def cmd_add(args, layout: Layout) -> int:
     elif kind == "hook":
         name = args.name or slug(source.stem)
         rel = f"hooks/{source.name}"
+        tests = [Path(t).expanduser().resolve() for t in (args.tests or "").split(",") if t.strip()]
+        if not tests and not args.local:
+            say("Every synced hook needs tests, because each machine runs them before it installs the hook. "
+                "Write them as the portable-scripts skill describes, then add the hook again with --tests TEST[,TEST], or add --local to keep it on this machine only.")
+            return 2
+        for test in tests:
+            if not test.is_file():
+                say(f"{test} does not exist.")
+                return 2
         atomic_write(root / rel, source.read_bytes(), executable=True)
+        test_rels = []
+        for test in tests:
+            # Keep each test where it sits relative to the hook, so a path such as ../hook.py still works.
+            try:
+                inner = PurePosixPath(test.relative_to(source.parent).as_posix())
+            except ValueError:
+                inner = PurePosixPath("tests") / test.name
+            test_rel = f"hooks/{inner}"
+            atomic_write(root / Path(*PurePosixPath(test_rel).parts), test.read_bytes())
+            test_rels.append(test_rel)
         events = [e.strip() for e in (args.events or "pre_tool_use").split(",") if e.strip()]
-        runtime = "node" if source.suffix in (".mjs", ".js") else ("bash" if source.suffix == ".sh" else "python")
-        text = tomledit.append_entry(text, "hooks", {"name": name, "file": rel, "events": events, "protocol": "native", "runtime": runtime, "timeout": 10, "on_failure": "open"})
+        runtime = "node" if source.suffix in (".mjs", ".js", ".cjs") else ("bash" if source.suffix == ".sh" else "python")
+        entry = {"name": name, "file": rel, "events": events, "protocol": "native", "runtime": runtime, "timeout": 10, "on_failure": "open"}
+        if test_rels:
+            entry["tests"] = test_rels
+        text = tomledit.append_entry(text, "hooks", entry)
     elif kind == "section":
         if not args.heading:
             say("Give the heading of the section to add with --heading.")
@@ -217,8 +239,8 @@ def cmd_add(args, layout: Layout) -> int:
         say(f"The module no longer loads: {error}")
         return 1
     say(f"Added {kind} {name} to {'local ' if args.local else ''}module {args.module}. Run agent-kit-sync sync to install it everywhere.")
-    if kind == "hook":
-        say("Check the hook with the portable-scripts skill before it syncs to other machines.")
+    if kind == "hook" and not args.local:
+        say("Run agent-kit-sync test MODULE before the next sync; it runs the hook's tests and the check for code that fails on macOS, Windows, or Linux.")
     return 0
 
 

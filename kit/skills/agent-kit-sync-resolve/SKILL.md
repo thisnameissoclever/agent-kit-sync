@@ -22,5 +22,6 @@ description: Handle an agent-kit-sync alert or held change by explaining it to t
 | `merge-conflict` | Two machines changed the same lines | Compare both versions; `discard` keeps the other machine's, `use-this` keeps this machine's |
 | `edit-conflict` | Two apps' copies on this machine were edited differently | `discard`, unless the saved edit has something the kept one lacks |
 | `collision` | An app already has an item with the same name that agent-kit-sync did not install | Compare them as the setup skill compares duplicates |
+| `checkout-edit` | A file changed in the config repo checkout failed the checks, so it was set back | Fix what the summary reports in the saved file, then `use-this` and sync; `discard` when the change was a mistake |
 
-For an alert that is not a held change, follow the command it gives. A "cannot find its current version" error from a hook means the dispatcher cannot start; tell the user to run `agent-kit-sync repair` in a terminal.
+For an alert that is not a held change, follow the command it gives. An alert that a hook failed its tests on this machine, or has no tests, means the hook stays off here: run `{{kit.cli}} test MODULE` to see why, then fix the hook or its tests as the portable-scripts skill describes. When the tests fail only on this machine's operating system, tell the user which system and which line. A "cannot find its current version" error from a hook means the dispatcher cannot start; tell the user to run `agent-kit-sync repair` in a terminal.

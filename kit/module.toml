@@ -17,6 +17,7 @@ templates = ["SKILL.md"]
 [[skills]]
 name = "portable-scripts"
 dir = "skills/portable-scripts"
+templates = ["SKILL.md"]
 
 [[skills]]
 name = "agent-kit-sync-resolve"
