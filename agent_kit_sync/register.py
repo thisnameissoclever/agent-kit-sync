@@ -21,7 +21,7 @@ from .model import Machine
 from .paths import Layout, os_name
 
 TOOL_EVENTS = ("session_start", "post_tool_use", "stop")
-# PowerShell reads these as single quotes too, so each is written twice inside a quoted string.
+# PowerShell reads each of these as a single quote, so an argument holding one cannot go in single quotes.
 POWERSHELL_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 
@@ -84,7 +84,7 @@ def windows_hook_quote(text: str) -> Optional[str]:
     """
     if not any(quote in text for quote in POWERSHELL_QUOTES):
         return "'" + text + "'"
-    if any(char in text for char in '"$`!\u201c\u201d\u201e') or "\\\\" in text or text.endswith("\\"):
+    if any(char in text for char in '"$`\u201c\u201d\u201e') or "\\\\" in text or text.endswith("\\"):
         return None
     return '"' + text + '"'
 
@@ -149,8 +149,9 @@ def interpreter_only(handler: dict, python: str) -> bool:
 def ours(command: str, launcher: Path) -> bool:
     """True when a command runs this kit's launcher, written plainly or quoted for a shell."""
     path = str(launcher)
-    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path]), windows_hook_quote(path)}
-    return any(form in command for form in forms if form)
+    # The last form is how the first Windows PowerShell entries wrote a path holding an apostrophe.
+    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path]), path.replace("'", "''")}
+    return any(form in command for form in forms)
 
 
 def _entry_command(handler: dict) -> str:

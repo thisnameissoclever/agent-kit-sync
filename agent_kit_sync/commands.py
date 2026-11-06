@@ -396,6 +396,10 @@ def cmd_doctor(args, layout: Layout) -> int:
             problems.append(f"{path} has {len(unshelled)} agent-kit-sync hook entries written for PowerShell that no longer set \"shell\" to \"powershell\" ({', '.join(unshelled)}). "
                             "Where Git Bash is installed, Claude Code runs them there, and they block every prompt and tool call. Another program probably rewrote the file. "
                             "Run agent-kit-sync repair from a terminal.")
+        bash_form = _bash_form_without_git_bash(data, layout)
+        if bash_form:
+            problems.append(f"Git Bash is not installed, so Claude Code runs hooks in PowerShell, which cannot run {len(bash_form)} agent-kit-sync entries written for Git Bash ({', '.join(bash_form)}). "
+                            "Run agent-kit-sync repair.")
         version = claude_version()
         if version and version < (2, 1, 295):
             notes.append("This Claude Code is older than 2.1.295, so hooks set to block on failure fail open if the dispatcher cannot start.")
@@ -414,8 +418,8 @@ def cmd_doctor(args, layout: Layout) -> int:
         exec_form = [event for event, handler in _own_entries(_json(machine.app_homes["claude"] / "settings.json"), layout) if handler.get("args")] if "claude" in machine.apps else []
         if exec_form:
             problems.append(f"Cursor cannot run {len(exec_form)} agent-kit-sync entries in Claude Code's settings ({', '.join(exec_form)}), because it ignores their \"args\" and starts Python with no script. "
-                            "agent-kit-sync writes that form only when the path to Python or to agent-kit-sync holds a quote character together with $, a backtick, or a double quote. "
-                            "Run agent-kit-sync repair; if this stays, install Python or agent-kit-sync under a path without those characters.")
+                            "agent-kit-sync writes that form only when the path to Python or to agent-kit-sync holds an apostrophe together with $, a backtick, a typographic double quote, or two backslashes in a row. "
+                            "Run agent-kit-sync repair; if this stays, install Python or agent-kit-sync under a path without an apostrophe.")
     for event in ("session_start", "pre_tool_use", "stop"):
         code, out = _dry_dispatch(layout, "claude" if "claude" in machine.apps else "codex", event)
         if code not in (0,):
@@ -484,6 +488,19 @@ def _powershell_without_shell(data: dict, layout: Layout) -> List[str]:
     """Events whose agent-kit-sync entry starts with PowerShell's & but has lost its "shell" field."""
     return [event for event, handler in _own_entries(data, layout)
             if str(handler.get("command", "")).startswith("& ") and handler.get("shell") != "powershell"]
+
+
+def _bash_form_without_git_bash(data: dict, layout: Layout) -> List[str]:
+    """On Windows without Git Bash, events whose agent-kit-sync entry is written for Git Bash.
+
+    Claude Code then runs hooks in PowerShell, which reads such an entry as a string and runs nothing.
+    """
+    from .paths import os_name
+    from .register import git_bash
+    if os_name() != "windows" or git_bash() is not None:
+        return []
+    return [event for event, handler in _own_entries(data, layout)
+            if not handler.get("args") and handler.get("shell") != "powershell" and not str(handler.get("command", "")).startswith("& ")]
 
 
 def _registered(data: dict, layout: Layout) -> List[str]:
