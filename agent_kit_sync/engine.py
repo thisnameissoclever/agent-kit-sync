@@ -800,7 +800,7 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
-            self._approve_own_items(paths, head)
+            self._approve_own_items(paths, head, commit)
 
     def _hold_checkout_file(self, path: str, summary: str, ours: bytes, set_back: Optional[bytes]) -> None:
         """Save a checkout file that was set back, with what it was set back to, so `use-this` can tell if it changed since."""
@@ -809,7 +809,7 @@ class Engine:
             data["set-back"] = set_back
         self.held.add(f"checkout:{path}", "checkout-edit", summary, ["discard", "use-this"], data, path=path, set_back_absent=set_back is None)
 
-    def _approve_own_items(self, paths: List[str], parent: Optional[str]) -> None:
+    def _approve_own_items(self, paths: List[str], parent: Optional[str], commit: Optional[str] = None) -> None:
         """Items this machine just committed, such as a `remember` entry or an `add`, are its own
         work, so the policy for changes from the config repo does not hold them here.
 
@@ -828,8 +828,12 @@ class Engine:
             _inventory, modules = self.load_modules()
         except ConfigError:
             return
-        listed = {module.name for module in modules}
-        for name in sorted(touched - listed):
+        try:
+            listed = {str(entry.get("name")) for entry in toml.load_file(self.checkout / "kit.toml").get("modules", [])}
+        except (OSError, toml.TOMLDecodeError):
+            listed = {module.name for module in modules}
+        loaded = {module.name for module in modules}
+        for name in sorted(touched - listed - loaded):
             # Not in kit.toml yet: read it from the checkout so its items can be approved now.
             if (self.checkout / "modules" / name / "module.toml").is_file():
                 try:
@@ -839,7 +843,8 @@ class Engine:
         for module in modules:
             if module.name not in touched or module.local:
                 continue
-            tree = Tree(module.root)
+            prefix = module.root.relative_to(self.checkout).as_posix()
+            tree = CommitTree(self.checkout, commit, prefix) if commit else Tree(module.root)
             previous = self._module_at(module, parent) if parent else None
             if previous is False:
                 continue  # The module did not load before this commit, so nothing here is known to be this machine's.
@@ -850,6 +855,8 @@ class Engine:
                     old = item_fingerprint(module, before, previous[1])
                     if info.get("fp") != old and self.index.approvals.get(item.key) != old:
                         continue  # Not what this machine had installed or approved; leave it to the policy.
+                elif parent and any(gitops.show(self.checkout, parent, f"{prefix}/{rel}") is not None for rel in item_source_files(module, item, tree)):
+                    continue  # New to the manifest, but its files were already in the config repo from elsewhere.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
 
     def _module_at(self, module: Module, commit: str):

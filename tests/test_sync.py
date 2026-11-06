@@ -324,6 +324,9 @@ class PolicyTests(TwoMachines):
         engine, _report = a.sync()
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
         self.assertNotIn("Changed by b.", a.read(".claude", "CLAUDE.md"))
+        # a's own version stayed approved; only b's change is waiting.
+        from agent_kit_sync.state import Index
+        self.assertTrue(Index(a.layout).approvals.get("extra/s"))
 
     def test_files_another_machine_committed_are_held_when_this_machine_lists_them(self):
         self.standard_config()
@@ -344,6 +347,28 @@ class PolicyTests(TwoMachines):
         engine, _report = a.sync()
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
 
+    def test_a_manifest_written_here_for_files_another_machine_committed_is_held(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        b = self.machine("b")
+        engine, _report = a.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with a.env():
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        b.sync()
+        (b.layout.config / "modules/extra/sections").mkdir(parents=True)
+        (b.layout.config / "modules/extra/sections/s.md").write_text("Written by b.\n", encoding="utf-8")
+        b.sync()  # b's files are committed with no module.toml.
+        a.sync()
+        (a.layout.config / "modules/extra/module.toml").write_text('description = "x"\n\n[[sections]]\nname = "s"\nfile = "sections/s.md"\n', encoding="utf-8")
+        self.list_extra(a)
+        engine, _report = a.sync()
+        self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
+        self.assertNotIn("Written by b.", a.read(".claude", "CLAUDE.md"))
+
     def test_a_module_listed_from_another_machine_is_held_here(self):
         self.standard_config()
         ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
@@ -357,10 +382,9 @@ class PolicyTests(TwoMachines):
         kit = config / "kit.toml"
         kit.write_text(kit.read_text(encoding="utf-8") + '\n[[modules]]\nname = "extra"\n', encoding="utf-8")
         a.sync()
-        # b commits an unrelated kit.toml change after pulling a's module; that does not make a's module b's own.
+        # b pulls a's module, then commits its own unrelated file in that module; a's items do not become b's.
         engine, _report = b.sync()
-        bkit = b.layout.config / "kit.toml"
-        bkit.write_text(bkit.read_text(encoding="utf-8") + "\n# local note\n", encoding="utf-8")
+        (b.layout.config / "modules/extra/notes.txt").write_text("b's note\n", encoding="utf-8")
         engine, _report = b.sync()
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
         self.assertNotIn("Extra rule.", b.read(".claude", "CLAUDE.md"))
