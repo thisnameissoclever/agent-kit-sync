@@ -800,7 +800,7 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
-            self._approve_own_items(paths, head)
+            self._approve_own_items(paths, head, commit)
 
     def _hold_checkout_file(self, path: str, summary: str, ours: bytes, set_back: Optional[bytes]) -> None:
         """Save a checkout file that was set back, with what it was set back to, so `use-this` can tell if it changed since."""
@@ -809,13 +809,17 @@ class Engine:
             data["set-back"] = set_back
         self.held.add(f"checkout:{path}", "checkout-edit", summary, ["discard", "use-this"], data, path=path, set_back_absent=set_back is None)
 
-    def _approve_own_items(self, paths: List[str], parent: Optional[str]) -> None:
+    def _approve_own_items(self, paths: List[str], parent: Optional[str], commit: Optional[str] = None) -> None:
         """Items this machine just committed, such as a `remember` entry or an `add`, are its own
         work, so the policy for changes from the config repo does not hold them here.
 
         An item is approved only when it is new in this commit, or when this machine had
-        installed exactly the version before this commit, so a held change from another
-        machine is never approved along with it.
+        installed or approved exactly the version before this commit, so a held change from
+        another machine is never approved along with it.
+
+        A module whose files this machine commits before kit.toml lists it is approved the
+        same way, so listing it later installs it here without asking. The approval holds the
+        item's exact fingerprint, so a change another machine makes before it is listed is held.
         """
         touched = {PurePosixPath(path).parts[1] for path in paths if path.startswith("modules/") and len(PurePosixPath(path).parts) > 2}
         if not touched:
@@ -824,9 +828,26 @@ class Engine:
             _inventory, modules = self.load_modules()
         except ConfigError:
             return
+        try:
+            listed = {str(entry.get("name")) for entry in toml.load_file(self.checkout / "kit.toml").get("modules", [])}
+        except (OSError, toml.TOMLDecodeError):
+            listed = {module.name for module in modules}
+        loaded = {module.name for module in modules}
+        for name in sorted(touched - listed - loaded):
+            # Not in kit.toml yet: read it from the checkout so its items can be approved now.
+            if (self.checkout / "modules" / name / "module.toml").is_file():
+                try:
+                    modules.append(load_module(self.checkout / "modules" / name, name, local=False))
+                except ConfigError:
+                    continue
         for module in modules:
             if module.name not in touched or module.local:
                 continue
+            prefix = module.root.relative_to(self.checkout).as_posix()
+            # The commit decides which items are this machine's own, so a hook file whose tests failed and
+            # was left out of it is not approved. The approval is the working tree's fingerprint, which is
+            # what the install check compares; Git may store the same text with other line breaks.
+            committed = CommitTree(self.checkout, commit, prefix) if commit else None
             tree = Tree(module.root)
             previous = self._module_at(module, parent) if parent else None
             if previous is False:
@@ -835,9 +856,23 @@ class Engine:
                 before = next((i for i in previous[0].items if i.name == item.name), None) if previous else None
                 if before is not None:
                     info = self.index.items.get(item.key) or {}
-                    if info.get("fp") != item_fingerprint(module, before, previous[1]):
-                        continue  # Not what this machine had installed; leave it to the policy.
+                    old = item_fingerprint(module, before, previous[1])
+                    if info.get("fp") != old and self.index.approvals.get(item.key) != old:
+                        continue  # Not what this machine had installed or approved; leave it to the policy.
+                elif parent and any(gitops.show(self.checkout, parent, f"{prefix}/{rel}") is not None for rel in item_source_files(module, item, tree)):
+                    continue  # New to the manifest, but its files were already in the config repo from elsewhere.
+                if committed is not None and not self._same_as_committed(module, item, tree, committed):
+                    continue  # Part of the item was left out of the commit, such as a hook whose tests failed.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
+
+    @staticmethod
+    def _same_as_committed(module: Module, item: Item, tree: Tree, committed: Tree) -> bool:
+        """True when every file of the item in the working tree is the committed file, ignoring line breaks."""
+        for rel in item_source_files(module, item, tree):
+            here, there = tree.read(rel), committed.read(rel)
+            if here is None or there is None or here.replace(b"\r\n", b"\n") != there.replace(b"\r\n", b"\n"):
+                return False
+        return True
 
     def _module_at(self, module: Module, commit: str):
         """The module as it was at `commit`, with its tree; None when it did not exist; False when it did not load."""

@@ -383,6 +383,15 @@ class Planner:
                 source_rel=rel, data=data.encode("utf-8"), executable=False, render_kind=kind, code=has_hooks, local=module.local,
             ))
 
+    def _hook_args(self, module: Module, item: Item) -> List[str]:
+        """The hook's args with this machine's values; {{kit.app}} is filled in when the hook runs."""
+        from .dispatch import APP_ARG
+        values = self._values(module, APP_ARG)
+        try:
+            return [render.substitute(str(arg), values) for arg in item.data.get("args", [])]
+        except render.RenderError as error:
+            raise render.RenderError(f"hook {item.name} args: {error}") from None
+
     def _hook(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree, order: int) -> None:
         rel = item.data["file"]
         raw = tree.read(rel)
@@ -400,7 +409,7 @@ class Planner:
         plan.hooks.append(HookSpec(
             module=module.name, name=item.name, path=dest, events=list(item.data.get("events", [])),
             tools=list(item.data.get("tools", [])), protocol=item.data.get("protocol", "native"),
-            args=[str(arg) for arg in item.data.get("args", [])], runtime=runtime,
+            args=self._hook_args(module, item), runtime=runtime,
             timeout=int(item.data.get("timeout", 10)), on_failure=item.data.get("on_failure", "open"),
             apps=list(item.data.get("apps", apps)), order=order,
         ))

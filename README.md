@@ -212,7 +212,7 @@ tests = ["tests/test_no_rm.py"]
 | `events` | `session_start`, `user_prompt`, `pre_tool_use`, `post_tool_use`, `stop`, `subagent_start`, `subagent_stop`, `pre_compact`, `session_end` |
 | `tools` | `shell`, `read`, `write`, `edit`, `search`, `web`, `task`, `mcp`; leave it out for every tool |
 | `protocol` | `native`: the hook reads and writes the app's own format, as an existing Claude Code or Codex hook does. `kit`: the hook reads one translated event and writes `{"decision": "allow" | "deny" | "ask" | "continue", "reason", "agent_context", "user_message"}`, the same on every app |
-| `args` | Arguments for the hook, which may use placeholders, such as `["--app", "{{kit.app}}"]` |
+| `args` | Arguments for the hook, such as `["--app", "{{kit.app}}"]`. Placeholders become this machine's values, and `{{kit.app}}` becomes the app that runs the hook. A placeholder with no value on a machine keeps the module off that machine, with an alert |
 | `runtime` | `python` (default), `node`, or `bash` |
 | `tests` | Test files, run as separate programs; required for every synced hook |
 | `on_failure` | `open`: a crash or timeout is reported and the action continues. `closed`: the action is blocked |

@@ -59,10 +59,19 @@ def caller(app: str, payload: dict) -> str:
     return app
 
 
+# What {{kit.app}} in a hook's args is stored as, so {{kit.literal app}} still reaches the hook as text.
+APP_ARG = "\x00kit.app\x00"
+
+
+def hook_args(hook: dict, calling: str) -> list:
+    """The hook's args with the calling app in place of {{kit.app}}; one registration serves every app."""
+    return [str(arg).replace(APP_ARG, calling) for arg in hook.get("args", [])]
+
+
 def run_one(hook: dict, app: str, event: str, raw: bytes, payload: dict, env: dict) -> dict:
     import subprocess
     import time
-    args = [str(arg) for arg in hook.get("args", [])]
+    args = hook_args(hook, env.get("AGENT_KIT_SYNC_APP") or caller(app, payload))
     path = hook["path"]
     runtime = hook.get("runtime", "python")
     if runtime == "python":

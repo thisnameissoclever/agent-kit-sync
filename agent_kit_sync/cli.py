@@ -178,7 +178,14 @@ def cmd_run_hook(args, layout: Layout) -> int:
     runtime = {"python": [sys.executable], "node": ["node"], "bash": ["bash"]}.get(hook.get("runtime", "python"), [])
     data = sys.stdin.buffer.read() if not sys.stdin.isatty() else b""
     try:
-        result = subprocess.run(runtime + [hook["path"]] + hook.get("args", []) + list(args.rest), input=data, timeout=hook.get("timeout", 10))
+        from .dispatch import caller, hook_args
+        try:
+            payload = json.loads(data.decode("utf-8")) if data else {}
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        # Claude Code runs the hook a subagent definition names, and Cursor runs Claude Code's.
+        calling = os.environ.get("AGENT_KIT_SYNC_APP") or caller("claude", payload if isinstance(payload, dict) else {})
+        result = subprocess.run(runtime + [hook["path"]] + hook_args(hook, calling) + list(args.rest), input=data, timeout=hook.get("timeout", 10))
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"agent-kit-sync: the {args.hook} hook timed out.\n")
         return 2 if hook.get("on_failure") == "closed" else 1
