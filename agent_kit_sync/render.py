@@ -41,6 +41,7 @@ class Values:
     os: str
     cli: str
     hooks: Dict[str, str]
+    reverse_skip: Tuple[str, ...] = ()
 
     def lookup(self, name: str, arg: Optional[str]) -> str:
         if name == "literal":
@@ -65,7 +66,7 @@ class Values:
         raise RenderError(f"unknown placeholder {{{{kit.{name}}}}}")
 
     def path_pairs(self) -> List[Tuple[str, str]]:
-        pairs = [(getattr(self, name), "{{kit." + name + "}}") for name in PATH_NAMES if getattr(self, name)]
+        pairs = [(getattr(self, name), "{{kit." + name + "}}") for name in PATH_NAMES if getattr(self, name) and name not in self.reverse_skip]
         return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
 
 

@@ -363,7 +363,13 @@ def cmd_doctor(args, layout: Layout) -> int:
     if shutil.which("git") is None:
         problems.append("Git is not on the command path.")
     for folder in machine.defaulted:
-        notes.append(f"The machine file sets no {folder} folder, so {getattr(machine, folder)} is used. Set {folder} in {layout.machine_file} to change it.")
+        path = getattr(machine, folder)
+        where = "" if path.is_dir() else ", which does not exist on this machine"
+        notes.append(f"The machine file sets no {folder} folder, so {path} is used{where}. Set {folder} in {layout.machine_file} to change it.")
+    from .model import folder_name, kit_defaults
+    for key, value in kit_defaults(layout).items():
+        if key in ("projects_folder_name", "worktrees_folder_name") and folder_name(value) is None:
+            problems.append(f"kit.toml sets defaults.{key} to {value!r}, which is not a plain folder name on this system, so it is ignored.")
     if sys.version_info < (3, 9):
         problems.append(f"Python {sys.version.split()[0]} is older than 3.9.")
     if machine.python and not Path(machine.python).exists():

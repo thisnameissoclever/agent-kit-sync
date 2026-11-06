@@ -834,6 +834,55 @@ class DefaultFolderTests(TwoMachines):
             machine = load_machine(a.layout)
         self.assertEqual(machine.projects, a.home / "Projects")
 
+    def test_a_defaulted_worktrees_folder_goes_inside_the_projects_folder_the_machine_file_sets(self):
+        self.standard_config()
+        a = self.machine("a")
+        data = a.machine_data()
+        data["projects"] = str(a.home / "elsewhere" / "code")
+        data.pop("worktrees", None)
+        a.write_machine(data)
+        with a.env():
+            from agent_kit_sync.model import load_machine
+            machine = load_machine(a.layout)
+        self.assertEqual(machine.worktrees, a.home / "elsewhere" / "code" / (".worktrees" if os.name == "nt" else "_worktrees"))
+        self.assertEqual(machine.defaulted, ["worktrees"])
+
+    def test_defaults_that_are_not_a_table_do_not_stop_the_machine_loading(self):
+        self.standard_config()
+        kit = self.seed / "kit.toml"
+        self.seed_files({"kit.toml": "defaults = 5\n" + kit.read_text(encoding="utf-8")}, "bad defaults")
+        a = self.machine("a")
+        self.drop_folders(a)
+        with a.env():
+            from agent_kit_sync.model import load_machine
+            machine = load_machine(a.layout)
+        self.assertEqual(machine.projects, a.home / "Projects")
+
+    def test_folder_names_that_fail_on_some_system_are_refused(self):
+        from agent_kit_sync.model import folder_name
+        for bad in ("../x", "a\\b", "C:", "a:b", "CON", "nul.txt", "foo.", "foo ", " foo", "x\ny", "", ".", 7, None, {"nosuch": "Code"}):
+            with self.subTest(name=bad):
+                self.assertIsNone(folder_name(bad))
+        for good in ("Code", "my projects", "_worktrees", ".worktrees", "Projects-2026"):
+            with self.subTest(name=good):
+                self.assertEqual(folder_name(good), good)
+
+    def test_an_edit_is_not_carried_back_into_a_defaulted_folder_placeholder(self):
+        self.standard_config()
+        a = self.machine("a")
+        self.drop_folders(a)
+        a.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        typed = "See " + str(a.home / "Projects" / "notes.md") + " too."
+        a.write(path, path.read_text(encoding="utf-8").replace("Write plainly.", "Write plainly.\n" + typed))
+        a.sync()
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_text(encoding="utf-8")
+        # The typed path is under the home folder, so it becomes {{kit.home}}, never the defaulted
+        # {{kit.projects}}; the line that already used the placeholder keeps it.
+        self.assertIn("See {{kit.home}}/Projects/notes.md too.", source)
+        self.assertNotIn("See {{kit.projects}}", source)
+        self.assertIn("Keep projects in {{kit.projects}}.", source)
+
     def test_doctor_says_which_folder_came_from_the_default(self):
         self.standard_config()
         a = self.machine("a")
@@ -846,6 +895,21 @@ class DefaultFolderTests(TwoMachines):
         with a.env(), contextlib.redirect_stdout(out):
             cmd_doctor(SimpleNamespace(), a.layout)
         self.assertIn("sets no projects folder", out.getvalue())
+        self.assertIn("does not exist on this machine", out.getvalue())
+
+    def test_doctor_reports_a_kit_default_it_ignored(self):
+        self.standard_config()
+        kit = self.seed / "kit.toml"
+        self.seed_files({"kit.toml": kit.read_text(encoding="utf-8") + '\n[defaults]\nprojects_folder_name = "CON"\n'}, "bad name")
+        a = self.machine("a")
+        a.sync()
+        import contextlib, io
+        from types import SimpleNamespace
+        from agent_kit_sync.commands import cmd_doctor
+        out = io.StringIO()
+        with a.env(), contextlib.redirect_stdout(out):
+            cmd_doctor(SimpleNamespace(), a.layout)
+        self.assertIn("defaults.projects_folder_name", out.getvalue())
 
 
 class HookArgumentTests(TwoMachines):

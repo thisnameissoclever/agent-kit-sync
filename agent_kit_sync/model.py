@@ -231,25 +231,45 @@ class Machine:
         return os_name()
 
 
-def default_folders(layout: Layout) -> Dict[str, Path]:
-    """The projects and worktrees folders for a machine whose machine file sets none.
+WINDOWS_DEVICE_NAMES = {"con", "prn", "aux", "nul"} | {f"{kind}{n}" for kind in ("com", "lpt") for n in range(1, 10)}
+
+
+def folder_name(value) -> Optional[str]:
+    """`value` when it is a plain folder name that works on every system, else None."""
+    if isinstance(value, dict):
+        value = value.get(os_name())
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text in (".", "..") or text != value or text.endswith((".", " ")):
+        return None
+    if any(char in text for char in '/\\:*?"<>|') or any(ord(char) < 32 for char in text):
+        return None
+    if text.split(".")[0].lower() in WINDOWS_DEVICE_NAMES:
+        return None
+    return text
+
+
+def kit_defaults(layout: Layout) -> dict:
+    try:
+        defaults = toml.load_file(layout.config / "kit.toml").get("defaults", {})
+    except (OSError, toml.TOMLDecodeError, ValueError, UnicodeDecodeError):
+        return {}
+    return defaults if isinstance(defaults, dict) else {}
+
+
+def default_folders(layout: Layout, projects: Optional[Path] = None) -> Dict[str, Path]:
+    """The projects and worktrees folders for a machine whose machine file does not set them.
 
     The names come from `defaults` in the config repo's kit.toml, as setup recommends them:
-    `projects_folder_name` in the home folder, and `worktrees_folder_name` inside it. The
-    folders need not exist; hooks that use them must handle their absence.
+    `projects_folder_name` in the home folder, and `worktrees_folder_name` inside the projects
+    folder, which is the one the machine file sets when it sets one. A name that is not a plain
+    folder name is ignored. The folders need not exist; hooks that use them must handle that.
     """
-    defaults: dict = {}
-    try:
-        defaults = dict(toml.load_file(layout.config / "kit.toml").get("defaults", {}))
-    except (OSError, toml.TOMLDecodeError, ValueError):
-        pass
-    def name(value, fallback: str) -> str:
-        if isinstance(value, dict):
-            value = value.get(os_name())
-        text = str(value).strip() if isinstance(value, str) else ""
-        return text if text and "/" not in text and "\\" not in text and text not in (".", "..") else fallback
-    projects = Path.home() / name(defaults.get("projects_folder_name"), "Projects")
-    worktrees = projects / name(defaults.get("worktrees_folder_name"), ".worktrees" if os_name() == "windows" else "_worktrees")
+    defaults = kit_defaults(layout)
+    if projects is None:
+        projects = Path.home() / (folder_name(defaults.get("projects_folder_name")) or "Projects")
+    worktrees = projects / (folder_name(defaults.get("worktrees_folder_name")) or (".worktrees" if os_name() == "windows" else "_worktrees"))
     return {"projects": projects, "worktrees": worktrees}
 
 
@@ -285,7 +305,7 @@ def load_machine(layout: Layout) -> Machine:
             from .paths import default_app_home
             homes[app] = default_app_home(app)
     defaulted = [folder for folder in ("projects", "worktrees") if not data.get(folder)]
-    fallback = default_folders(layout) if defaulted else {}
+    fallback = default_folders(layout, Path(data["projects"]) if data.get("projects") else None) if defaulted else {}
     return Machine(
         name=str(data.get("name", "machine")),
         apps=apps,
