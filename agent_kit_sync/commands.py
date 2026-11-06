@@ -362,6 +362,8 @@ def cmd_doctor(args, layout: Layout) -> int:
     machine = load_machine(layout)
     if shutil.which("git") is None:
         problems.append("Git is not on the command path.")
+    for folder in machine.defaulted:
+        notes.append(f"The machine file sets no {folder} folder, so {getattr(machine, folder)} is used. Set {folder} in {layout.machine_file} to change it.")
     if sys.version_info < (3, 9):
         problems.append(f"Python {sys.version.split()[0]} is older than 3.9.")
     if machine.python and not Path(machine.python).exists():

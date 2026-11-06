@@ -1,6 +1,7 @@
 """Sync between apps on one machine and between machines."""
 
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -781,6 +782,70 @@ class ReviewRegressionTests(TwoMachines):
         _engine, report = a.sync()
         self.assertEqual(report.held, [])
         self.assertIn("  Helps with reviews.\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+
+class DefaultFolderTests(TwoMachines):
+    def drop_folders(self, machine):
+        data = machine.machine_data()
+        data.pop("projects", None)
+        data.pop("worktrees", None)
+        machine.write_machine(data)
+
+    def test_a_machine_with_no_projects_folder_uses_the_kit_default(self):
+        self.standard_config()
+        kit = self.seed / "kit.toml"
+        self.seed_files({"kit.toml": kit.read_text(encoding="utf-8") + '\n[defaults]\nprojects_folder_name = "Code"\nworktrees_folder_name = { macos = "_wt", linux = "_wt", windows = ".wt" }\n'}, "defaults")
+        a = self.machine("a")
+        self.drop_folders(a)
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        self.assertIn("Keep projects in " + str(a.home / "Code") + ".", a.read(".claude", "CLAUDE.md"))
+        with a.env():
+            from agent_kit_sync.model import load_machine
+            machine = load_machine(a.layout)
+        self.assertEqual(machine.worktrees, a.home / "Code" / (".wt" if os.name == "nt" else "_wt"))
+        self.assertEqual(machine.defaulted, ["projects", "worktrees"])
+
+    def test_without_kit_defaults_the_folder_is_projects_in_the_home_folder(self):
+        self.standard_config()
+        a = self.machine("a")
+        self.drop_folders(a)
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        self.assertIn("Keep projects in " + str(a.home / "Projects") + ".", a.read(".claude", "CLAUDE.md"))
+
+    def test_a_folder_the_machine_file_sets_is_kept_and_not_reported(self):
+        self.standard_config()
+        a = self.machine("a")
+        with a.env():
+            from agent_kit_sync.model import load_machine
+            machine = load_machine(a.layout)
+        self.assertEqual((machine.projects, machine.defaulted), (a.home / "Projects", []))
+
+    def test_a_default_name_with_a_path_in_it_is_ignored(self):
+        self.standard_config()
+        kit = self.seed / "kit.toml"
+        self.seed_files({"kit.toml": kit.read_text(encoding="utf-8") + '\n[defaults]\nprojects_folder_name = "../elsewhere"\n'}, "defaults")
+        a = self.machine("a")
+        self.drop_folders(a)
+        a.sync()
+        with a.env():
+            from agent_kit_sync.model import load_machine
+            machine = load_machine(a.layout)
+        self.assertEqual(machine.projects, a.home / "Projects")
+
+    def test_doctor_says_which_folder_came_from_the_default(self):
+        self.standard_config()
+        a = self.machine("a")
+        self.drop_folders(a)
+        a.sync()
+        import contextlib, io
+        from types import SimpleNamespace
+        from agent_kit_sync.commands import cmd_doctor
+        out = io.StringIO()
+        with a.env(), contextlib.redirect_stdout(out):
+            cmd_doctor(SimpleNamespace(), a.layout)
+        self.assertIn("sets no projects folder", out.getvalue())
 
 
 class HookArgumentTests(TwoMachines):

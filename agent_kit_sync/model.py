@@ -223,10 +223,34 @@ class Machine:
     policy: dict
     overrides: dict
     cloud: bool = False
+    # Folders the machine file leaves out and that therefore come from the defaults, such as in a cloud session.
+    defaulted: List[str] = field(default_factory=list)
 
     @property
     def os(self) -> str:
         return os_name()
+
+
+def default_folders(layout: Layout) -> Dict[str, Path]:
+    """The projects and worktrees folders for a machine whose machine file sets none.
+
+    The names come from `defaults` in the config repo's kit.toml, as setup recommends them:
+    `projects_folder_name` in the home folder, and `worktrees_folder_name` inside it. The
+    folders need not exist; hooks that use them must handle their absence.
+    """
+    defaults: dict = {}
+    try:
+        defaults = dict(toml.load_file(layout.config / "kit.toml").get("defaults", {}))
+    except (OSError, toml.TOMLDecodeError, ValueError):
+        pass
+    def name(value, fallback: str) -> str:
+        if isinstance(value, dict):
+            value = value.get(os_name())
+        text = str(value).strip() if isinstance(value, str) else ""
+        return text if text and "/" not in text and "\\" not in text and text not in (".", "..") else fallback
+    projects = Path.home() / name(defaults.get("projects_folder_name"), "Projects")
+    worktrees = projects / name(defaults.get("worktrees_folder_name"), ".worktrees" if os_name() == "windows" else "_worktrees")
+    return {"projects": projects, "worktrees": worktrees}
 
 
 def load_machine(layout: Layout) -> Machine:
@@ -260,18 +284,21 @@ def load_machine(layout: Layout) -> Machine:
         if app not in homes:
             from .paths import default_app_home
             homes[app] = default_app_home(app)
+    defaulted = [folder for folder in ("projects", "worktrees") if not data.get(folder)]
+    fallback = default_folders(layout) if defaulted else {}
     return Machine(
         name=str(data.get("name", "machine")),
         apps=apps,
         app_homes=homes,
         tags=list(data.get("tags", [])),
         python=str(data.get("python", "")),
-        projects=Path(data["projects"]) if data.get("projects") else None,
-        worktrees=Path(data["worktrees"]) if data.get("worktrees") else None,
+        projects=Path(data["projects"]) if data.get("projects") else fallback.get("projects"),
+        worktrees=Path(data["worktrees"]) if data.get("worktrees") else fallback.get("worktrees"),
         git_identity=dict(data.get("git_identity", {})),
         policy=policy,
         overrides=overrides,
         cloud=bool(data.get("cloud", False)),
+        defaulted=defaulted,
     )
 
 
