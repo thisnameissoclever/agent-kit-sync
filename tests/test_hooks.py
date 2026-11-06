@@ -91,6 +91,132 @@ class RecognizeOwnEntriesTests(unittest.TestCase):
             self.assertFalse(interpreter_only({"type": "command", "command": "/usr/bin/other-python"}, python))
 
 
+class PowerShellEntryTests(unittest.TestCase):
+    """Windows entries in Claude Code's settings are PowerShell calls, the one form Cursor and Claude Code both run."""
+
+    PYTHON = r"C:\Program Files\Python313\python.exe"
+    LAUNCHER = Path(r"C:\Users\o'brien\.agent-kit-sync\launcher.py")
+
+    def entries(self, system, version):
+        from types import SimpleNamespace
+        from unittest import mock
+        from agent_kit_sync import register
+        machine = SimpleNamespace(python=self.PYTHON)
+        layout = SimpleNamespace(launcher=self.LAUNCHER)
+        with mock.patch.object(register, "os_name", return_value=system):
+            return register.desired_entries(layout, machine, "claude", [], True, version >= register.CLAUDE_MIN_POWERSHELL)
+
+    def test_windows_entry_is_a_powershell_call_cursor_can_run(self):
+        from agent_kit_sync.register import interpreter_only, ours
+        handler = self.entries("windows", (2, 1, 309))["Stop"]["handler"]
+        self.assertEqual(handler["shell"], "powershell")
+        self.assertNotIn("args", handler)
+        self.assertEqual(handler["command"], "& 'C:\\Program Files\\Python313\\python.exe' '-I' '-S' 'C:\\Users\\o''brien\\.agent-kit-sync\\launcher.py' 'hook' 'claude' 'stop'")
+        self.assertTrue(ours(handler["command"], self.LAUNCHER))
+        self.assertFalse(interpreter_only(handler, self.PYTHON))
+
+    def test_older_claude_code_on_windows_keeps_the_exec_form(self):
+        handler = self.entries("windows", (2, 1, 308))["Stop"]["handler"]
+        self.assertEqual(handler["command"], self.PYTHON)
+        self.assertEqual(handler["args"][-3:], ["hook", "claude", "stop"])
+        self.assertNotIn("shell", handler)
+
+    def test_macos_and_linux_entries_stay_one_shell_string(self):
+        for system in ("macos", "linux"):
+            handler = self.entries(system, (2, 1, 318))["Stop"]["handler"]
+            self.assertEqual(sorted(handler), ["command", "timeout", "type"])
+
+    def test_interpreter_only_powershell_call_is_detected(self):
+        from agent_kit_sync.register import interpreter_only, powershell_call
+        self.assertTrue(interpreter_only({"type": "command", "shell": "powershell", "command": powershell_call([self.PYTHON])}, self.PYTHON))
+
+
+def powershell_programs():
+    """Every PowerShell here. Claude Code and Cursor use PowerShell 7 when present, else Windows PowerShell 5.1."""
+    found = []
+    for name in ("pwsh", "powershell"):
+        program = shutil.which(name)
+        if program and program not in found:
+            found.append(program)
+    return found
+
+
+def powershell_program():
+    programs = powershell_programs()
+    return programs[0] if programs else None
+
+
+POWERSHELL_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+
+
+def run_like_claude_code(command, payload, env=None, program=None):
+    """Run a "shell": "powershell" hook command the way Claude Code 2.1.318 does: the payload on standard input."""
+    script = command + "\n; if (-not $?) { if ($LASTEXITCODE -eq 2) { exit 2 } }"
+    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+
+
+def run_like_cursor(command, payload, folder, env=None, program=None):
+    """Run a hook command the way the Cursor app 3.27.22 does on Windows: the payload in a file piped to the command."""
+    payload_file = Path(folder) / "cursor-hook-payload.json"
+    payload_file.write_bytes(payload)
+    literal = str(payload_file).replace("'", "''")
+    script = ("$OutputEncoding = [System.Text.UTF8Encoding]::new($false); try { $global:cursorHookConsoleInputEncoding = [Console]::InputEncoding; "
+              "$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { try { [Console]::InputEncoding = $global:cursorHookConsoleInputEncoding } catch { } }; "
+              "[Console]::InputEncoding = $OutputEncoding } catch { }; "
+              f"Get-Content -LiteralPath '{literal}' -Raw -Encoding UTF8 | & {{ $input | {command} }}"
+              "; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE } elseif ($null -eq $LASTEXITCODE -and "
+              "@($Error | Where-Object { $_.Exception -is [System.Management.Automation.CommandNotFoundException] }).Count -gt 0) { exit 127 }")
+    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+
+
+ECHO_HOOK = """
+import json, sys
+data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+if data.get("block"):
+    sys.stderr.write("Refusing: " + data["text"])
+    sys.exit(2)
+# Raw UTF-8, as a hook that prints text of its own may write it.
+sys.stdout.buffer.write(json.dumps({"seen": data["text"], "args": sys.argv[1:]}, ensure_ascii=False).encode("utf-8"))
+"""
+
+
+@unittest.skipUnless(powershell_program(), "PowerShell is not installed")
+class PowerShellInvocationTests(unittest.TestCase):
+    """The PowerShell call written for Windows runs one program with its arguments, input, and exit code intact."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="aks-ps-"))
+        folder = self.tmp / "o'brien $HOME dir"
+        folder.mkdir()
+        self.script = folder / "echo_hook.py"
+        self.script.write_text(ECHO_HOOK, encoding="utf-8")
+
+    def tearDown(self):
+        remove_tree(self.tmp)
+
+    def command(self):
+        from agent_kit_sync.register import powershell_call
+        return powershell_call([sys.executable, "-I", str(self.script), "hook", "claude", "$env:HOME", "a b"])
+
+    def check(self, run):
+        for program in powershell_programs():
+            with self.subTest(program=program):
+                payload = json.dumps({"text": "naïve ✓"}, ensure_ascii=False).encode("utf-8")
+                result = run(self.command(), payload, program)
+                self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                self.assertEqual(json.loads(result.stdout.decode("utf-8")), {"seen": "naïve ✓", "args": ["hook", "claude", "$env:HOME", "a b"]})
+                blocked = run(self.command(), json.dumps({"text": "rm", "block": True}).encode("utf-8"), program)
+                self.assertEqual(blocked.returncode, 2, blocked.stderr.decode("utf-8", "replace"))
+                self.assertIn("Refusing: rm", blocked.stderr.decode("utf-8", "replace"))
+
+    def test_claude_code_runs_it(self):
+        self.check(lambda command, payload, program: run_like_claude_code(command, payload, program=program))
+
+    def test_cursor_runs_it(self):
+        self.check(lambda command, payload, program: run_like_cursor(command, payload, self.tmp, program=program))
+
+
 class DispatchUnitTests(unittest.TestCase):
     def test_matcher_and_tool_kinds(self):
         self.assertEqual(dispatch.tool_kind("claude", "Bash"), "shell")
@@ -285,6 +411,41 @@ class InstalledToolTests(TwoMachines):
         out = json.loads(self.cli("hook", "claude", "user_prompt", stdin=payload).stdout)
         self.assertEqual(out["decision"], "block")
 
+    @unittest.skipUnless(os.name == "nt" and powershell_program(), "Windows with PowerShell only")
+    def test_windows_entries_run_in_claude_code_and_cursor(self):
+        # A Claude Code new enough for "shell": "powershell", found by name as setup finds it.
+        bin_dir = self.tmp / "fake-bin"
+        bin_dir.mkdir()
+        (bin_dir / "claude.cmd").write_text("@echo 2.1.318 (Claude Code)\r\n", encoding="utf-8")
+        git_dir = os.path.dirname(shutil.which("git") or "git")
+        path = {"PATH": os.pathsep.join([str(bin_dir), git_dir, os.path.dirname(sys.executable), os.path.dirname(powershell_program())])}
+        result = self.cli("setup", "init", "--tool-url", self.tool_url, extra_env=path)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        result = self.cli("sync", extra_env=path)
+        self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        settings = json.loads(self.a.read(".claude", "settings.json"))
+        for event, groups in settings["hooks"].items():
+            for group in groups:
+                for handler in group["hooks"]:
+                    self.assertEqual(handler.get("shell"), "powershell", (event, handler))
+                    self.assertTrue(handler["command"].startswith("& '"), (event, handler))
+                    self.assertNotIn("args", handler)
+        command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        env = dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home), AGENT_KIT_SYNC_NO_BACKGROUND="1")
+        for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_KIT_SYNC_HOME"):
+            env.pop(name, None)
+        blocked = json.dumps({"session_id": "w1", "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}, "cwd": str(self.a.home)}).encode()
+        allowed = json.dumps({"session_id": "w1", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": str(self.a.home)}).encode()
+        runs = (("Claude Code", lambda c, p, prog: run_like_claude_code(c, p, env, prog)), ("Cursor", lambda c, p, prog: run_like_cursor(c, p, self.tmp, env, prog)))
+        for program in powershell_programs():
+            for name, run in runs:
+                with self.subTest(app=name, program=program):
+                    result = run(command, blocked, program)
+                    self.assertEqual(result.returncode, 2, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace"))
+                    self.assertIn(b"Refusing rm -rf.", result.stderr)
+                    result = run(command, allowed, program)
+                    self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace"))
+
     def test_registration_keeps_other_entries_and_is_idempotent(self):
         other = {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "other-tool capture"}]}]}, "theme": "dark"}
         self.a.path(".claude", "settings.json").write_text(json.dumps(other, indent=2))
@@ -396,6 +557,24 @@ class InstalledToolTests(TwoMachines):
         out = self.cli("doctor").stdout.decode()
         self.assertIn("1 hook entries that run only", out)
         self.assertIn("(Stop)", out)
+
+    def test_doctor_reports_entries_cursor_cannot_run_and_powershell_entries_without_shell(self):
+        self.install()
+        path = self.a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        from agent_kit_sync import toml
+        from agent_kit_sync.register import powershell_call
+        python = toml.load_file(self.a.layout.machine_file)["python"]
+        launcher = str(self.a.layout.launcher)
+        data["hooks"]["Stop"] = [{"matcher": "", "hooks": [{"type": "command", "command": python, "args": ["-I", "-S", launcher, "hook", "claude", "stop"], "timeout": 60}]}]
+        data["hooks"]["SessionStart"] = [{"matcher": "", "hooks": [{"type": "command", "command": powershell_call([python, "-I", "-S", launcher, "hook", "claude", "session_start"]), "timeout": 60}]}]
+        path.write_text(json.dumps(data, indent=2))
+        out = self.cli("doctor").stdout.decode()
+        self.assertNotIn("Cursor cannot run", out)
+        self.assertIn('no longer set "shell" to "powershell" (SessionStart)', out)
+        self.a.path(".cursor").mkdir(exist_ok=True)
+        out = self.cli("doctor").stdout.decode()
+        self.assertIn("Cursor cannot run this machine's agent-kit-sync entries", out)
 
     def test_missing_version_prints_repair_command(self):
         self.install()

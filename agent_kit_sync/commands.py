@@ -391,6 +391,10 @@ def cmd_doctor(args, layout: Layout) -> int:
                             "Each fails on every event. Another program probably rewrote the file and dropped the arguments. Delete those entries, then run agent-kit-sync repair.")
         if not mine:
             problems.append("No agent-kit-sync hook entries in Claude Code's settings. Run agent-kit-sync repair.")
+        unshelled = _powershell_without_shell(data, layout)
+        if unshelled:
+            problems.append(f"{path} has {len(unshelled)} agent-kit-sync hook entries written for PowerShell that no longer set \"shell\" to \"powershell\" ({', '.join(unshelled)}). "
+                            "Claude Code runs them in Git Bash, where they fail. Another program probably rewrote the file. Run agent-kit-sync repair.")
         version = claude_version()
         if version and version < (2, 1, 295):
             notes.append("This Claude Code is older than 2.1.295, so hooks set to block on failure fail open if the dispatcher cannot start.")
@@ -406,6 +410,10 @@ def cmd_doctor(args, layout: Layout) -> int:
             problems.append(f"Codex has not approved {len(unapproved)} agent-kit-sync hook entries ({', '.join(unapproved)}). Open /hooks in Codex and approve them.")
     if (Path.home() / ".cursor").is_dir():
         notes.append("Cursor is installed. It runs the hooks registered for Claude Code; if the dispatcher cannot start there, Cursor lets every action continue.")
+        if "claude" in machine.apps and _exec_form(_json(machine.app_homes["claude"] / "settings.json"), layout):
+            from .register import CLAUDE_MIN_POWERSHELL
+            problems.append("Cursor cannot run this machine's agent-kit-sync entries in Claude Code's settings, because it ignores their \"args\" and starts Python with no script. "
+                            f"Update Claude Code to {'.'.join(map(str, CLAUDE_MIN_POWERSHELL))} or later, then run agent-kit-sync repair.")
     for event in ("session_start", "pre_tool_use", "stop"):
         code, out = _dry_dispatch(layout, "claude" if "claude" in machine.apps else "codex", event)
         if code not in (0,):
@@ -458,6 +466,31 @@ def _interpreter_only(data: dict, python: str) -> List[str]:
         for group in groups if isinstance(groups, list) else []:
             for handler in group.get("hooks", []) if isinstance(group, dict) else []:
                 if interpreter_only(handler, python):
+                    found.append(event)
+    return found
+
+
+def _exec_form(data: dict, layout: Layout) -> List[str]:
+    """Events whose agent-kit-sync entry keeps its arguments in "args", which Cursor drops."""
+    from .register import _entry_command, ours
+    found = []
+    for event, groups in (data.get("hooks") or {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                if isinstance(handler, dict) and handler.get("args") and ours(_entry_command(handler), layout.launcher):
+                    found.append(event)
+    return found
+
+
+def _powershell_without_shell(data: dict, layout: Layout) -> List[str]:
+    """Events whose agent-kit-sync entry is a PowerShell call but has lost its "shell" field."""
+    from .register import ours
+    found = []
+    for event, groups in (data.get("hooks") or {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                if (isinstance(handler, dict) and str(handler.get("command", "")).startswith("& ") and handler.get("shell") != "powershell"
+                        and ours(str(handler.get("command", "")), layout.launcher)):
                     found.append(event)
     return found
 

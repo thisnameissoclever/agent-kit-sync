@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,11 +20,18 @@ from .model import Machine
 from .paths import Layout, os_name
 
 TOOL_EVENTS = ("session_start", "post_tool_use", "stop")
+# Claude Code runs a command hook in PowerShell when it sets "shell": "powershell"; 2.1.309 fixed
+# such hooks failing open on Windows without Git for Windows.
+CLAUDE_MIN_POWERSHELL = (2, 1, 309)
 
 
 def claude_version() -> Optional[Tuple[int, ...]]:
+    # Found by name first, because on Windows the program may be claude.exe or an npm claude.cmd.
+    program = shutil.which("claude")
+    if program is None:
+        return None
     try:
-        out = subprocess.run(["claude", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode()
+        out = subprocess.run([program, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode()
     except (OSError, subprocess.TimeoutExpired):
         return None
     import re
@@ -70,6 +78,20 @@ def shell_join(parts: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def powershell_quote(text: str) -> str:
+    """One PowerShell single-quoted string: nothing inside it is expanded, and ' is written twice."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+def powershell_call(parts: List[str]) -> str:
+    """A PowerShell statement that runs the program in parts[0] with the other parts as its arguments.
+
+    Cursor keeps only a Claude Code entry's command and runs it in PowerShell on Windows, and Claude
+    Code runs it in PowerShell too when the entry sets "shell": "powershell", so both read this the same way.
+    """
+    return "& " + " ".join(powershell_quote(part) for part in parts)
+
+
 def interpreter_only(handler: dict, python: str) -> bool:
     """True for an entry that runs only this machine's Python, with no script or arguments.
 
@@ -79,13 +101,13 @@ def interpreter_only(handler: dict, python: str) -> bool:
     if not isinstance(handler, dict) or handler.get("args"):
         return False
     command = str(handler.get("command", "")).strip()
-    return bool(command) and command in (python, shlex.quote(python), subprocess.list2cmdline([python]))
+    return bool(command) and command in (python, shlex.quote(python), subprocess.list2cmdline([python]), powershell_call([python]))
 
 
 def ours(command: str, launcher: Path) -> bool:
     """True when a command runs this kit's launcher, written plainly or quoted for a shell."""
     path = str(launcher)
-    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path])}
+    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path]), powershell_quote(path)}
     return any(form in command for form in forms)
 
 
@@ -153,20 +175,23 @@ def update_file(path: Path, layout: Layout, desired: Dict[str, dict]) -> bool:
     raise ValueError(f"{path} kept changing while agent-kit-sync updated it")
 
 
-def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict], on_failure_supported: bool) -> Dict[str, dict]:
+def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict], on_failure_supported: bool,
+                    powershell_supported: bool = False) -> Dict[str, dict]:
     result = {}
     for event, spec in needed(hooks, app).items():
         native = APP_EVENTS[app][event]
         parts = command_parts(layout, machine, app, event)
         if app == "claude":
             # The whole command sits in one string, because a program that rewrites settings.json
-            # may keep only each handler's type and command; losing the timeout then leaves Claude
-            # Code's own default instead of an entry that runs Python with no script. Windows keeps
-            # the exec form, so a path with spaces needs no shell quoting.
-            if os_name() == "windows":
-                handler = {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
-            else:
+            # may keep only each handler's type and command, and because Cursor, which runs these
+            # entries too, keeps only the command. On Windows the string is a PowerShell call, the
+            # shell Cursor uses there; a Claude Code too old to run it in PowerShell keeps the exec form.
+            if os_name() != "windows":
                 handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
+            elif powershell_supported:
+                handler = {"type": "command", "shell": "powershell", "command": powershell_call(parts), "timeout": 60}
+            else:
+                handler = {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
             if spec["closed"] and on_failure_supported and event not in ("stop", "subagent_stop"):
                 handler["onFailure"] = "block"
         else:
@@ -183,11 +208,12 @@ def register(layout: Layout, machine: Machine, hooks: List[dict]) -> Dict[str, b
     changed = {}
     version = claude_version() if "claude" in machine.apps else None
     supported = version is not None and version >= (2, 1, 295)
+    powershell = version is not None and version >= CLAUDE_MIN_POWERSHELL
     for app in ("claude", "codex"):
         if app not in machine.apps:
             continue
         path = machine.app_homes[app] / ("settings.json" if app == "claude" else "hooks.json")
-        changed[app] = update_file(path, layout, desired_entries(layout, machine, app, hooks, supported))
+        changed[app] = update_file(path, layout, desired_entries(layout, machine, app, hooks, supported, powershell))
     return changed
 
 
