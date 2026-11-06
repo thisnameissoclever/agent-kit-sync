@@ -271,6 +271,79 @@ class PolicyTests(TwoMachines):
         engine, _report = b.sync()
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
 
+    def extra_module(self, machine, hook=False):
+        config = machine.layout.config
+        (config / "modules/extra/sections").mkdir(parents=True, exist_ok=True)
+        manifest = 'description = "x"\n\n[[sections]]\nname = "s"\nfile = "sections/s.md"\n'
+        if hook:
+            manifest += '\n[[hooks]]\nname = "h"\nfile = "hooks/h.py"\nevents = ["stop"]\ntests = ["hooks/test_h.py"]\n'
+            (config / "modules/extra/hooks").mkdir(parents=True, exist_ok=True)
+            (config / "modules/extra/hooks/h.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+            (config / "modules/extra/hooks/test_h.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+        (config / "modules/extra/module.toml").write_text(manifest, encoding="utf-8")
+        (config / "modules/extra/sections/s.md").write_text("Extra rule.\n", encoding="utf-8")
+
+    def list_extra(self, machine):
+        kit = machine.layout.config / "kit.toml"
+        kit.write_text(kit.read_text(encoding="utf-8") + '\n[[modules]]\nname = "extra"\n', encoding="utf-8")
+
+    def test_a_hook_in_a_module_listed_later_installs_here_without_asking(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        engine, _report = a.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with a.env():
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        self.extra_module(a, hook=True)
+        a.sync()
+        self.list_extra(a)
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertTrue((a.layout.installed / "extra" / "hooks" / "h.py").exists())
+
+    def test_another_machines_edit_before_listing_is_held_here(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        b = self.machine("b")
+        engine, _report = a.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with a.env():
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        self.extra_module(a)
+        a.sync()
+        b.sync()
+        (b.layout.config / "modules/extra/sections/s.md").write_text("Changed by b.\n", encoding="utf-8")
+        b.sync()
+        self.list_extra(a)
+        engine, _report = a.sync()
+        self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
+        self.assertNotIn("Changed by b.", a.read(".claude", "CLAUDE.md"))
+
+    def test_files_another_machine_committed_are_held_when_this_machine_lists_them(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        b = self.machine("b")
+        engine, _report = a.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with a.env():
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        b.sync()
+        self.extra_module(b)
+        b.sync()
+        a.sync()
+        self.list_extra(a)
+        engine, _report = a.sync()
+        self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
+
     def test_a_module_listed_from_another_machine_is_held_here(self):
         self.standard_config()
         ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
@@ -698,7 +771,9 @@ class HookArgumentTests(TwoMachines):
         self.assertEqual(report.errors, [])
         index = json.loads((a.layout.state / "index.json").read_text(encoding="utf-8"))
         args = next(h["args"] for h in index["hooks"] if h["name"] == "guard")
-        self.assertEqual(args, ["--app", "{{kit.app}}", "--home", str(a.home)])
+        from agent_kit_sync import dispatch
+        self.assertEqual(args, ["--app", dispatch.APP_ARG, "--home", str(a.home)])
+        self.assertEqual(dispatch.hook_args({"args": args}, "cursor"), ["--app", "cursor", "--home", str(a.home)])
 
     def test_dispatcher_puts_the_calling_app_into_kit_app(self):
         from agent_kit_sync import dispatch
@@ -706,11 +781,38 @@ class HookArgumentTests(TwoMachines):
         folder = Path(tempfile.mkdtemp(dir=self.tmp))
         script = folder / "echo_args.py"
         script.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
-        hook = {"module": "m", "name": "h", "path": str(script), "runtime": "python", "args": ["--app", "{{kit.app}}"], "timeout": 30}
+        hook = {"module": "m", "name": "h", "path": str(script), "runtime": "python", "args": ["--app", dispatch.APP_ARG], "timeout": 30}
         for env_app, expected in (("cursor", "cursor"), ("", "codex")):
             env = dict(os.environ, AGENT_KIT_SYNC_APP=env_app)
             result = dispatch.run_one(hook, "codex", "stop", b"{}", {}, env)
             self.assertEqual(json.loads(result["stdout"]), ["--app", expected], env_app)
+
+    def test_kit_literal_app_reaches_the_hook_as_text(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n',
+            "modules/guards/module.toml": '[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\nargs = ["{{kit.literal app}}", "{{kit.app}}"]\ntests = ["hooks/test_guard.py"]\n',
+            "modules/guards/hooks/guard.py": "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+            "modules/guards/hooks/test_guard.py": "import sys\nsys.exit(0)\n",
+        })
+        a = self.machine("a")
+        a.sync()
+        from agent_kit_sync import dispatch
+        import os
+        index = json.loads((a.layout.state / "index.json").read_text(encoding="utf-8"))
+        hook = next(h for h in index["hooks"] if h["name"] == "guard")
+        result = dispatch.run_one(hook, "claude", "stop", b"{}", {}, dict(os.environ, AGENT_KIT_SYNC_APP="codex"))
+        self.assertEqual(json.loads(result["stdout"]), ["{{kit.app}}", "codex"])
+
+    def test_a_bad_placeholder_in_args_names_the_hook(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n',
+            "modules/guards/module.toml": '[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\nargs = ["{{kit.nope}}"]\ntests = ["hooks/test_guard.py"]\n',
+            "modules/guards/hooks/guard.py": "import sys\nsys.exit(0)\n",
+            "modules/guards/hooks/test_guard.py": "import sys\nsys.exit(0)\n",
+        })
+        a = self.machine("a")
+        _engine, report = a.sync()
+        self.assertTrue(any("hook guard args" in error and "kit.nope" in error for error in report.errors), report.errors)
 
 
 class HookTestRequirementTests(TwoMachines):

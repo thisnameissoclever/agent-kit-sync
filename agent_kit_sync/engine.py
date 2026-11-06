@@ -814,44 +814,43 @@ class Engine:
         work, so the policy for changes from the config repo does not hold them here.
 
         An item is approved only when it is new in this commit, or when this machine had
-        installed exactly the version before this commit, so a held change from another
-        machine is never approved along with it.
+        installed or approved exactly the version before this commit, so a held change from
+        another machine is never approved along with it.
+
+        A module whose files this machine commits before kit.toml lists it is approved the
+        same way, so listing it later installs it here without asking. The approval holds the
+        item's exact fingerprint, so a change another machine makes before it is listed is held.
         """
         touched = {PurePosixPath(path).parts[1] for path in paths if path.startswith("modules/") and len(PurePosixPath(path).parts) > 2}
-        # A module this commit adds to kit.toml is this machine's own, even when its files were
-        # committed earlier: listing it is what installs it, so nothing in it was installed before.
-        listed = self._modules_listed_since(parent) if "kit.toml" in paths else set()
-        touched |= listed
         if not touched:
             return
         try:
             _inventory, modules = self.load_modules()
         except ConfigError:
             return
+        listed = {module.name for module in modules}
+        for name in sorted(touched - listed):
+            # Not in kit.toml yet: read it from the checkout so its items can be approved now.
+            if (self.checkout / "modules" / name / "module.toml").is_file():
+                try:
+                    modules.append(load_module(self.checkout / "modules" / name, name, local=False))
+                except ConfigError:
+                    continue
         for module in modules:
             if module.name not in touched or module.local:
                 continue
             tree = Tree(module.root)
-            previous = self._module_at(module, parent) if parent and module.name not in listed else None
+            previous = self._module_at(module, parent) if parent else None
             if previous is False:
                 continue  # The module did not load before this commit, so nothing here is known to be this machine's.
             for item in module.items:
                 before = next((i for i in previous[0].items if i.name == item.name), None) if previous else None
                 if before is not None:
                     info = self.index.items.get(item.key) or {}
-                    if info.get("fp") != item_fingerprint(module, before, previous[1]):
-                        continue  # Not what this machine had installed; leave it to the policy.
+                    old = item_fingerprint(module, before, previous[1])
+                    if info.get("fp") != old and self.index.approvals.get(item.key) != old:
+                        continue  # Not what this machine had installed or approved; leave it to the policy.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
-
-    def _modules_listed_since(self, parent: Optional[str]) -> Set[str]:
-        """Module names kit.toml lists now and did not list at `parent`."""
-        def names(text: Optional[bytes]) -> Set[str]:
-            try:
-                return {str(entry.get("name")) for entry in toml.loads(text.decode("utf-8")).get("modules", [])} if text else set()
-            except (toml.TOMLDecodeError, UnicodeDecodeError):
-                return set()
-        before = names(gitops.show(self.checkout, parent, "kit.toml")) if parent else set()
-        return names(read_or_none(self.checkout / "kit.toml")) - before
 
     def _module_at(self, module: Module, commit: str):
         """The module as it was at `commit`, with its tree; None when it did not exist; False when it did not load."""
