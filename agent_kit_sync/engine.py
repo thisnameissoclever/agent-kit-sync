@@ -844,7 +844,11 @@ class Engine:
             if module.name not in touched or module.local:
                 continue
             prefix = module.root.relative_to(self.checkout).as_posix()
-            tree = CommitTree(self.checkout, commit, prefix) if commit else Tree(module.root)
+            # The commit decides which items are this machine's own, so a hook file whose tests failed and
+            # was left out of it is not approved. The approval is the working tree's fingerprint, which is
+            # what the install check compares; Git may store the same text with other line breaks.
+            committed = CommitTree(self.checkout, commit, prefix) if commit else None
+            tree = Tree(module.root)
             previous = self._module_at(module, parent) if parent else None
             if previous is False:
                 continue  # The module did not load before this commit, so nothing here is known to be this machine's.
@@ -857,7 +861,18 @@ class Engine:
                         continue  # Not what this machine had installed or approved; leave it to the policy.
                 elif parent and any(gitops.show(self.checkout, parent, f"{prefix}/{rel}") is not None for rel in item_source_files(module, item, tree)):
                     continue  # New to the manifest, but its files were already in the config repo from elsewhere.
+                if committed is not None and not self._same_as_committed(module, item, tree, committed):
+                    continue  # Part of the item was left out of the commit, such as a hook whose tests failed.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
+
+    @staticmethod
+    def _same_as_committed(module: Module, item: Item, tree: Tree, committed: Tree) -> bool:
+        """True when every file of the item in the working tree is the committed file, ignoring line breaks."""
+        for rel in item_source_files(module, item, tree):
+            here, there = tree.read(rel), committed.read(rel)
+            if here is None or there is None or here.replace(b"\r\n", b"\n") != there.replace(b"\r\n", b"\n"):
+                return False
+        return True
 
     def _module_at(self, module: Module, commit: str):
         """The module as it was at `commit`, with its tree; None when it did not exist; False when it did not load."""

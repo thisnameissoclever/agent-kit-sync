@@ -272,16 +272,17 @@ class PolicyTests(TwoMachines):
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
 
     def extra_module(self, machine, hook=False):
+        """Write a module into the checkout with CRLF line breaks, as a Windows editor does; Git stores them as LF."""
         config = machine.layout.config
         (config / "modules/extra/sections").mkdir(parents=True, exist_ok=True)
         manifest = 'description = "x"\n\n[[sections]]\nname = "s"\nfile = "sections/s.md"\n'
         if hook:
             manifest += '\n[[hooks]]\nname = "h"\nfile = "hooks/h.py"\nevents = ["stop"]\ntests = ["hooks/test_h.py"]\n'
             (config / "modules/extra/hooks").mkdir(parents=True, exist_ok=True)
-            (config / "modules/extra/hooks/h.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
-            (config / "modules/extra/hooks/test_h.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
-        (config / "modules/extra/module.toml").write_text(manifest, encoding="utf-8")
-        (config / "modules/extra/sections/s.md").write_text("Extra rule.\n", encoding="utf-8")
+            (config / "modules/extra/hooks/h.py").write_bytes("import sys\nsys.exit(0)\n".replace("\n", "\r\n").encode("utf-8"))
+            (config / "modules/extra/hooks/test_h.py").write_bytes("import sys\nsys.exit(0)\n".replace("\n", "\r\n").encode("utf-8"))
+        (config / "modules/extra/module.toml").write_bytes(manifest.replace("\n", "\r\n").encode("utf-8"))
+        (config / "modules/extra/sections/s.md").write_bytes("Extra rule.\n".replace("\n", "\r\n").encode("utf-8"))
 
     def list_extra(self, machine):
         kit = machine.layout.config / "kit.toml"
