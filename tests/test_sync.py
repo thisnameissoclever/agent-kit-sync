@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from pathlib import Path
 
 from support import TwoMachines, git
 from agent_kit_sync import toml
@@ -244,6 +245,52 @@ class PolicyTests(TwoMachines):
         # Another machine still asks before installing it.
         engine, _report = b.sync()
         self.assertIn("shared-memory/entries", [e.get("item_key") for e in engine.held.all()])
+
+    def test_a_module_this_machine_lists_after_committing_its_files_is_not_held_here(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a", policy=ask)
+        b = self.machine("b", policy=ask)
+        engine, _report = a.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with a.env():
+                resolve(a.layout, entry["id"], "apply")
+        a.sync()
+        config = a.layout.config
+        (config / "modules/extra/sections").mkdir(parents=True)
+        (config / "modules/extra/module.toml").write_text('description = "x"\n\n[[sections]]\nname = "s"\nfile = "sections/s.md"\n', encoding="utf-8")
+        (config / "modules/extra/sections/s.md").write_text("Extra rule.\n", encoding="utf-8")
+        a.sync()  # The module's files are committed before kit.toml lists it.
+        kit = config / "kit.toml"
+        kit.write_text(kit.read_text(encoding="utf-8") + '\n[[modules]]\nname = "extra"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertIn("Extra rule.", a.read(".claude", "CLAUDE.md"))
+        # Another machine still asks before installing it.
+        engine, _report = b.sync()
+        self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
+
+    def test_a_module_listed_from_another_machine_is_held_here(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.machine("a")
+        b = self.machine("b", policy=ask)
+        a.sync()
+        config = a.layout.config
+        (config / "modules/extra/sections").mkdir(parents=True)
+        (config / "modules/extra/module.toml").write_text('description = "x"\n\n[[sections]]\nname = "s"\nfile = "sections/s.md"\n', encoding="utf-8")
+        (config / "modules/extra/sections/s.md").write_text("Extra rule.\n", encoding="utf-8")
+        kit = config / "kit.toml"
+        kit.write_text(kit.read_text(encoding="utf-8") + '\n[[modules]]\nname = "extra"\n', encoding="utf-8")
+        a.sync()
+        # b commits an unrelated kit.toml change after pulling a's module; that does not make a's module b's own.
+        engine, _report = b.sync()
+        bkit = b.layout.config / "kit.toml"
+        bkit.write_text(bkit.read_text(encoding="utf-8") + "\n# local note\n", encoding="utf-8")
+        engine, _report = b.sync()
+        self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
+        self.assertNotIn("Extra rule.", b.read(".claude", "CLAUDE.md"))
 
     def test_own_commit_does_not_approve_another_machines_held_change(self):
         self.standard_config()
@@ -636,6 +683,34 @@ class ReviewRegressionTests(TwoMachines):
         _engine, report = a.sync()
         self.assertEqual(report.held, [])
         self.assertIn("  Helps with reviews.\n", (a.layout.config / "modules/writing/agents/helper.md").read_text())
+
+
+class HookArgumentTests(TwoMachines):
+    def test_hook_args_get_this_machines_values_and_kit_app_is_left_for_the_dispatcher(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n',
+            "modules/guards/module.toml": '[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\nargs = ["--app", "{{kit.app}}", "--home", "{{kit.home}}"]\ntests = ["hooks/test_guard.py"]\n',
+            "modules/guards/hooks/guard.py": "import sys\nsys.exit(0)\n",
+            "modules/guards/hooks/test_guard.py": "import sys\nsys.exit(0)\n",
+        })
+        a = self.machine("a")
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        index = json.loads((a.layout.state / "index.json").read_text(encoding="utf-8"))
+        args = next(h["args"] for h in index["hooks"] if h["name"] == "guard")
+        self.assertEqual(args, ["--app", "{{kit.app}}", "--home", str(a.home)])
+
+    def test_dispatcher_puts_the_calling_app_into_kit_app(self):
+        from agent_kit_sync import dispatch
+        import os, sys, tempfile
+        folder = Path(tempfile.mkdtemp(dir=self.tmp))
+        script = folder / "echo_args.py"
+        script.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+        hook = {"module": "m", "name": "h", "path": str(script), "runtime": "python", "args": ["--app", "{{kit.app}}"], "timeout": 30}
+        for env_app, expected in (("cursor", "cursor"), ("", "codex")):
+            env = dict(os.environ, AGENT_KIT_SYNC_APP=env_app)
+            result = dispatch.run_one(hook, "codex", "stop", b"{}", {}, env)
+            self.assertEqual(json.loads(result["stdout"]), ["--app", expected], env_app)
 
 
 class HookTestRequirementTests(TwoMachines):

@@ -62,7 +62,9 @@ def caller(app: str, payload: dict) -> str:
 def run_one(hook: dict, app: str, event: str, raw: bytes, payload: dict, env: dict) -> dict:
     import subprocess
     import time
-    args = [str(arg) for arg in hook.get("args", [])]
+    # One registration serves every app, so {{kit.app}} becomes the app that called the dispatcher.
+    calling = env.get("AGENT_KIT_SYNC_APP") or app
+    args = [str(arg).replace("{{kit.app}}", calling) for arg in hook.get("args", [])]
     path = hook["path"]
     runtime = hook.get("runtime", "python")
     if runtime == "python":

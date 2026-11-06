@@ -400,7 +400,7 @@ class Planner:
         plan.hooks.append(HookSpec(
             module=module.name, name=item.name, path=dest, events=list(item.data.get("events", [])),
             tools=list(item.data.get("tools", [])), protocol=item.data.get("protocol", "native"),
-            args=[str(arg) for arg in item.data.get("args", [])], runtime=runtime,
+            args=[render.substitute(str(arg), self._values(module, "{{kit.app}}")) for arg in item.data.get("args", [])], runtime=runtime,
             timeout=int(item.data.get("timeout", 10)), on_failure=item.data.get("on_failure", "open"),
             apps=list(item.data.get("apps", apps)), order=order,
         ))

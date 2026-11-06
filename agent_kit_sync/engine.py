@@ -818,6 +818,10 @@ class Engine:
         machine is never approved along with it.
         """
         touched = {PurePosixPath(path).parts[1] for path in paths if path.startswith("modules/") and len(PurePosixPath(path).parts) > 2}
+        # A module this commit adds to kit.toml is this machine's own, even when its files were
+        # committed earlier: listing it is what installs it, so nothing in it was installed before.
+        listed = self._modules_listed_since(parent) if "kit.toml" in paths else set()
+        touched |= listed
         if not touched:
             return
         try:
@@ -828,7 +832,7 @@ class Engine:
             if module.name not in touched or module.local:
                 continue
             tree = Tree(module.root)
-            previous = self._module_at(module, parent) if parent else None
+            previous = self._module_at(module, parent) if parent and module.name not in listed else None
             if previous is False:
                 continue  # The module did not load before this commit, so nothing here is known to be this machine's.
             for item in module.items:
@@ -838,6 +842,16 @@ class Engine:
                     if info.get("fp") != item_fingerprint(module, before, previous[1]):
                         continue  # Not what this machine had installed; leave it to the policy.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
+
+    def _modules_listed_since(self, parent: Optional[str]) -> Set[str]:
+        """Module names kit.toml lists now and did not list at `parent`."""
+        def names(text: Optional[bytes]) -> Set[str]:
+            try:
+                return {str(entry.get("name")) for entry in toml.loads(text.decode("utf-8")).get("modules", [])} if text else set()
+            except (toml.TOMLDecodeError, UnicodeDecodeError):
+                return set()
+        before = names(gitops.show(self.checkout, parent, "kit.toml")) if parent else set()
+        return names(read_or_none(self.checkout / "kit.toml")) - before
 
     def _module_at(self, module: Module, commit: str):
         """The module as it was at `commit`, with its tree; None when it did not exist; False when it did not load."""

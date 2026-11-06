@@ -178,7 +178,10 @@ def cmd_run_hook(args, layout: Layout) -> int:
     runtime = {"python": [sys.executable], "node": ["node"], "bash": ["bash"]}.get(hook.get("runtime", "python"), [])
     data = sys.stdin.buffer.read() if not sys.stdin.isatty() else b""
     try:
-        result = subprocess.run(runtime + [hook["path"]] + hook.get("args", []) + list(args.rest), input=data, timeout=hook.get("timeout", 10))
+        # Only Claude Code runs a hook named in a subagent definition's header, so {{kit.app}} defaults to claude here.
+        calling = os.environ.get("AGENT_KIT_SYNC_APP") or "claude"
+        hook_args = [str(arg).replace("{{kit.app}}", calling) for arg in hook.get("args", [])]
+        result = subprocess.run(runtime + [hook["path"]] + hook_args + list(args.rest), input=data, timeout=hook.get("timeout", 10))
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"agent-kit-sync: the {args.hook} hook timed out.\n")
         return 2 if hook.get("on_failure") == "closed" else 1
