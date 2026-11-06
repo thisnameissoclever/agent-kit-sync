@@ -879,7 +879,7 @@ class DefaultFolderTests(TwoMachines):
         source = (a.layout.config / "modules/writing/sections/plain.md").read_text(encoding="utf-8")
         # The typed path is under the home folder, so it becomes {{kit.home}}, never the defaulted
         # {{kit.projects}}; the line that already used the placeholder keeps it.
-        self.assertIn("See {{kit.home}}/Projects/notes.md too.", source)
+        self.assertIn("See {{kit.home}}" + os.sep + "Projects" + os.sep + "notes.md too.", source)
         self.assertNotIn("See {{kit.projects}}", source)
         self.assertIn("Keep projects in {{kit.projects}}.", source)
 
