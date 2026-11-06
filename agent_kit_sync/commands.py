@@ -394,7 +394,8 @@ def cmd_doctor(args, layout: Layout) -> int:
         unshelled = _powershell_without_shell(data, layout)
         if unshelled:
             problems.append(f"{path} has {len(unshelled)} agent-kit-sync hook entries written for PowerShell that no longer set \"shell\" to \"powershell\" ({', '.join(unshelled)}). "
-                            "Claude Code runs them in Git Bash, where they fail. Another program probably rewrote the file. Run agent-kit-sync repair.")
+                            "Where Git Bash is installed, Claude Code runs them there, and they block every prompt and tool call. Another program probably rewrote the file. "
+                            "Run agent-kit-sync repair from a terminal.")
         version = claude_version()
         if version and version < (2, 1, 295):
             notes.append("This Claude Code is older than 2.1.295, so hooks set to block on failure fail open if the dispatcher cannot start.")
@@ -410,10 +411,11 @@ def cmd_doctor(args, layout: Layout) -> int:
             problems.append(f"Codex has not approved {len(unapproved)} agent-kit-sync hook entries ({', '.join(unapproved)}). Open /hooks in Codex and approve them.")
     if (Path.home() / ".cursor").is_dir():
         notes.append("Cursor is installed. It runs the hooks registered for Claude Code; if the dispatcher cannot start there, Cursor lets every action continue.")
-        if "claude" in machine.apps and _exec_form(_json(machine.app_homes["claude"] / "settings.json"), layout):
-            from .register import CLAUDE_MIN_POWERSHELL
-            problems.append("Cursor cannot run this machine's agent-kit-sync entries in Claude Code's settings, because it ignores their \"args\" and starts Python with no script. "
-                            f"Update Claude Code to {'.'.join(map(str, CLAUDE_MIN_POWERSHELL))} or later, then run agent-kit-sync repair.")
+        exec_form = [event for event, handler in _own_entries(_json(machine.app_homes["claude"] / "settings.json"), layout) if handler.get("args")] if "claude" in machine.apps else []
+        if exec_form:
+            problems.append(f"Cursor cannot run {len(exec_form)} agent-kit-sync entries in Claude Code's settings ({', '.join(exec_form)}), because it ignores their \"args\" and starts Python with no script. "
+                            "agent-kit-sync writes that form only when the path to Python or to agent-kit-sync holds a quote character together with $, a backtick, or a double quote. "
+                            "Run agent-kit-sync repair; if this stays, install Python or agent-kit-sync under a path without those characters.")
     for event in ("session_start", "pre_tool_use", "stop"):
         code, out = _dry_dispatch(layout, "claude" if "claude" in machine.apps else "codex", event)
         if code not in (0,):
@@ -459,51 +461,33 @@ def _json(path: Path) -> dict:
         return {}
 
 
+def _handlers(data: dict):
+    """Every hook handler in an app's hook settings, with the app's name for its event."""
+    for event, groups in (data.get("hooks") or {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                if isinstance(handler, dict):
+                    yield event, handler
+
+
+def _own_entries(data: dict, layout: Layout):
+    from .register import _entry_command, ours
+    return [(event, handler) for event, handler in _handlers(data) if ours(_entry_command(handler), layout.launcher)]
+
+
 def _interpreter_only(data: dict, python: str) -> List[str]:
     from .register import interpreter_only
-    found = []
-    for event, groups in (data.get("hooks") or {}).items():
-        for group in groups if isinstance(groups, list) else []:
-            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                if interpreter_only(handler, python):
-                    found.append(event)
-    return found
-
-
-def _exec_form(data: dict, layout: Layout) -> List[str]:
-    """Events whose agent-kit-sync entry keeps its arguments in "args", which Cursor drops."""
-    from .register import _entry_command, ours
-    found = []
-    for event, groups in (data.get("hooks") or {}).items():
-        for group in groups if isinstance(groups, list) else []:
-            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                if isinstance(handler, dict) and handler.get("args") and ours(_entry_command(handler), layout.launcher):
-                    found.append(event)
-    return found
+    return [event for event, handler in _handlers(data) if interpreter_only(handler, python)]
 
 
 def _powershell_without_shell(data: dict, layout: Layout) -> List[str]:
-    """Events whose agent-kit-sync entry is a PowerShell call but has lost its "shell" field."""
-    from .register import ours
-    found = []
-    for event, groups in (data.get("hooks") or {}).items():
-        for group in groups if isinstance(groups, list) else []:
-            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                if (isinstance(handler, dict) and str(handler.get("command", "")).startswith("& ") and handler.get("shell") != "powershell"
-                        and ours(str(handler.get("command", "")), layout.launcher)):
-                    found.append(event)
-    return found
+    """Events whose agent-kit-sync entry starts with PowerShell's & but has lost its "shell" field."""
+    return [event for event, handler in _own_entries(data, layout)
+            if str(handler.get("command", "")).startswith("& ") and handler.get("shell") != "powershell"]
 
 
 def _registered(data: dict, layout: Layout) -> List[str]:
-    from .register import _entry_command, ours
-    found = []
-    for event, groups in (data.get("hooks") or {}).items():
-        for group in groups if isinstance(groups, list) else []:
-            for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                if isinstance(handler, dict) and ours(_entry_command(handler), layout.launcher):
-                    found.append(event)
-    return found
+    return [event for event, _handler in _own_entries(data, layout)]
 
 
 def _dry_dispatch(layout: Layout, app: str, event: str):

@@ -145,7 +145,10 @@ def hook_cli(layout: Layout, machine: Machine) -> str:
     python = machine.python or sys.executable
     parts = [python, "-I", "-S", str(layout.launcher)]
     if os_name() == "windows":
-        return subprocess.list2cmdline(parts)
+        # Claude Code runs a subagent definition's hook command in Git Bash on Windows, which
+        # drops the backslashes of an unquoted Windows path, so quote it for Bash and PowerShell.
+        from .register import windows_hook_command
+        return windows_hook_command(parts) or subprocess.list2cmdline(parts)
     return " ".join(shlex.quote(part) for part in parts)
 
 
