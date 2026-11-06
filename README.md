@@ -291,7 +291,7 @@ Two examples of held changes:
 
 ## Cloud sessions
 
-Claude Code's cloud sessions ignore your home folder's skills and hooks. Its cloud environments run a setup script before environment variables are set, and reuse its result for about a week. Cloud support is not tested yet. Until it is, use `agent-kit-sync install --cloud --config-url URL` from a session-start hook in the repository the session works on. In a cloud session, agent-kit-sync installs but never pushes.
+Claude Code's cloud sessions ignore your home folder's skills and hooks. Its cloud environments run a setup script before environment variables are set, and reuse its result for about a week. Cloud support is not tested yet. Until it is, use `agent-kit-sync install --cloud --config-url URL` from a session-start hook in the repository the session works on. In a cloud session, agent-kit-sync installs but never pushes. A machine whose machine file sets no projects folder, such as a cloud session, uses the folder named by `defaults.projects_folder_name` in `kit.toml` inside the home folder, or `Projects` when that is not set, and the worktrees folder inside it; `agent-kit-sync doctor` says so.
 
 ## Commands
 

@@ -223,10 +223,54 @@ class Machine:
     policy: dict
     overrides: dict
     cloud: bool = False
+    # Folders the machine file leaves out and that therefore come from the defaults, such as in a cloud session.
+    defaulted: List[str] = field(default_factory=list)
 
     @property
     def os(self) -> str:
         return os_name()
+
+
+WINDOWS_DEVICE_NAMES = {"con", "prn", "aux", "nul"} | {f"{kind}{n}" for kind in ("com", "lpt") for n in range(1, 10)}
+
+
+def folder_name(value) -> Optional[str]:
+    """`value` when it is a plain folder name that works on every system, else None."""
+    if isinstance(value, dict):
+        value = value.get(os_name())
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text in (".", "..") or text != value or text.endswith((".", " ")):
+        return None
+    if any(char in text for char in '/\\:*?"<>|') or any(ord(char) < 32 for char in text):
+        return None
+    if text.split(".")[0].lower() in WINDOWS_DEVICE_NAMES:
+        return None
+    return text
+
+
+def kit_defaults(layout: Layout) -> dict:
+    try:
+        defaults = toml.load_file(layout.config / "kit.toml").get("defaults", {})
+    except (OSError, toml.TOMLDecodeError, ValueError, UnicodeDecodeError):
+        return {}
+    return defaults if isinstance(defaults, dict) else {}
+
+
+def default_folders(layout: Layout, projects: Optional[Path] = None) -> Dict[str, Path]:
+    """The projects and worktrees folders for a machine whose machine file does not set them.
+
+    The names come from `defaults` in the config repo's kit.toml, as setup recommends them:
+    `projects_folder_name` in the home folder, and `worktrees_folder_name` inside the projects
+    folder, which is the one the machine file sets when it sets one. A name that is not a plain
+    folder name is ignored. The folders need not exist; hooks that use them must handle that.
+    """
+    defaults = kit_defaults(layout)
+    if projects is None:
+        projects = Path.home() / (folder_name(defaults.get("projects_folder_name")) or "Projects")
+    worktrees = projects / (folder_name(defaults.get("worktrees_folder_name")) or (".worktrees" if os_name() == "windows" else "_worktrees"))
+    return {"projects": projects, "worktrees": worktrees}
 
 
 def load_machine(layout: Layout) -> Machine:
@@ -260,18 +304,21 @@ def load_machine(layout: Layout) -> Machine:
         if app not in homes:
             from .paths import default_app_home
             homes[app] = default_app_home(app)
+    defaulted = [folder for folder in ("projects", "worktrees") if not data.get(folder)]
+    fallback = default_folders(layout, Path(data["projects"]) if data.get("projects") else None) if defaulted else {}
     return Machine(
         name=str(data.get("name", "machine")),
         apps=apps,
         app_homes=homes,
         tags=list(data.get("tags", [])),
         python=str(data.get("python", "")),
-        projects=Path(data["projects"]) if data.get("projects") else None,
-        worktrees=Path(data["worktrees"]) if data.get("worktrees") else None,
+        projects=Path(data["projects"]) if data.get("projects") else fallback.get("projects"),
+        worktrees=Path(data["worktrees"]) if data.get("worktrees") else fallback.get("worktrees"),
         git_identity=dict(data.get("git_identity", {})),
         policy=policy,
         overrides=overrides,
         cloud=bool(data.get("cloud", False)),
+        defaulted=defaulted,
     )
 
 

@@ -159,6 +159,8 @@ def hook_commands(layout: Layout, machine: Machine, modules: List[Module]) -> Di
 
 
 def values_for(layout: Layout, machine: Machine, module: str, app: str, hooks: Dict[str, str]) -> render.Values:
+    """This machine's placeholder values. A folder the machine file does not set is a default, so
+    edits carried back never turn a path into that placeholder; the user did not choose it."""
     return render.Values(
         home=str(Path.home()),
         projects=str(machine.projects) if machine.projects else "",
@@ -168,6 +170,7 @@ def values_for(layout: Layout, machine: Machine, module: str, app: str, hooks: D
         os=machine.os,
         cli=cli_command(layout, machine),
         hooks=hooks,
+        reverse_skip=tuple(machine.defaulted),
     )
 
 
