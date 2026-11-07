@@ -120,6 +120,7 @@ class Engine:
         self.carry_modules: List[Module] = []   # the modules edits are carried back to, for {{kit.hook}} commands
         self.replace_existing: Set[str] = set() # "app|module/item" allowed to overwrite unmanaged files
         self.carried: Dict[str, Optional[str]] = {}  # copy or block keys carried back, with their hash when found
+        self.carried_text: Dict[str, str] = {}       # the same keys, with the hash of the text that was carried back
         self.restoring = False                  # uninstall: put back files the tool replaced
 
     # ------------------------------------------------------------ loading
@@ -399,6 +400,8 @@ class Engine:
                 # The file as it is on disk, which can differ from change.new in its line breaks only.
                 on_disk = read_or_none(change.path) if change.kind == "edit" and change.path is not None else change.new
                 self.carried[change.copy_key] = sha256(on_disk) if on_disk is not None else None
+                if change.new is not None:
+                    self.carried_text[change.copy_key] = sha256(change.new)
         settings_changes = [c for c in changes if c.kind == "setting"]
         for change in settings_changes:
             self._hold_setting(module, item, change)
@@ -1320,8 +1323,17 @@ class Engine:
                 expected = self.carried[copy.key]
             if self.forced(f"{copy.module}/{copy.item}") and current is not None:
                 expected = sha256(current)
-            if entry is not None and current is not None and sha256(current) != expected:
-                continue  # Edited since this run started; the next run carries it back.
+            breaks_only = entry is not None and current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy.key, entry, current)
+            if breaks_only and copy.data == self.index.rendered(copy.key):
+                continue  # Saved again with other line breaks, and nothing to update: leave it as saved.
+            if entry is not None and current is not None and sha256(current) != expected and not breaks_only:
+                # Edited since this run started; the next run carries it back.
+                if self.carried_text.get(copy.key) == sha256(copy.data):
+                    # This run carried an earlier edit to this copy back, and the config repo now
+                    # renders to that edit. Record it as the copy written here, so the next run
+                    # compares the newer edit with the earlier one and not with the copy before both.
+                    self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
+                continue
             if current == copy.data:
                 if entry is None:
                     # The file was already here, written by someone else: keep a copy so uninstall leaves it.
@@ -1346,6 +1358,13 @@ class Engine:
         self.index.save()
         self.journal.finish()
         self._remove_stale(set(wanted), plan)
+
+    def _copy_line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
+        """True when an installed copy differs from the one written only in its line breaks, which
+        find_local_changes does not count as an edit, so the copy can be replaced or removed."""
+        if copy_key in self.carried or entry.get("render_kind", "copy") == "copy":
+            return False
+        return sha256(same_line_breaks(current, self.index.rendered(copy_key))) == entry["hash"]
 
     def _copy_entry(self, copy: Copy) -> dict:
         return {"path": str(copy.path), "app": copy.app, "item_key": f"{copy.module}/{copy.item}", "kind": copy.kind,
@@ -1391,12 +1410,13 @@ class Engine:
             path = Path(entry["path"])
             current = read_or_none(path)
             expected = self.carried.get(copy_key, entry["hash"]) if copy_key in self.carried else entry["hash"]
-            if current is not None and sha256(current) != expected:
+            breaks_only = current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy_key, entry, current)
+            if current is not None and sha256(current) != expected and not breaks_only:
                 continue  # Edited by someone; leave it for the next run to carry back.
             self.record.file(real(path), current, kind="remove")
             if current is not None:
                 try:
-                    remove_file(path, expect=entry["hash"])
+                    remove_file(path, expect=sha256(current) if breaks_only else entry["hash"])
                 except ChangedUnderneath:
                     continue
                 if entry.get("kind") == "skill":
@@ -1445,6 +1465,8 @@ class Engine:
                 if key in present:
                     desired.setdefault(key, present[key])
             skip = set()
+            # Blocks edited again after this run carried an earlier edit back; see _write_copies.
+            rebase = {block.key for block in by_app.get(app, []) if self.carried_text.get(f"{app}|{block.key}") == sha256(block.content.encode("utf-8"))}
             for block_key, entry in self.index.blocks.items():
                 if entry["app"] != app or entry["key"] not in present:
                     continue
@@ -1452,6 +1474,13 @@ class Engine:
                 expected = self.carried.get(block_key, entry["hash"]) if block_key in self.carried else entry["hash"]
                 if self.forced(entry["item_key"]):
                     expected = found
+                if block_key not in self.carried and found != expected:
+                    # A block saved with Windows line breaks is not an edit; see find_local_changes.
+                    same = same_line_breaks(present[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
+                    if sha256(same) == expected:
+                        expected = found
+                        if desired.get(entry["key"]) == entry.get("content"):
+                            desired[entry["key"]] = present[entry["key"]]  # Nothing to update: leave it as saved.
                 if found != expected:
                     desired[entry["key"]] = present[entry["key"]]
                     skip.add(entry["key"])
@@ -1478,7 +1507,7 @@ class Engine:
                 if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired:
                     del self.index.blocks[key]
             for block in by_app.get(app, []):
-                if block.key in skip:
+                if block.key in skip and block.key not in rebase:
                     continue
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
             self.index.save()

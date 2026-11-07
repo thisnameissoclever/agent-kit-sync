@@ -1153,5 +1153,134 @@ class HookTestRequirementTests(TwoMachines):
         self.assertTrue((a.layout.installed / "guards" / "hooks" / "new_hook.py").exists())
 
 
+class EditDuringRunTests(TwoMachines):
+    """A second edit saved while the run that carries the first edit back is still running."""
+
+    def sync_with_edit_during_run(self, machine, path, old, new):
+        """Run a sync that saves one more edit to `path` right after it commits the first one."""
+        from agent_kit_sync.engine import Engine
+        with machine.env():
+            engine = Engine(machine.layout)
+            commit_local = engine.commit_local
+
+            def commit_then_edit(message):
+                commit_local(message)
+                machine.write(path, path.read_text(encoding="utf-8").replace(old, new))
+
+            engine.commit_local = commit_then_edit
+            return engine, engine.run()
+
+    def test_second_section_edit_during_a_run_is_carried_back_next_run(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        a.write(path, path.read_text().replace("Write plainly.", "Write plainly and briefly."))
+        _engine, report = self.sync_with_edit_during_run(a, path, "Keep projects", "Always keep projects")
+        self.assertEqual(report.edits, ["writing/plain"])
+        self.assertIn("Always keep projects", a.read(".claude", "CLAUDE.md"))
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertEqual(report.edits, ["writing/plain"])
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_text()
+        self.assertIn("Write plainly and briefly.", source)
+        self.assertIn("Always keep projects in {{kit.projects}}.", source)
+        self.assertIn("Always keep projects", a.read(".codex", "AGENTS.md"))
+        b.sync()
+        self.assertIn("Always keep projects", b.read(".codex", "AGENTS.md"))
+        _engine, report = a.sync()
+        self.assertEqual((report.edits, report.installed), ([], []))
+
+    def test_second_skill_edit_during_a_run_is_carried_back_next_run(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "skills", "review", "SKILL.md")
+        a.write(path, path.read_text().replace("report problems", "report every problem"))
+        _engine, report = self.sync_with_edit_during_run(a, path, "Read the draft", "Read the whole draft")
+        self.assertEqual(report.edits, ["writing/review"])
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertEqual(report.edits, ["writing/review"])
+        source = (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text()
+        self.assertIn("Read the whole draft and report every problem.", source)
+        self.assertIn("Read the whole draft", a.read(".agents", "skills", "review", "SKILL.md"))
+
+    def test_edit_during_a_run_that_carried_nothing_back_stays_an_edit(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        _engine, report = self.sync_with_edit_during_run(a, path, "Write plainly.", "Write plainly and briefly.")
+        self.assertEqual(report.edits, [])
+        self.assertIn("briefly", a.read(".claude", "CLAUDE.md"))
+        _engine, report = a.sync()
+        self.assertEqual(report.edits, ["writing/plain"])
+        self.assertIn("briefly", (a.layout.config / "modules/writing/sections/plain.md").read_text())
+
+
+class WindowsLineBreakTests(TwoMachines):
+    """A copy saved again with Windows line breaks, and no other change, still receives updates."""
+
+    def save_with_crlf(self, path):
+        data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        path.write_bytes(data)
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    def test_instruction_file_saved_with_crlf_still_gets_updates(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        self.save_with_crlf(a.path(".claude", "CLAUDE.md"))
+        _engine, report = a.sync()
+        self.assertEqual(report.edits, [])
+        self.assertIn(b"\r\n", a.path(".claude", "CLAUDE.md").read_bytes())  # Nothing to update, so it stays as saved.
+        path = b.path(".claude", "CLAUDE.md")
+        b.write(path, path.read_text().replace("Write plainly.", "Write plainly and briefly."))
+        b.sync()
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertIn("Write plainly and briefly.", a.read(".claude", "CLAUDE.md"))
+        _engine, report = a.sync()
+        self.assertEqual((report.edits, report.installed), ([], []))
+
+    def test_subagent_saved_with_crlf_still_gets_updates(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        self.save_with_crlf(a.path(".claude", "agents", "helper.md"))
+        _engine, report = a.sync()
+        self.assertEqual(report.edits, [])
+        self.assertIn(b"\r\n", a.path(".claude", "agents", "helper.md").read_bytes())  # Nothing to update, so it stays as saved.
+        path = b.path(".claude", "agents", "helper.md")
+        b.write(path, path.read_text().replace("Help with the task.", "Help carefully."))
+        b.sync()
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertIn("Help carefully.", a.read(".claude", "agents", "helper.md"))
+        _engine, report = a.sync()
+        self.assertEqual((report.edits, report.installed), ([], []))
+
+    def test_retired_subagent_saved_with_crlf_is_removed(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        self.save_with_crlf(a.path(".claude", "agents", "helper.md"))
+        # Retire the subagent in the same run, so the copy still has Windows line breaks when it is removed.
+        manifest = a.layout.config / "modules/writing/module.toml"
+        text = manifest.read_text(encoding="utf-8")
+        start = text.index("[[agents]]")
+        end = text.index("[[settings]]")
+        manifest.write_text(text[:start] + text[end:], encoding="utf-8")
+        _engine, report = a.sync()
+        self.assertEqual(report.errors, [])
+        self.assertFalse(a.path(".claude", "agents", "helper.md").exists())
+        self.assertIn("claude|writing/helper|agents/helper.md", report.removed)
+
+
 if __name__ == "__main__":
     unittest.main()
