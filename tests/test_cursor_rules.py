@@ -73,7 +73,7 @@ class CursorRuleTests(TwoMachines):
         self.assertEqual(report.errors, [])
         plain = self.rule("plain").read_text(encoding="utf-8")
         self.assertTrue(plain.startswith("---\ndescription: "))
-        self.assertIn("alwaysApply: true\n---\n\n<!-- agent-kit-sync rule sha256=", plain)
+        self.assertIn("alwaysApply: true\n---\n\n<!-- agent-kit-sync rule file=agent-kit-sync--writing--plain.mdc item=writing/plain sha256=", plain)
         self.assertIn(f"Keep projects in {self.a.home / 'Projects'}.", plain)
         imported = self.rule("import").read_text(encoding="utf-8")
         self.assertIn(f"Use short sentences. Projects live in {self.a.home / 'Projects'}.", imported)
@@ -175,22 +175,23 @@ class CursorRuleTests(TwoMachines):
         self.assertFalse(path.read_bytes().startswith(b"\xef\xbb\xbf"))
 
     def test_an_import_line_naming_no_installed_file_raises_an_alert(self):
-        self.seed_files({"modules/writing/sections/plain.md": "@/somewhere/else.md\nWrite plainly.\n\n```\n@decorator\n```\n"}, message="bad import")
+        self.seed_files({"modules/writing/sections/plain.md": "@/somewhere/else.md\nWrite plainly.\n@Tim, hello.\n\n```\n@/in/a/fence.md\n```\n"}, message="bad import")
         engine, _report = self.a.sync()
         messages = [a["message"] for a in engine.alerts.open() if "name no file agent-kit-sync installs" in a["message"]]
         self.assertEqual(len(messages), 1)
         self.assertIn("/somewhere/else.md", messages[0])
-        self.assertNotIn("decorator", messages[0])
+        self.assertNotIn("fence", messages[0])
+        self.assertNotIn("Tim", messages[0])
 
     def test_uninstall_removes_only_agent_kit_syncs_rules(self):
         self.a.sync()
         (self.rules() / "my-rule.mdc").write_text("Mine.\n", encoding="utf-8")
-        from agent_kit_sync.engine import Engine
-        from agent_kit_sync.plan import Plan
+        from types import SimpleNamespace
+        from agent_kit_sync.commands import cmd_uninstall
         with self.a.env():
-            engine = Engine(self.a.layout)
-            engine.write_cursor_rules(Plan(), everything_removed=True)
+            self.assertEqual(cmd_uninstall(SimpleNamespace(yes=True), self.a.layout), 0)
         self.assertEqual(sorted(p.name for p in self.rules().iterdir()), ["my-rule.mdc"])
+        self.assertNotIn("Write plainly.", self.a.read(".claude", "CLAUDE.md"))
 
     def test_cursor_leaving_the_machine_closes_its_alerts(self):
         self.seed_files({"modules/writing/sections/plain.md": "@/somewhere/else.md\n"}, message="bad import")
@@ -202,20 +203,103 @@ class CursorRuleTests(TwoMachines):
         engine, _report = self.a.sync()
         self.assertFalse(any("Cursor" in a["message"] for a in engine.alerts.open()))
 
-    def test_entries_from_a_version_that_read_rules_back_are_dropped(self):
+    def test_a_header_only_edit_is_saved_too(self):
         self.a.sync()
-        path = self.a.layout.state / "index.json"
-        index = json.loads(path.read_text(encoding="utf-8"))
-        index["blocks"]["cursor|writing/plain"] = {"app": "cursor", "key": "writing/plain", "item_key": "writing/plain", "source_rel": "sections/plain.md", "hash": "0" * 64, "content": "x", "local": False}
-        index["copies"]["cursor|writing/standard|style.md"] = {"path": str(self.rules() / "old.mdc"), "app": "cursor", "item_key": "writing/standard", "kind": "file", "source_rel": "style.md", "render_kind": "cursor-rule-text", "hash": "0" * 64, "executable": False, "local": False, "sig": None}
-        path.write_text(json.dumps(index), encoding="utf-8")
-        head = self.head()
-        _engine, report = self.a.sync()
-        self.assertEqual((report.deletions, report.edits), ([], []))
-        self.assertEqual(self.head(), head)
-        index = json.loads(path.read_text(encoding="utf-8"))
-        self.assertNotIn("cursor|writing/plain", index["blocks"])
-        self.assertNotIn("cursor|writing/standard|style.md", index["copies"])
+        for change in (("alwaysApply: true", "alwaysApply: false"), ("---\n\n<!--", "---\n\nMy note.\n<!--")):
+            with self.subTest(change=change[1][:20]):
+                path = self.rule("plain")
+                self.a.write(path, path.read_text(encoding="utf-8").replace(*change, 1))
+                self.a.sync()
+                self.assertEqual(path.read_text(encoding="utf-8").count("alwaysApply: true"), 1)
+                backups = sorted((self.a.layout.state / "backups" / "cursor-rules").iterdir())
+                self.assertTrue(any(change[1] in b.read_text(encoding="utf-8") for b in backups))
+
+    def test_backups_in_the_same_second_do_not_overwrite_each_other(self):
+        from agent_kit_sync.cursor_rules import Outcome, _backup
+        path = self.tmp / "agent-kit-sync--writing--plain.mdc"
+        outcome = Outcome()
+        for text in (b"first", b"second", b"\xff not utf-8"):
+            self.assertTrue(_backup(path, text, self.tmp / "backups", outcome))
+        self.assertEqual(sorted(Path(b).read_bytes() for b in outcome.backed_up), [b"first", b"second", b"\xff not utf-8"])
+
+    def test_a_copy_holding_our_marker_under_another_name_is_left_alone(self):
+        self.a.sync()
+        copy = self.rules() / "agent-kit-sync--writing--plain-mine.mdc"
+        copy.write_bytes(self.rule("plain").read_bytes())
+        self.a.sync()
+        self.assertTrue(copy.exists())
+
+    def test_cursor_leaving_the_machine_removes_its_rules(self):
+        self.a.sync()
+        (self.rules() / "my-rule.mdc").write_text("Mine.\n", encoding="utf-8")
+        data = self.a.machine_data()
+        data["apps"] = ["claude", "codex"]
+        self.a.write_machine(data)
+        self.a.sync()
+        self.assertEqual(sorted(p.name for p in self.rules().iterdir()), ["my-rule.mdc"])
+
+    def test_an_import_of_a_failed_modules_file_keeps_its_text(self):
+        self.seed_files({
+            "kit.toml": CONFIG["kit.toml"] + """
+                [[modules]]
+                name = "rules"
+            """,
+            "modules/rules/module.toml": """
+                description = "Imports the writing standard"
+
+                [[sections]]
+                name = "uses-style"
+                file = "sections/uses.md"
+            """,
+            "modules/rules/sections/uses.md": "@{{kit.home}}/.agent-kit-sync/installed/writing/style.md\n",
+        }, message="cross-module import")
+        self.a.sync()
+        rule = self.rules() / "agent-kit-sync--rules--uses-style.mdc"
+        self.assertIn("Use short sentences.", rule.read_text(encoding="utf-8"))
+        self.seed_files({"modules/writing/style.md": "Broken {{kit.nothing}}.\n"}, message="break the writing module")
+        engine, report = self.a.sync()
+        self.assertTrue(report.errors)
+        self.assertIn("Use short sentences.", rule.read_text(encoding="utf-8"))
+        self.assertFalse(any("name no file agent-kit-sync installs" in a["message"] for a in engine.alerts.open()))
+
+    def test_a_frozen_item_keeps_its_rule(self):
+        self.a.sync()
+        before = self.rule("plain").read_text(encoding="utf-8")
+        from agent_kit_sync.engine import Engine
+        from agent_kit_sync.plan import Plan
+        with self.a.env():
+            engine = Engine(self.a.layout)
+            engine.frozen = lambda key: key == "writing/plain"
+            plan = Plan()
+            engine.write_cursor_rules(plan)
+        self.assertEqual(self.rule("plain").read_text(encoding="utf-8"), before)
+        self.assertFalse(self.rule("import").exists())
+
+    def test_a_shorter_section_removes_its_old_parts(self):
+        paragraph = ("Long text for the size test. " * 40).strip() + "\n\n"
+        self.seed_files({"modules/writing/sections/plain.md": paragraph * 160}, message="long")
+        self.a.sync()
+        self.assertTrue(list(self.rules().glob("agent-kit-sync--writing--plain--part*.mdc")))
+        self.seed_files({"modules/writing/sections/plain.md": "Short now.\n"}, message="short")
+        self.a.sync()
+        self.assertEqual(list(self.rules().glob("agent-kit-sync--writing--plain--part*.mdc")), [])
+        self.assertIn("Short now.", self.rule("plain").read_text(encoding="utf-8"))
+
+    def test_an_edited_rule_alert_closes_after_a_day(self):
+        self.a.sync()
+        self.a.write(self.rule("plain"), self.rule("plain").read_text(encoding="utf-8") + "Edit.\n")
+        engine, _report = self.a.sync()
+        self.assertTrue(any("were replaced" in a["message"] for a in engine.alerts.open()))
+        engine, _report = self.a.sync()
+        self.assertTrue(any("were replaced" in a["message"] for a in engine.alerts.open()))
+        path = self.a.layout.state / "alerts.json"
+        alerts = json.loads(path.read_text(encoding="utf-8"))
+        for alert in alerts:
+            if alert.get("key") == "cursor-rule-edited":
+                alert["time"] -= 2 * 86400
+        path.write_text(json.dumps(alerts), encoding="utf-8")
+        engine, _report = self.a.sync()
+        self.assertFalse(any("were replaced" in a["message"] for a in engine.alerts.open()))
 
     def test_a_machine_without_cursor_writes_no_rules(self):
         b = self.machine("b")
@@ -224,13 +308,27 @@ class CursorRuleTests(TwoMachines):
 
 
 class NameTests(unittest.TestCase):
-    def test_names_are_short_and_owned(self):
+    def test_names_are_short_and_the_marker_names_the_owner(self):
         self.assertEqual(cursor_rules.file_name("writing", "plain"), "agent-kit-sync--writing--plain.mdc")
-        self.assertEqual(cursor_rules.owner("agent-kit-sync--writing--plain--part2.mdc"), ("writing", "plain"))
         long = cursor_rules.file_name("a" * 80, "b" * 80)
         self.assertLessEqual(len(long), cursor_rules.NAME_LIMIT)
         self.assertNotEqual(long, cursor_rules.file_name("a" * 80, "b" * 79 + "c"))
-        self.assertIsNone(cursor_rules.owner("my-rule.mdc"))
+        rule = cursor_rules.compose("a" * 80, "b" * 80, "Text.\n")
+        mark = cursor_rules.read_mark(rule.text)
+        self.assertEqual((mark.name, mark.module, mark.item, mark.edited), (long, "a" * 80, "b" * 80, False))
+        self.assertIsNone(cursor_rules.read_mark("Mine.\n"))
+
+    def test_a_split_inside_a_code_fence_closes_and_reopens_it(self):
+        body = "Intro.\n\n```python\n" + "x = 1\n" * 30000 + "```\n\nAfter.\n"
+        parts = cursor_rules.split(body, 50000)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            fences = cursor_rules.Fences()
+            for line in part.splitlines(keepends=True):
+                fences.step(line)
+            self.assertIsNone(fences.open)
+            self.assertLessEqual(len(part.encode("utf-8")), 50000)
+        self.assertTrue(parts[1].startswith("```python\n"))
 
 
 if __name__ == "__main__":

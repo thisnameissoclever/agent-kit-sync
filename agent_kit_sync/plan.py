@@ -324,11 +324,7 @@ class Planner:
     def _section(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
         prepend, append, replace = self._local_text(module.name, item.name)
         for app in apps:
-            if app == "cursor":
-                # Cursor reads rule files, written as output only; see cursor_rules.
-                plan.cursor_blocks.append((module.name, item.name, self._section_text(module, item, app, tree, prepend, append, replace)))
-                continue
-            if app not in INSTRUCTION_FILES:
+            if app != "cursor" and app not in INSTRUCTION_FILES:
                 continue
             rel = dict(item.data.get("variants", {})).get(app, item.data["file"])
             raw = replace if replace is not None else tree.read(rel)
@@ -338,16 +334,11 @@ class Planner:
             from .sections import with_local
             if prepend is not None or append is not None:
                 text = with_local(text, prepend, append)
-            plan.sections.append(SectionBlock(app, item.key, module.name, item.name, rel, text, module.local))
-
-    def _section_text(self, module: Module, item: Item, app: str, tree: Tree, prepend, append, replace) -> str:
-        rel = dict(item.data.get("variants", {})).get(app, item.data["file"])
-        raw = replace if replace is not None else tree.read(rel)
-        if raw is None:
-            raise render.RenderError(f"section {item.name} file {rel} is missing")
-        text = render.render_text(raw.decode("utf-8"), self._values(module, app)).text
-        from .sections import with_local
-        return with_local(text, prepend, append) if prepend is not None or append is not None else text
+            if app == "cursor":
+                # Cursor reads rule files, written as output only; see cursor_rules.
+                plan.cursor_blocks.append((module.name, item.name, text))
+            else:
+                plan.sections.append(SectionBlock(app, item.key, module.name, item.name, rel, text, module.local))
 
     def _skill(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
         rel_dir = item.data["dir"].rstrip("/")

@@ -412,7 +412,7 @@ class RulesPointerTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.home = self.tmp / "home"
         (self.home / ".cursor" / "rules").mkdir(parents=True)
-        (self.home / ".cursor" / "rules" / "agent-kit-sync.mdc").write_text("---\nalwaysApply: true\n---\n\nRule.\n", encoding="utf-8")
+        (self.home / ".cursor" / "rules" / "agent-kit-sync--writing--rules.mdc").write_text("---\nalwaysApply: true\n---\n\nRule.\n", encoding="utf-8")
         (self.home / ".cursor" / "rules" / "mine.mdc").write_text("Not ours.\n", encoding="utf-8")
         self.inside = self.home / "project"
         self.inside.mkdir()
@@ -436,7 +436,7 @@ class RulesPointerTests(unittest.TestCase):
 
     def test_a_workspace_outside_the_user_folder_is_told_to_read_the_rules(self):
         text = self.start(self.outside, "Other context.")["additional_context"]
-        self.assertIn(str(self.home / ".cursor" / "rules" / "agent-kit-sync.mdc"), text)
+        self.assertIn(str(self.home / ".cursor" / "rules" / "agent-kit-sync--writing--rules.mdc"), text)
         self.assertNotIn("mine.mdc", text)
         self.assertTrue(text.endswith("Other context."))
 

@@ -420,7 +420,7 @@ def rules_pointer(payload: dict) -> str:
         return ""
     folder = os.path.join(home, ".cursor", "rules")  # The folder Cursor reads; it has no setting to move it.
     try:
-        files = sorted(os.path.join(folder, name) for name in os.listdir(folder) if name.startswith("agent-kit-sync") and name.endswith(".mdc"))
+        files = sorted(os.path.join(folder, name) for name in os.listdir(folder) if name.startswith("agent-kit-sync--") and name.endswith(".mdc"))
     except OSError:
         return ""
     if not files:
