@@ -17,11 +17,10 @@ import re
 import time
 from typing import Optional
 
+from .dispatch import APP_EVENTS
+
 # Claude Code's event names, by the tool's event names.
-CLAUDE_EVENTS = {
-    "session_start": "SessionStart", "user_prompt": "UserPromptSubmit", "pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse",
-    "stop": "Stop", "subagent_start": "SubagentStart", "subagent_stop": "SubagentStop", "pre_compact": "PreCompact", "session_end": "SessionEnd",
-}
+CLAUDE_EVENTS = APP_EVENTS["claude"]
 # Cursor's tool names that differ from Claude Code's, in hook input and in transcripts.
 TOOL_NAMES = {"Shell": "Bash", "StrReplace": "Edit", "MultiStrReplace": "MultiEdit", "EditNotebook": "NotebookEdit",
               "AskQuestion": "AskUserQuestion", "ask_question": "AskUserQuestion"}
@@ -32,13 +31,15 @@ CONTEXT_LIMIT = 10000
 MAX_TRANSCRIPT = 4_000_000
 # Largest existing file whose text is read to show an edit as Claude Code's Edit.
 MAX_EDITED_FILE = 1_000_000
-# Translated transcripts and full context texts older than this are removed at session start.
+# Translated transcripts and full context texts older than this are removed when a Cursor session starts.
 KEEP_SECONDS = 7 * 24 * 3600
+# An older copy of a transcript is removed only after this long, so a hook that was handed it can still read it.
+SUPERSEDED_SECONDS = 600
 
 
-def called_by_cursor(app: str, payload: dict) -> bool:
-    """True when Cursor ran a Claude Code entry. Cursor puts cursor_version in every hook's input."""
-    return app == "claude" and isinstance(payload, dict) and "cursor_version" in payload
+def native_root(root: str, windows: bool = os.name == "nt") -> str:
+    """Cursor's editor sends a Windows folder as a URI path, such as /c:/Users/name/project."""
+    return root[1:] if windows and re.match(r"^/[A-Za-z]:[/\\]", root) else root
 
 
 def workspace_root(payload: dict) -> Optional[str]:
@@ -46,13 +47,8 @@ def workspace_root(payload: dict) -> Optional[str]:
     if not isinstance(roots, list):
         return None
     for root in roots:
-        if not isinstance(root, str) or not root:
-            continue
-        # Cursor's editor sends a Windows folder as a URI path, such as /c:/Users/name/project.
-        if os.name == "nt" and re.match(r"^/[A-Za-z]:[/\\]", root):
-            root = root[1:]
-        if os.path.isdir(root):
-            return root
+        if isinstance(root, str) and root and os.path.isdir(native_root(root)):
+            return native_root(root)
     return None
 
 
@@ -69,10 +65,16 @@ def to_claude(event: str, payload: dict) -> dict:
             out.pop("cwd", None)
     name = out.get("tool_name")
     if isinstance(name, str):
-        out["tool_name"] = TOOL_NAMES.get(name, name)
+        # Cursor names an MCP tool MCP:<tool> without its server; Claude Code names it mcp__<server>__<tool>.
+        out["tool_name"] = "mcp__cursor__" + name[4:] if name.startswith("MCP:") else TOOL_NAMES.get(name, name)
         tool_input = out.get("tool_input")
         if isinstance(tool_input, dict):
             out["tool_input"] = claude_tool_input(out["tool_name"], tool_input)
+            if out["tool_name"] == "Bash":
+                # The shell command's own folder, which first-use-review and others run git and gh in.
+                folder = tool_input.get("cwd") or tool_input.get("working_directory")
+                if isinstance(folder, str) and folder and os.path.isdir(folder):
+                    out["cwd"] = folder
             if event == "pre_tool_use" and out["tool_name"] == "Write":
                 as_edit = edit_of_existing_file(out["tool_input"])
                 if as_edit is not None:
@@ -174,7 +176,7 @@ def translate_transcript(source: str, folder: str) -> Optional[str]:
 
     Each version of the transcript, by its size and time, gets its own copy, so a copy is never
     replaced while a hook reads it; Windows refuses to replace a file another program has open.
-    A new copy removes the older copies of the same transcript.
+    A new copy removes the older copies of the same transcript once they are ten minutes old.
     """
     try:
         info = os.stat(source)
@@ -200,17 +202,20 @@ def translate_transcript(source: str, folder: str) -> Optional[str]:
                 continue
             converted = claude_row(row) if isinstance(row, dict) else None
             if converted is not None:
-                lines.append(json.dumps(converted, ensure_ascii=False))
+                lines.append(json.dumps(converted))  # ASCII, so a lone surrogate cannot stop the write.
         os.makedirs(folder, exist_ok=True)
         _replace(target, ("\n".join(lines) + "\n" if lines else "").encode("utf-8"))
     except OSError:
         return target if os.path.isfile(target) else None  # Another hook may have written the same copy.
+    cutoff = time.time() - SUPERSEDED_SECONDS
     for entry in os.listdir(folder):
         if entry.startswith(name + "-") and entry.endswith(".jsonl") and entry != os.path.basename(target):
+            path = os.path.join(folder, entry)
             try:
-                os.remove(os.path.join(folder, entry))
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
             except OSError:
-                pass  # Open in a hook still running; removed by a later copy or after a week.
+                pass  # Open in a hook still running; a later copy or session start removes it.
     return target
 
 
@@ -245,7 +250,8 @@ def remove_old(state: str) -> None:
 
 
 def _length(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
+    """The text's length as JavaScript counts it: a character outside the Basic Multilingual Plane is two."""
+    return len(text) + sum(1 for character in text if ord(character) > 0xFFFF)
 
 
 def bounded_context(text: str, state: str, session: str, event: str) -> str:
@@ -257,8 +263,9 @@ def bounded_context(text: str, state: str, session: str, event: str) -> str:
         folder = os.path.join(state, "cursor")
         os.makedirs(folder, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_-]", "_", session)[:80] or "session"
-        path = os.path.join(folder, f"{safe}-{event}-context.md")
-        _replace(path, text.encode("utf-8"))
+        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+        path = os.path.join(folder, f"{safe}-{event}-{digest}-context.md")
+        _replace(path, text.encode("utf-8", "replace"))
         where = f" Read the whole text in {path}."
     except OSError:
         pass
@@ -274,16 +281,22 @@ def bounded_context(text: str, state: str, session: str, event: str) -> str:
     return kept + template.format(limit=CONTEXT_LIMIT, omitted=len(text) - len(kept), where=where)
 
 
-def cursor_input(updated: dict, sent: dict) -> dict:
-    """A hook's changed tool input in the form Cursor's tool takes. When an edit was shown to the
-    hooks as Claude Code's Edit, Cursor's tool is still a Write of the whole new text."""
+def cursor_input(updated: dict, sent: dict) -> Optional[dict]:
+    """A hook's changed tool input in the form Cursor's tool takes, or None when it cannot be. When an
+    edit was shown to the hooks as Claude Code's Edit, Cursor's tool is still a Write of the whole new
+    text, so the hook's replacement is applied to the old text."""
     if not (isinstance(updated, dict) and sent.get("tool_name") == "Edit" and sent.get("cursor_tool") == "Write"):
         return updated
     whole = sent.get("tool_input", {}).get("old_string", "")
     old, new = updated.get("old_string"), updated.get("new_string")
     if not isinstance(old, str) or not isinstance(new, str) or old not in whole:
-        return {"file_path": updated.get("file_path", sent["tool_input"].get("file_path")), "content": sent["tool_input"].get("new_string", "")}
+        return None
     return {"file_path": updated.get("file_path", sent["tool_input"].get("file_path")), "content": whole.replace(old, new, 1)}
+
+
+UNAPPLIED_EDIT = ("A hook changed this edit in a way agent-kit-sync cannot turn into Cursor's write of the whole file, "
+                  "so the edit was refused. Read the file again and make the edit again.")
+NOTICE = "agent-kit-sync notice meant for the user, which Cursor has no place to show; pass it on: "
 
 
 def answer(event: str, data: dict, state: str, session: str, sent: Optional[dict] = None) -> dict:
@@ -304,7 +317,12 @@ def answer(event: str, data: dict, state: str, session: str, sent: Optional[dict
                 data["agent_message"] = why
                 data["user_message"] = why
         if specific.get("updatedInput") is not None:
-            data["updated_input"] = cursor_input(specific["updatedInput"], sent or {})
+            converted = cursor_input(specific["updatedInput"], sent or {})
+            if converted is None:
+                data["permission"] = "deny"
+                data["agent_message"] = data["user_message"] = UNAPPLIED_EDIT
+            else:
+                data["updated_input"] = converted
     elif event == "user_prompt":
         if data.get("decision") == "block":
             data["continue"] = False
@@ -315,26 +333,39 @@ def answer(event: str, data: dict, state: str, session: str, sent: Optional[dict
     elif event == "post_tool_use":
         if data.get("decision") == "block" and reason:
             context = reason + ("\n\n" + context if context else "")
+    notice = data.get("systemMessage")
+    if isinstance(notice, str) and notice.strip() and notice not in context and not (data.get("agent_message") and data["agent_message"] in notice):
+        # Claude Code shows systemMessage to the user; Cursor shows nothing, so the agent is told.
+        context = (context + "\n\n" if context else "") + NOTICE + notice
     if context and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use"):
-        text = bounded_context(context, state, session, event)
-        data["additional_context"] = text
-        if specific.get("additionalContext"):
-            specific["additionalContext"] = text
+        data["additional_context"] = context
     return data
 
 
 def stdout(event: str, out: bytes, state: str, session: str, sent: Optional[dict] = None) -> bytes:
     """The dispatcher's answer as Cursor reads it. Cursor needs JSON, and counts empty output as a failure."""
     text = out.decode("utf-8", "replace").strip()
-    if not text:
-        return b"{}"
-    try:
-        data = json.loads(text)
-    except ValueError:
-        data = None
-    if not isinstance(data, dict):
-        # Plain text is context on these events in Claude Code.
-        if event in ("session_start", "user_prompt"):
-            return json.dumps({"additional_context": bounded_context(text, state, session, event)}).encode("utf-8")
-        return b"{}"
-    return json.dumps(answer(event, data, state, session, sent)).encode("utf-8")
+    data = None
+    if text:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        data = answer(event, data, state, session, sent)
+    elif text and event in ("session_start", "user_prompt"):
+        data = {"additional_context": text}  # Plain text is context on these events in Claude Code.
+    else:
+        data = {}
+    return finish(event, data, state, session)
+
+
+def finish(event: str, data: dict, state: str, session: str) -> bytes:
+    """Cut the added context to what Cursor accepts, and write the answer as ASCII JSON."""
+    context = data.get("additional_context")
+    if isinstance(context, str) and context:
+        data["additional_context"] = bounded_context(context, state, session, event)
+        specific = data.get("hookSpecificOutput")
+        if isinstance(specific, dict) and isinstance(specific.get("additionalContext"), str):
+            specific["additionalContext"] = data["additional_context"]
+    return json.dumps(data).encode("utf-8")

@@ -24,8 +24,9 @@ APP_TOOLS = {
     "codex": {"shell": ["Bash"], "read": [], "write": ["apply_patch"], "edit": ["apply_patch"], "search": [], "web": [], "task": ["Agent"], "mcp": ["mcp__.*"]},
 }
 # Cursor runs Claude Code's entries and tests each matcher as a regular expression against its own
-# tool names, so a Claude Code matcher also lists these. Claude Code has no tools by these names.
-# Cursor reports every file edit as Write, and an MCP tool as MCP:<tool name>.
+# tool names, so a Claude Code matcher also lists these. Cursor reports every file edit as Write, and
+# an MCP tool as MCP:<tool name>. Claude Code's own Write then also matches an edit hook's matcher;
+# the tool-kind filter in main() still runs only the hooks for the tool that was used.
 CURSOR_TOOLS = {"shell": ["Shell"], "edit": ["Write"], "mcp": ["MCP:.*"]}
 WRITE_TOOLS = {"claude": ["Write", "Edit", "MultiEdit", "NotebookEdit"], "codex": ["apply_patch"]}
 CLAUDE_MIN_ON_FAILURE = (2, 1, 295)
@@ -379,6 +380,24 @@ def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny:
     return 0, json.dumps(data).encode("utf-8"), stderr, alerts
 
 
+def without_transcripts(payload: dict) -> dict:
+    """Cursor's input without its transcripts, which a hook expecting Claude Code's format would misread."""
+    return {key: value for key, value in payload.items() if key not in ("transcript_path", "agent_transcript_path")}
+
+
+def cursor_fallback(event: str, combined: Combined) -> bytes:
+    """The hooks' decision in Cursor's fields, for when the full translation of the answer fails."""
+    reason = "\n".join(r for r in combined.reasons if isinstance(r, str) and r) or "A hook refused this."
+    answer = {}
+    if event == "pre_tool_use" and combined.decision in ("deny", "ask"):
+        answer = {"permission": "deny", "agent_message": reason, "user_message": reason}
+    elif event == "user_prompt" and combined.decision in ("deny", "continue"):
+        answer = {"continue": False, "user_message": reason}
+    elif event in ("stop", "subagent_stop") and combined.decision in ("deny", "continue"):
+        answer = {"followup_message": reason}
+    return json.dumps(answer).encode("utf-8")
+
+
 def main(layout_root, launcher, app: str, event: str) -> int:
     layout_root = str(layout_root)
     raw = sys.stdin.buffer.read() if not sys.stdin.isatty() else b""
@@ -389,11 +408,18 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     state = os.path.join(layout_root, "state")
     calling = caller(app, payload)
     if calling == "cursor":
-        # Cursor sends its own input; every hook gets the input Claude Code would have sent.
+        # Cursor sends its own input; every hook gets the input Claude Code would have sent. Each step
+        # falls back instead of failing, because a dispatcher that crashes runs no hook at all.
         from . import cursor
-        payload = cursor.to_claude(event, payload)
+        try:
+            payload = cursor.to_claude(event, payload)
+        except Exception:
+            payload = without_transcripts(payload)
         if event == "session_start":
-            cursor.remove_old(state)
+            try:
+                cursor.remove_old(state)
+            except Exception:
+                pass
     try:
         with open(os.path.join(state, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
@@ -407,7 +433,10 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     hooks.sort(key=lambda h: (h.get("order", 0), h.get("name", "")))
     if calling == "cursor":
         if hooks:
-            payload = cursor.with_transcripts(payload, state)
+            try:
+                payload = cursor.with_transcripts(payload, state)
+            except Exception:
+                payload = without_transcripts(payload)
         raw = json.dumps(payload).encode("utf-8")
     results = []
     if hooks:
@@ -419,11 +448,12 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
     fresh = []
-    # Cursor shows nothing a hook says when the agent stops, so an alert waits for the next session.
+    # Cursor shows nothing a hook says when the agent stops, so an alert waits for a later event.
     if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop"):
         fresh = unseen_alerts(state, session)
     cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
-    passed = pass_through(app, event, results, fresh, cursor_ask_is_deny)
+    # Cursor gets every answer through emit(), so cursor.stdout() reads one shape, not exit code 2 or plain text.
+    passed = None if calling == "cursor" else pass_through(app, event, results, fresh, cursor_ask_is_deny)
     if passed is None:
         combined = combine(app, event, results)
         user, context = alert_lines(event, fresh)
@@ -448,8 +478,11 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         err = lone["stderr"] if lone and lone["hook"].get("protocol", "native") == "native" and not failed(lone) else b""
     else:
         code, out, err, delivered = passed
-    if calling == "cursor" and code == 0:
-        out = cursor.stdout(event, out, state, session, payload)
+    if calling == "cursor":
+        try:
+            out = cursor.stdout(event, out, state, session, payload)
+        except Exception:
+            out = cursor_fallback(event, combined)
     if session:
         mark_shown(state, session, delivered)
     if err:

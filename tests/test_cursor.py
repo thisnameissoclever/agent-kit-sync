@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -41,9 +42,9 @@ class TranslationTests(unittest.TestCase):
         remove_tree(self.tmp)
 
     def test_only_cursor_version_in_the_input_marks_a_cursor_call(self):
-        self.assertTrue(cursor.called_by_cursor("claude", cursor_payload("preToolUse")))
-        self.assertFalse(cursor.called_by_cursor("claude", {"hook_event_name": "PreToolUse"}))
-        self.assertFalse(cursor.called_by_cursor("codex", cursor_payload("preToolUse")))
+        self.assertEqual(dispatch.caller("claude", cursor_payload("preToolUse")), "cursor")
+        self.assertEqual(dispatch.caller("claude", {"hook_event_name": "PreToolUse"}), "claude")
+        self.assertEqual(dispatch.caller("codex", cursor_payload("preToolUse")), "codex")
         # Claude Code started from Cursor's terminal inherits CURSOR_VERSION; it is still Claude Code.
         os.environ["CURSOR_VERSION"] = "3.27.22"
         try:
@@ -66,6 +67,24 @@ class TranslationTests(unittest.TestCase):
                 self.assertEqual(out["hook_event_name"], claude_event)
                 self.assertEqual(out.get("tool_name"), tool)
                 self.assertEqual(out["cursor_version"], "3.27.22")  # Cursor's own fields stay.
+
+    def test_mcp_tools_get_claude_codes_name_form(self):
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="MCP:slack_send_message", tool_input={"text": "hi"}))
+        self.assertEqual(out["tool_name"], "mcp__cursor__slack_send_message")
+        self.assertEqual(dispatch.tool_kind("claude", out["tool_name"]), "mcp")
+
+    def test_a_shell_commands_own_folder_is_the_cwd(self):
+        other = self.tmp / "worktree"
+        other.mkdir()
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "gh pr merge 1", "cwd": str(other)}, cwd="", workspace_roots=[str(self.project)]))
+        self.assertEqual(out["cwd"], str(other))
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "ls", "cwd": str(self.tmp / "gone")}, cwd="", workspace_roots=[str(self.project)]))
+        self.assertEqual(out["cwd"], str(self.project))
+
+    def test_windows_workspace_roots_lose_the_uri_slash(self):
+        self.assertEqual(cursor.native_root("/c:/Users/name/project", windows=True), "c:/Users/name/project")
+        self.assertEqual(cursor.native_root("/c:/Users/name/project", windows=False), "/c:/Users/name/project")
+        self.assertEqual(cursor.native_root("C:\\Users\\name", windows=True), "C:\\Users\\name")
 
     def test_cwd_comes_from_the_workspace_when_cursor_sends_none(self):
         out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "ls"}, cwd="", workspace_roots=[str(self.project)]))
@@ -110,7 +129,13 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(tools[1]["name"], "AskUserQuestion")
         # The copy is rebuilt when the transcript changes, including to the same size.
         before = Path(out["transcript_path"]).read_text(encoding="utf-8")
-        cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "Fix the lexer."}]}}])
+        size = os.stat(source).st_size
+        cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "<timestamp>Friday</timestamp>\n<user_query>\nFix the lexers.\n</user_query>"}]}},
+                                   {"role": "assistant", "message": {"content": [{"type": "text", "text": "Fixing it."},
+                                                                                 {"type": "tool_use", "name": "Write", "input": {"path": "/p/out.txt", "contents": "done\n"}},
+                                                                                 {"type": "tool_use", "name": "AskQuestion", "input": {"questions": []}}]}},
+                                   {"type": "turn_ended", "status": "success"}])
+        self.assertEqual(os.stat(source).st_size, size)
         os.utime(source, ns=(os.stat(source).st_atime_ns, os.stat(source).st_mtime_ns + 1_000_000))
         again = cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
         self.assertNotEqual(Path(again["transcript_path"]).read_text(encoding="utf-8"), before)
@@ -119,9 +144,24 @@ class TranslationTests(unittest.TestCase):
         self.assertNotIn("transcript_path", gone)
         # Cursor's null transcript_path is left out too.
         self.assertNotIn("transcript_path", cursor.with_transcripts(cursor_payload("stop"), self.state))
-        # Each version has its own copy, and a new copy removes the old one.
-        copies = [p for p in Path(self.state, "cursor").iterdir() if p.suffix == ".jsonl"]
-        self.assertEqual(len(copies), 1)
+        # Each version has its own copy; an older copy stays until it is ten minutes old, so a hook handed it can read it.
+        copies = sorted(p for p in Path(self.state, "cursor").iterdir() if p.suffix == ".jsonl")
+        self.assertEqual(len(copies), 2)
+        old = next(p for p in copies if str(p) != again["transcript_path"])
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "Third."}]}}])
+        cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
+        self.assertFalse(old.exists())
+
+    def test_a_lone_surrogate_does_not_stop_the_copy_or_the_answer(self):
+        source = self.tmp / "cursor.jsonl"
+        source.write_text('{"role": "assistant", "message": {"content": [{"type": "text", "text": "cut \\ud83d here"}]}}\n', encoding="utf-8")
+        out = cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
+        rows = [json.loads(line) for line in Path(out["transcript_path"]).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["message"]["content"][0]["text"], "cut \ud83d here")
+        answer = json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "x\ud83d" * 6000}}).encode()
+        text = json.loads(cursor.stdout("session_start", answer, self.state, "s"))["additional_context"]
+        self.assertLessEqual(cursor._length(text), cursor.CONTEXT_LIMIT)
 
     def test_answers_carry_cursors_fields(self):
         deny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "No."}}
@@ -146,6 +186,23 @@ class TranslationTests(unittest.TestCase):
                                           "updatedInput": {"file_path": str(target), "old_string": "one\ntwo\n", "new_string": "one\ntwo\n3\n"}}}
         out = json.loads(cursor.stdout("pre_tool_use", json.dumps(changed).encode(), self.state, "s", sent))
         self.assertEqual(out["updated_input"], {"file_path": str(target), "content": "one\ntwo\n3\n"})
+        # A replacement that does not fit the old text is refused, not dropped.
+        changed["hookSpecificOutput"]["updatedInput"] = {"file_path": str(target), "old_string": "absent", "new_string": "x"}
+        out = json.loads(cursor.stdout("pre_tool_use", json.dumps(changed).encode(), self.state, "s", sent))
+        self.assertEqual(out["permission"], "deny")
+        self.assertNotIn("updated_input", out)
+
+    def test_notices_for_the_user_reach_the_agent(self):
+        notice = {"systemMessage": "Writing check: something."}
+        out = json.loads(cursor.stdout("pre_tool_use", json.dumps(notice).encode(), self.state, "s"))
+        self.assertIn("Writing check: something.", out["additional_context"])
+        # A refusal already says it to the agent; the notice is not repeated.
+        deny = {"systemMessage": "Writing check: No.", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "No."}}
+        self.assertNotIn("additional_context", json.loads(cursor.stdout("pre_tool_use", json.dumps(deny).encode(), self.state, "s")))
+
+    def test_a_post_tool_use_block_becomes_context(self):
+        block = {"decision": "block", "reason": "Check the file again."}
+        self.assertEqual(json.loads(cursor.stdout("post_tool_use", json.dumps(block).encode(), self.state, "s"))["additional_context"], "Check the file again.")
 
     def test_long_context_is_cut_to_what_cursor_accepts_and_saved_whole(self):
         text = "\n".join(f"Line {n}: " + "x" * 60 for n in range(400))
@@ -174,6 +231,12 @@ HOOK = """
     data = json.load(sys.stdin)
     if data.get("hook_event_name") == "PreToolUse" and data.get("tool_name") == "Bash" and "rm -rf" in data["tool_input"].get("command", ""):
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Refusing rm -rf."}}))
+    elif data.get("hook_event_name") == "PreToolUse" and data.get("tool_name") == "Bash" and "shutdown" in data["tool_input"].get("command", ""):
+        sys.stderr.write("Refusing shutdown.")
+        sys.exit(2)
+    elif data.get("hook_event_name") == "Stop":
+        sys.stderr.write("Finish the tests.")
+        sys.exit(2)
     elif data.get("hook_event_name") == "SessionStart":
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "app=" + os.environ.get("AGENT_KIT_SYNC_APP", "")}}))
 """
@@ -188,7 +251,7 @@ class DispatcherTests(unittest.TestCase):
         (self.kit / "state").mkdir(parents=True)
         hook = self.tmp / "hook.py"
         hook.write_text(textwrap.dedent(HOOK), encoding="utf-8")
-        index = {"hooks": [{"module": "m", "name": "h", "path": str(hook), "events": ["pre_tool_use", "session_start"], "protocol": "native",
+        index = {"hooks": [{"module": "m", "name": "h", "path": str(hook), "events": ["pre_tool_use", "session_start", "stop"], "protocol": "native",
                             "runtime": "python", "timeout": 20, "on_failure": "open", "apps": [], "order": 0}]}
         (self.kit / "state" / "index.json").write_text(json.dumps(index), encoding="utf-8")
 
@@ -221,6 +284,38 @@ class DispatcherTests(unittest.TestCase):
     def test_an_allowed_command_answers_with_json(self):
         code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "ls"}))
         self.assertEqual((code, out), (0, {}))
+
+    def test_a_lone_hooks_exit_code_2_reaches_cursor_as_its_own_fields(self):
+        code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "shutdown now"}))
+        self.assertEqual((code, out["permission"]), (0, "deny"))
+        self.assertIn("Refusing shutdown.", out["agent_message"])
+        code, out = self.run_dispatcher("stop", cursor_payload("stop", status="completed", loop_count=0))
+        self.assertEqual((code, out["followup_message"]), (0, "Finish the tests."))
+
+    def test_a_failed_translation_still_answers(self):
+        # Input Cursor never sends must not crash the dispatcher.
+        code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input="not an object", workspace_roots="nope"))
+        self.assertEqual(code, 0)
+        self.assertNotIn("permission", out)
+        # The test hook itself fails on that input; the notice reaches the agent, since Cursor shows the user nothing.
+        self.assertIn("failed", out["additional_context"])
+
+    def test_a_translation_that_raises_keeps_the_hooks_decision(self):
+        import subprocess
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); from agent_kit_sync import cursor, dispatch\n"
+            "def broken(*args, **kwargs): raise UnicodeEncodeError('utf-8', '', 0, 1, 'lone surrogate')\n"
+            "cursor.stdout = broken\n"
+            "sys.exit(dispatch.main(sys.argv[2], sys.argv[3], 'claude', 'pre_tool_use'))"
+        )
+        env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
+        payload = cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "rm -rf /tmp/x"})
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py")],
+                                input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["permission"], "deny")
+        self.assertIn("Refusing rm -rf.", out["agent_message"])
 
     def test_claude_codes_own_calls_are_unchanged(self):
         code, out = self.run_dispatcher("pre_tool_use", {"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}})
