@@ -91,6 +91,187 @@ class RecognizeOwnEntriesTests(unittest.TestCase):
             self.assertFalse(interpreter_only({"type": "command", "command": "/usr/bin/other-python"}, python))
 
 
+class WindowsEntryTests(unittest.TestCase):
+    """Windows entries in Claude Code's settings are one command that Git Bash and PowerShell read alike."""
+
+    PYTHON = r"C:\Program Files\Python313\python.exe"
+    LAUNCHER = Path(r"C:\Users\o'brien\.agent-kit-sync\launcher.py")
+
+    def entries(self, system, bash=r"C:\Program Files\Git\bin\bash.exe", launcher=None, python=None):
+        from types import SimpleNamespace
+        from unittest import mock
+        from agent_kit_sync import register
+        machine = SimpleNamespace(python=python or self.PYTHON)
+        layout = SimpleNamespace(launcher=launcher or self.LAUNCHER)
+        with mock.patch.object(register, "os_name", return_value=system), mock.patch.object(register, "git_bash", return_value=bash):
+            return register.desired_entries(layout, machine, "claude", [], True)
+
+    def test_with_git_bash_the_entry_is_one_quoted_command_without_shell(self):
+        from agent_kit_sync.register import interpreter_only, ours
+        handler = self.entries("windows")["Stop"]["handler"]
+        self.assertEqual(sorted(handler), ["command", "timeout", "type"])
+        self.assertEqual(handler["command"], "'C:\\Program Files\\Python313\\python.exe' '-I' '-S' \"C:\\Users\\o'brien\\.agent-kit-sync\\launcher.py\" 'hook' 'claude' 'stop'")
+        self.assertTrue(ours(handler["command"], self.LAUNCHER))
+        self.assertFalse(interpreter_only(handler, self.PYTHON))
+
+    def test_without_git_bash_the_entry_runs_in_powershell(self):
+        handler = self.entries("windows", bash=None)["Stop"]["handler"]
+        self.assertEqual(handler["shell"], "powershell")
+        self.assertTrue(handler["command"].startswith("& 'C:\\Program Files\\Python313\\python.exe' "), handler["command"])
+
+    def test_a_path_no_quoting_suits_keeps_the_exec_form(self):
+        launcher = Path("C:\\Users\\o'brien$x\\.agent-kit-sync\\launcher.py")
+        handler = self.entries("windows", launcher=launcher)["Stop"]["handler"]
+        self.assertEqual(handler["command"], self.PYTHON)
+        self.assertEqual(handler["args"][-4:], [str(launcher), "hook", "claude", "stop"])
+
+    def test_entries_from_the_first_powershell_form_are_recognized(self):
+        from agent_kit_sync.register import ours
+        command = "& 'C:\\Program Files\\Python313\\python.exe' '-I' '-S' 'C:\\Users\\o''brien\\.agent-kit-sync\\launcher.py' 'hook' 'claude' 'stop'"
+        self.assertTrue(ours(command, self.LAUNCHER))
+
+    def test_macos_and_linux_entries_stay_one_shell_string(self):
+        for system in ("macos", "linux"):
+            handler = self.entries(system)["Stop"]["handler"]
+            self.assertEqual(sorted(handler), ["command", "timeout", "type"])
+
+    def test_quoting_for_bash_and_powershell(self):
+        from agent_kit_sync.register import windows_hook_quote
+        cases = {
+            r"C:\Users\a b\$HOME `x`\py.exe": r"'C:\Users\a b\$HOME `x`\py.exe'",
+            r"C:\Users\O'Neil\py.exe": "\"C:\\Users\\O'Neil\\py.exe\"",
+            "C:\\Users\\O\u2019Neil\\py.exe": "\"C:\\Users\\O\u2019Neil\\py.exe\"",
+            r"C:\Users\O'Neil!\py.exe": "\"C:\\Users\\O'Neil!\\py.exe\"",
+            r"C:\Users\O'Neil$\py.exe": None,
+            r"\\server\O'Neil\py.exe": None,
+            "C:\\Users\\O'Neil\\": None,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(windows_hook_quote(text), expected)
+
+
+def powershell_programs():
+    """Every PowerShell here. Claude Code and Cursor use PowerShell 7 when present, else Windows PowerShell 5.1."""
+    found = []
+    for name in ("pwsh", "powershell"):
+        program = shutil.which(name)
+        if program and program not in found:
+            found.append(program)
+    return found
+
+
+def powershell_program():
+    programs = powershell_programs()
+    return programs[0] if programs else None
+
+
+POWERSHELL_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+
+
+def bash_program():
+    """The Bash Claude Code runs hooks in: Git Bash on Windows, found as Claude Code finds it; bash elsewhere."""
+    if os.name == "nt":
+        from agent_kit_sync.register import git_bash
+        return git_bash()
+    return shutil.which("bash")
+
+
+def run_like_claude_code(command, payload, env=None):
+    """Run a hook command the way Claude Code 2.1.318 does on Windows with Git Bash: bash -c, the payload on standard input."""
+    return subprocess.run([bash_program(), "-c", command], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+
+
+def run_like_claude_code_powershell(command, payload, env=None, program=None):
+    """Run a "shell": "powershell" hook command the way Claude Code 2.1.318 does: the payload on standard input."""
+    script = command + "\n; if (-not $?) { if ($LASTEXITCODE -eq 2) { exit 2 } }"
+    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+
+
+def run_like_cursor(command, payload, folder, env=None, program=None):
+    """Run a hook command the way the Cursor app 3.27.22 does on Windows: the payload in a file piped to the command."""
+    payload_file = Path(folder) / "cursor-hook-payload.json"
+    payload_file.write_bytes(payload)
+    literal = str(payload_file).replace("'", "''")
+    # Cursor puts PowerShell's call operator in front of a command that starts with a quote.
+    stripped = command.lstrip()
+    if stripped[:1] in ("'", '"'):
+        command = "& " + command
+    script = ("$OutputEncoding = [System.Text.UTF8Encoding]::new($false); try { $global:cursorHookConsoleInputEncoding = [Console]::InputEncoding; "
+              "$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { try { [Console]::InputEncoding = $global:cursorHookConsoleInputEncoding } catch { } }; "
+              "[Console]::InputEncoding = $OutputEncoding } catch { }; "
+              f"Get-Content -LiteralPath '{literal}' -Raw -Encoding UTF8 | & {{ $input | {command} }}"
+              "; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE } elseif ($null -eq $LASTEXITCODE -and "
+              "@($Error | Where-Object { $_.Exception -is [System.Management.Automation.CommandNotFoundException] }).Count -gt 0) { exit 127 }")
+    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+
+
+ECHO_HOOK = """
+import json, sys
+data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+if data.get("block"):
+    sys.stderr.write("Refusing: " + data["text"])
+    sys.exit(2)
+if data.get("exit"):
+    sys.exit(data["exit"])
+# Raw UTF-8, as a hook that prints text of its own may write it.
+sys.stdout.buffer.write(json.dumps({"seen": data["text"], "args": sys.argv[1:]}, ensure_ascii=False).encode("utf-8"))
+"""
+
+
+@unittest.skipUnless(powershell_program() and bash_program(), "PowerShell or Bash is not installed")
+class WindowsInvocationTests(unittest.TestCase):
+    """The command written for Windows runs one program with its arguments, input, and exit code intact,
+    in Git Bash as Claude Code runs it and in PowerShell as Cursor runs it."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="aks-ps-"))
+        # One folder with an apostrophe, one with $ and a backtick: each is quoted a different way.
+        self.scripts = []
+        for name in ("o'brien o\u2019neil dir", "plain $HOME `x` dir"):
+            folder = self.tmp / name
+            folder.mkdir()
+            script = folder / "echo_hook.py"
+            script.write_text(ECHO_HOOK, encoding="utf-8")
+            self.scripts.append(script)
+
+    def tearDown(self):
+        remove_tree(self.tmp)
+
+    def command(self, script, python=None):
+        from agent_kit_sync.register import windows_hook_command
+        command = windows_hook_command([python or sys.executable, "-I", str(script), "hook", "claude", "$env:HOME", "a b"])
+        self.assertIsNotNone(command, script)
+        return command
+
+    def check(self, run):
+        for program in powershell_programs():
+            for script in self.scripts:
+                with self.subTest(program=program, script=script.parent.name):
+                    payload = json.dumps({"text": "naïve ✓"}, ensure_ascii=False).encode("utf-8")
+                    result = run(self.command(script), payload, program)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                    self.assertEqual(json.loads(result.stdout.decode("utf-8")), {"seen": "naïve ✓", "args": ["hook", "claude", "$env:HOME", "a b"]})
+                    blocked = run(self.command(script), json.dumps({"text": "rm", "block": True}).encode("utf-8"), program)
+                    self.assertEqual(blocked.returncode, 2, blocked.stderr.decode("utf-8", "replace"))
+                    self.assertIn("Refusing: rm", blocked.stderr.decode("utf-8", "replace"))
+                    # Any other failure must read as a failure, never as success or as a block.
+                    failed = run(self.command(script), json.dumps({"text": "x", "exit": 3}).encode("utf-8"), program)
+                    self.assertNotIn(failed.returncode, (0, 2), failed.stderr.decode("utf-8", "replace"))
+                    missing = run(self.command(script, str(self.tmp / "no such python.exe")), b"{}", program)
+                    self.assertNotIn(missing.returncode, (0, 2), missing.stderr.decode("utf-8", "replace"))
+
+    def test_claude_code_runs_it_in_git_bash(self):
+        self.check(lambda command, payload, program: run_like_claude_code(command, payload))
+
+    def test_claude_code_runs_it_in_powershell_without_git_bash(self):
+        self.check(lambda command, payload, program: run_like_claude_code_powershell("& " + command, payload, program=program))
+
+    def test_cursor_runs_it(self):
+        self.check(lambda command, payload, program: run_like_cursor(command, payload, self.tmp, program=program))
+
+
 class DispatchUnitTests(unittest.TestCase):
     def test_matcher_and_tool_kinds(self):
         self.assertEqual(dispatch.tool_kind("claude", "Bash"), "shell")
@@ -257,12 +438,9 @@ class InstalledToolTests(TwoMachines):
         pre = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(pre["matcher"], "^(?:Bash|PowerShell)$")
         handler = pre["hooks"][0]
-        if os.name == "nt":
-            self.assertEqual(handler["args"][-2:], ["claude", "pre_tool_use"])
-        else:
-            # One command string, so a program that keeps only type and command keeps a working entry.
-            self.assertEqual(sorted(handler), ["command", "timeout", "type"])
-            self.assertTrue(handler["command"].endswith(" hook claude pre_tool_use"), handler["command"])
+        # One command string, so a program that keeps only type and command keeps a working entry.
+        self.assertIn(sorted(handler), (["command", "timeout", "type"], ["command", "shell", "timeout", "type"]))
+        self.assertTrue(handler["command"].endswith((" hook claude pre_tool_use", " 'hook' 'claude' 'pre_tool_use'")), handler["command"])
         codex = json.loads(self.a.read(".codex", "hooks.json"))
         self.assertIn("PreToolUse", codex["hooks"])
         # A blocked command: the only hook's exit code 2 and its error text reach the app unchanged.
@@ -284,6 +462,33 @@ class InstalledToolTests(TwoMachines):
         payload = json.dumps({"session_id": "s3", "prompt": "hi"}).encode()
         out = json.loads(self.cli("hook", "claude", "user_prompt", stdin=payload).stdout)
         self.assertEqual(out["decision"], "block")
+
+    @unittest.skipUnless(os.name == "nt" and powershell_program() and bash_program(), "Windows with Git Bash and PowerShell only")
+    def test_windows_entries_run_in_claude_code_and_cursor(self):
+        self.install()
+        settings = json.loads(self.a.read(".claude", "settings.json"))
+        for event, groups in settings["hooks"].items():
+            for group in groups:
+                for handler in group["hooks"]:
+                    self.assertEqual(sorted(handler), ["command", "timeout", "type"], (event, handler))
+                    self.assertTrue(handler["command"].startswith("'"), (event, handler))
+        command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        env = dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home), AGENT_KIT_SYNC_NO_BACKGROUND="1")
+        for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_KIT_SYNC_HOME"):
+            env.pop(name, None)
+        blocked = json.dumps({"session_id": "w1", "tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}, "cwd": str(self.a.home)}).encode()
+        allowed = json.dumps({"session_id": "w1", "tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": str(self.a.home)}).encode()
+        runs = [("Claude Code in Git Bash", None, lambda c, p, prog: run_like_claude_code(c, p, env))]
+        for program in powershell_programs():
+            runs.append(("Claude Code in PowerShell", program, lambda c, p, prog: run_like_claude_code_powershell("& " + c, p, env, prog)))
+            runs.append(("Cursor", program, lambda c, p, prog: run_like_cursor(c, p, self.tmp, env, prog)))
+        for name, program, run in runs:
+            with self.subTest(app=name, program=program):
+                result = run(command, blocked, program)
+                self.assertEqual(result.returncode, 2, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace"))
+                self.assertIn(b"Refusing rm -rf.", result.stderr)
+                result = run(command, allowed, program)
+                self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace"))
 
     def test_registration_keeps_other_entries_and_is_idempotent(self):
         other = {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "other-tool capture"}]}]}, "theme": "dark"}
@@ -396,6 +601,37 @@ class InstalledToolTests(TwoMachines):
         out = self.cli("doctor").stdout.decode()
         self.assertIn("1 hook entries that run only", out)
         self.assertIn("(Stop)", out)
+
+    def test_doctor_reports_entries_cursor_cannot_run_and_powershell_entries_without_shell(self):
+        self.install()
+        path = self.a.path(".claude", "settings.json")
+        data = json.loads(path.read_text())
+        from agent_kit_sync import toml
+        from agent_kit_sync.register import windows_hook_command
+        python = toml.load_file(self.a.layout.machine_file)["python"]
+        launcher = str(self.a.layout.launcher)
+        data["hooks"]["Stop"] = [{"matcher": "", "hooks": [{"type": "command", "command": python, "args": ["-I", "-S", launcher, "hook", "claude", "stop"], "timeout": 60}]}]
+        data["hooks"]["SessionStart"] = [{"matcher": "", "hooks": [{"type": "command", "command": "& " + windows_hook_command([python, "-I", "-S", launcher, "hook", "claude", "session_start"]), "timeout": 60}]}]
+        path.write_text(json.dumps(data, indent=2))
+        out = self.cli("doctor").stdout.decode()
+        self.assertNotIn("Cursor cannot run", out)
+        self.assertIn('no longer set "shell" to "powershell" (SessionStart)', out)
+        self.a.path(".cursor").mkdir(exist_ok=True)
+        out = self.cli("doctor").stdout.decode()
+        self.assertIn("Cursor cannot run 1 agent-kit-sync entries in Claude Code's settings (Stop)", out)
+
+    def test_doctor_reports_git_bash_entries_when_git_bash_is_gone(self):
+        from unittest import mock
+        from agent_kit_sync import commands, paths, register
+        layout = mock.Mock(launcher=Path("launcher.py"))
+        data = {"hooks": {
+            "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "'python.exe' '-I' '-S' 'launcher.py' 'hook' 'claude' 'stop'"}]}],
+            "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "shell": "powershell", "command": "& 'python.exe' '-I' '-S' 'launcher.py' 'hook' 'claude' 'session_start'"}]}],
+        }}
+        with mock.patch.object(paths, "os_name", return_value="windows"), mock.patch.object(register, "git_bash", return_value=None):
+            self.assertEqual(commands._bash_form_without_git_bash(data, layout), ["Stop"])
+        with mock.patch.object(paths, "os_name", return_value="windows"), mock.patch.object(register, "git_bash", return_value="bash.exe"):
+            self.assertEqual(commands._bash_form_without_git_bash(data, layout), [])
 
     def test_missing_version_prints_repair_command(self):
         self.install()

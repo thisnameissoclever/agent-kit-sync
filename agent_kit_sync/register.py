@@ -7,7 +7,9 @@ tool recognizes its own entries later. Entries written by anything else are neve
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +21,8 @@ from .model import Machine
 from .paths import Layout, os_name
 
 TOOL_EVENTS = ("session_start", "post_tool_use", "stop")
+# PowerShell reads each of these as a single quote, so an argument holding one cannot go in single quotes.
+POWERSHELL_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 
 def claude_version() -> Optional[Tuple[int, ...]]:
@@ -70,6 +74,66 @@ def shell_join(parts: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def windows_hook_quote(text: str) -> Optional[str]:
+    """One argument quoted so Git Bash and PowerShell both read it as exactly `text`, or None.
+
+    In single quotes, Bash and PowerShell both take every character literally, so a path with
+    spaces, $, or backticks is safe in either. They differ only on a quote character inside the
+    quotes, so such an argument goes in double quotes instead, which both read literally when it
+    holds no $, backtick, double quote, or doubled or final backslash.
+    """
+    if not any(quote in text for quote in POWERSHELL_QUOTES):
+        return "'" + text + "'"
+    if any(char in text for char in '"$`\u201c\u201d\u201e') or "\\\\" in text or text.endswith("\\"):
+        return None
+    return '"' + text + '"'
+
+
+def windows_hook_command(parts: List[str]) -> Optional[str]:
+    """The program in parts[0] and its arguments, as a command Claude Code and Cursor both run on Windows.
+
+    Claude Code runs a hook's command in Git Bash on Windows, and Cursor, which runs the hooks in
+    Claude Code's settings, keeps only the command and runs it in PowerShell. Every part is quoted,
+    so the command starts with a quote, and Cursor puts PowerShell's call operator, &, in front of
+    such a command. Bash and PowerShell then start the same program with the same arguments. Returns
+    None when a part cannot be quoted for both, such as a path holding both ' and $.
+    """
+    quoted = [windows_hook_quote(part) for part in parts]
+    return None if None in quoted else " ".join(quoted)
+
+
+def git_bash() -> Optional[str]:
+    """The Git Bash that Claude Code runs hooks in on Windows, found the way Claude Code 2.1.318 finds it."""
+    chosen = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if chosen and os.path.basename(chosen).lower() in ("bash.exe", "sh.exe", "bash", "sh") and os.path.exists(chosen):
+        return chosen
+    for path in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"):
+        if os.path.exists(path):
+            return path
+    git = shutil.which("git")
+    if git:
+        path = os.path.join(os.path.dirname(os.path.dirname(git)), "bin", "bash.exe")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def windows_claude_handler(parts: List[str], bash: Optional[str]) -> dict:
+    """A Claude Code entry for Windows that Claude Code and Cursor both run.
+
+    With Git Bash, where Claude Code runs a hook with no "shell", the command is quoted for Bash and
+    PowerShell alike. Without it, Claude Code runs hooks in PowerShell, so the command starts with
+    PowerShell's call operator and the entry says so. A path that cannot be quoted for both keeps the
+    exec form, which Claude Code runs and Cursor cannot.
+    """
+    command = windows_hook_command(parts)
+    if command is None:
+        return {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
+    if bash:
+        return {"type": "command", "command": command, "timeout": 60}
+    return {"type": "command", "shell": "powershell", "command": "& " + command, "timeout": 60}
+
+
 def interpreter_only(handler: dict, python: str) -> bool:
     """True for an entry that runs only this machine's Python, with no script or arguments.
 
@@ -85,7 +149,8 @@ def interpreter_only(handler: dict, python: str) -> bool:
 def ours(command: str, launcher: Path) -> bool:
     """True when a command runs this kit's launcher, written plainly or quoted for a shell."""
     path = str(launcher)
-    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path])}
+    # The last form is how the first Windows PowerShell entries wrote a path holding an apostrophe.
+    forms = {path, path.replace("\\", "/"), shlex.quote(path), subprocess.list2cmdline([path]), path.replace("'", "''")}
     return any(form in command for form in forms)
 
 
@@ -160,11 +225,12 @@ def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict
         parts = command_parts(layout, machine, app, event)
         if app == "claude":
             # The whole command sits in one string, because a program that rewrites settings.json
-            # may keep only each handler's type and command; losing the timeout then leaves Claude
-            # Code's own default instead of an entry that runs Python with no script. Windows keeps
-            # the exec form, so a path with spaces needs no shell quoting.
+            # may keep only each handler's type and command, and because Cursor, which runs these
+            # entries too, keeps only the command. On Windows the string is quoted so that Git Bash,
+            # where Claude Code runs it, and PowerShell, where Cursor runs it, read it the same way.
+            # A path no quoting suits both keeps the exec form, which Cursor cannot run; doctor says so.
             if os_name() == "windows":
-                handler = {"type": "command", "command": parts[0], "args": parts[1:], "timeout": 60}
+                handler = windows_claude_handler(parts, git_bash())
             else:
                 handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
             if spec["closed"] and on_failure_supported and event not in ("stop", "subagent_stop"):
