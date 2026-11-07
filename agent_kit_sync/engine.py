@@ -1486,17 +1486,27 @@ class Engine:
 
     def write_cursor_rules(self, plan: Plan, everything_removed: bool = False) -> None:
         """Write Cursor's rule files from the sections meant for Cursor. They are output only: nothing
-        in them is carried back, so no state of Cursor's rules folder can change the config repo."""
+        in them is carried back, so no state of Cursor's rules folder can change the config repo, and
+        a problem with them raises an alert instead of stopping the run."""
+        try:
+            self._write_cursor_rules(plan, everything_removed)
+        except Exception as error:  # noqa: BLE001 - Cursor's output must never stop a sync.
+            self.alerts.raise_("cursor-rules", f"agent-kit-sync could not write Cursor's rule files: {error}", "agent-kit-sync status")
+
+    def _write_cursor_rules(self, plan: Plan, everything_removed: bool) -> None:
         from . import cursor_rules
         folder = Path.home() / ".cursor" / "rules"   # The folder Cursor reads; it has no setting to move it.
         backups = self.layout.state / "backups" / "cursor-rules"
         if "cursor" not in self.machine.apps or everything_removed:
             # Cursor left this machine, or agent-kit-sync is being removed: take only its own files away.
             outcome = cursor_rules.write_rules(folder, [], set(), backups)
-            for key in ("cursor-rules", "cursor-rule-import", "cursor-rule-size", "cursor-rule-edited", "cursor-rule-foreign"):
+            for key in ("cursor-rules", "cursor-rule-import", "cursor-rule-size", "cursor-rule-foreign"):
                 self.alerts.close(key)
-            if outcome.backed_up or outcome.errors:
-                self._alert_list("cursor-rules", outcome.backed_up + outcome.errors, "agent-kit-sync removed its Cursor rule files; edited ones were saved, and some could not be removed: {listed}")
+            self._close_edited_notice()
+            if outcome.backed_up:
+                self._alert_list("cursor-rule-edited", outcome.backed_up, "agent-kit-sync removed its Cursor rule files, and saved the ones that had been edited as: {listed}")
+            if outcome.errors:
+                self._alert_list("cursor-rules", outcome.errors, "agent-kit-sync could not remove some of its Cursor rule files: {listed}")
             return
         support = {str(copy.path): copy.data for copy in plan.copies if copy.app == "kit" and copy.kind == "file"}
         failed = set(plan.failed)
@@ -1504,7 +1514,10 @@ class Engine:
             # A failed module keeps its earlier installed files; a section importing one still gets its text.
             if entry.get("app") == "kit" and entry.get("kind") == "file" and entry.get("item_key", "").split("/", 1)[0] in failed:
                 path = Path(entry["path"])
-                data = read_or_none(path)
+                try:
+                    data = read_or_none(path)
+                except OSError:
+                    data = None
                 if data is not None:
                     support.setdefault(str(path), data)
         blocks = [b for b in plan.cursor_blocks if not self.frozen(f"{b[0]}/{b[1]}")]
@@ -1519,10 +1532,13 @@ class Engine:
         if outcome.backed_up:
             self._alert_list("cursor-rule-edited", outcome.backed_up, "Cursor's rule files are written by agent-kit-sync and never carried back, so edits in them were replaced. Make the change in CLAUDE.md, AGENTS.md, or the installed file instead. The edited files were saved as: {listed}")
         else:
-            # The notice stays a day, so every app's next session shows it, then closes.
-            for alert in self.alerts.open():
-                if alert.get("key") == "cursor-rule-edited" and time.time() - float(alert.get("time", 0)) > 86400:
-                    self.alerts.close("cursor-rule-edited")
+            self._close_edited_notice()
+
+    def _close_edited_notice(self) -> None:
+        """The notice of replaced edits stays a day, so every app's next session shows it, then closes."""
+        for alert in self.alerts.open():
+            if alert.get("key") == "cursor-rule-edited" and time.time() - float(alert.get("time", 0)) > 86400:
+                self.alerts.close("cursor-rule-edited")
 
     def _alert_list(self, key: str, items: List[str], message: str) -> None:
         if not items:

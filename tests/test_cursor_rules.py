@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -307,7 +308,85 @@ class CursorRuleTests(TwoMachines):
         self.assertFalse(b.path(".cursor").exists())
 
 
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions and a user who is not root")
+    def test_an_unreadable_rules_folder_does_not_stop_the_sync(self):
+        self.a.sync()
+        os.chmod(self.rules(), 0)
+        try:
+            self.seed_files({"modules/writing/sections/plain.md": "Write plainly, always.\n"}, message="upstream")
+            engine, report = self.a.sync()
+            self.assertIn("Write plainly, always.", self.a.read(".claude", "CLAUDE.md"))
+            self.assertTrue(any("Cursor's rule files" in a["message"] for a in engine.alerts.open()))
+        finally:
+            os.chmod(self.rules(), 0o755)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symbolic links")
+    def test_a_link_at_our_name_is_left_alone(self):
+        self.rules().mkdir(parents=True)
+        target = self.tmp / "elsewhere" / "target.mdc"
+        try:
+            os.symlink(target, self.rule("plain"))
+        except OSError:
+            self.skipTest("cannot create symbolic links here")
+        engine, _report = self.a.sync()
+        self.assertFalse(target.exists())
+        self.assertTrue(os.path.islink(self.rule("plain")))
+        self.assertTrue(any("did not write these Cursor rule files" in a["message"] for a in engine.alerts.open()))
+
+    def test_a_trailing_space_after_the_marker_still_marks_our_file(self):
+        self.a.sync()
+        path = self.rule("plain")
+        text = path.read_text(encoding="utf-8").replace("-->\n", "--> \n", 1)
+        self.a.write(path, text)
+        engine, _report = self.a.sync()
+        self.assertFalse(any("did not write these Cursor rule files" in a["message"] for a in engine.alerts.open()))
+
+    def test_backup_notice_survives_when_cursor_leaves(self):
+        self.a.sync()
+        self.a.write(self.rule("plain"), self.rule("plain").read_text(encoding="utf-8") + "Edit.\n")
+        data = self.a.machine_data()
+        data["apps"] = ["claude", "codex"]
+        self.a.write_machine(data)
+        engine, _report = self.a.sync()
+        self.assertTrue(any("saved the ones that had been edited" in a["message"] for a in engine.alerts.open()))
+        engine, _report = self.a.sync()
+        self.assertTrue(any("saved the ones that had been edited" in a["message"] for a in engine.alerts.open()))
+
+
 class NameTests(unittest.TestCase):
+    def test_a_file_that_changes_while_writing_is_left_for_the_next_run(self):
+        import tempfile
+        from unittest import mock
+        folder = Path(tempfile.mkdtemp())
+        rule = cursor_rules.compose("writing", "plain", "New text.\n")
+        old = cursor_rules.compose("writing", "plain", "Old text.\n")
+        path = folder / rule.name
+        path.write_text(old.text, encoding="utf-8")
+        real_read = cursor_rules._read
+
+        def read_then_edit(target, outcome):
+            result = real_read(target, outcome)
+            target.write_text(old.text + "Edit made just now.\n", encoding="utf-8")
+            return result
+        with mock.patch.object(cursor_rules, "_read", read_then_edit):
+            outcome = cursor_rules.write_rules(folder, [rule], set(), folder / "backups")
+        self.assertIn("Edit made just now.", path.read_text(encoding="utf-8"))
+        self.assertEqual(outcome.written, [])
+
+    def test_inline_triple_backticks_are_not_a_fence(self):
+        text, unmatched, _ = cursor_rules.expand_imports("```x``` marks inline code\n@/x/y.md\n", {"/x/y.md": b"Y\n"})
+        self.assertEqual((text, unmatched), ("```x``` marks inline code\nY\n", []))
+
+    def test_only_line_feeds_end_lines(self):
+        body = ("a\u2028b\x0cc\n\n" * 6000)
+        pieces = cursor_rules.split(body, 20000)
+        self.assertGreater(len(pieces), 1)
+        self.assertLessEqual("".join(pieces).count("\n"), body.count("\n"))  # A cut may drop the blank line it falls on.
+        self.assertEqual("".join(pieces).count("\u2028"), body.count("\u2028"))
+        text, _, _ = cursor_rules.expand_imports("note\u2028@/x/y.md\n", {"/x/y.md": b"Y\n"})
+        self.assertEqual(text, "note\u2028@/x/y.md\n")
+
+
     def test_names_are_short_and_the_marker_names_the_owner(self):
         self.assertEqual(cursor_rules.file_name("writing", "plain"), "agent-kit-sync--writing--plain.mdc")
         long = cursor_rules.file_name("a" * 80, "b" * 80)

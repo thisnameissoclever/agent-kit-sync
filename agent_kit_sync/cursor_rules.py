@@ -24,14 +24,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from .fsutil import ChangedUnderneath, atomic_write
+from .fsutil import ChangedUnderneath, atomic_write, sha256
 
 # Cursor reads only the first 102,400 bytes of a rule's text.
 RULE_LIMIT = 102400
 # Room left under the limit for the header, the marker line, and closing a split code fence.
 BODY_LIMIT = RULE_LIMIT - 2048
 PREFIX = "agent-kit-sync--"
-MARKER = re.compile(r"^<!-- agent-kit-sync rule file=(\S+) item=([a-z0-9-]+)/([a-z0-9-]+) sha256=([0-9a-f]{64}) -->\n", re.M)
+MARKER = re.compile(r"^<!-- agent-kit-sync rule file=(\S+) item=([a-z0-9-]+)/([a-z0-9-]+) sha256=([0-9a-f]{64}) -->[ \t]*\n", re.M)
 HEADER = "---\ndescription: {description}\nalwaysApply: true\n---\n\n"
 # An import line names a file: an absolute path, a home-relative path, or a Windows drive path.
 IMPORT_LINE = re.compile(r"^@((?:/|~[/\\]|[A-Za-z]:[/\\])\S.*?)\s*$")
@@ -95,6 +95,11 @@ def read_mark(text: str) -> Optional[Mark]:
     return Mark(match.group(1), match.group(2), match.group(3), _hash(rest) != match.group(4))
 
 
+def _lines(text: str) -> List[str]:
+    """The text's lines, each with its \\n; unlike str.splitlines, other characters do not end a line."""
+    return re.findall(r"[^\n]*\n|[^\n]+\Z", text)
+
+
 def _same(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.expanduser(path)))
 
@@ -113,6 +118,8 @@ class Fences:
             return False
         mark = match.group(1)
         if self.open is None:
+            if mark[0] == "`" and "`" in line.strip()[len(mark):]:
+                return False  # Inline code, such as ```x```, not a fence.
             self.open = mark
             return True
         if mark[0] == self.open[0] and len(mark) >= len(self.open) and not line.strip()[len(mark):].strip():
@@ -129,7 +136,7 @@ def expand_imports(text: str, support: Dict[str, bytes]) -> Tuple[str, List[str]
     files = {_same(path): data for path, data in support.items()}
     out, unmatched, unreadable = [], [], []
     fences = Fences()
-    for line in text.splitlines(keepends=True):
+    for line in _lines(text):
         inside = fences.open is not None
         if fences.step(line) or inside:
             out.append(line)
@@ -170,7 +177,7 @@ def split(body: str, limit: int = BODY_LIMIT) -> List[str]:
         current = [opening] if inside else []
         size = len(opening.encode("utf-8")) if inside else 0
 
-    for line in body.splitlines(keepends=True):
+    for line in _lines(body):
         if not line.endswith("\n"):
             line += "\n"
         line_size = len(line.encode("utf-8"))
@@ -226,22 +233,27 @@ class Outcome:
 def write_rules(folder: Path, rules: List[Rule], keep: Set[Tuple[str, str]], backups: Path) -> Outcome:
     """Make agent-kit-sync's rule files in `folder` match `rules`.
 
-    A file is agent-kit-sync's only when its marker names the file itself; every other file is
-    left alone. `keep` holds (module, item) pairs whose files stay as they are, such as a module
-    that failed this run. A file someone edited is backed up before it is replaced or removed.
+    A file is agent-kit-sync's only when it is a regular file whose marker names the file itself;
+    every other file, and any link, is left alone. `keep` holds (module, item) pairs whose files
+    stay as they are, such as a module that failed this run. A file someone edited is backed up
+    before it is replaced or removed, and a file that changes while this runs is left for the
+    next run. Every problem is listed in the outcome; nothing is raised.
     """
     outcome = Outcome()
     wanted = {rule.name: rule for rule in rules}
     try:
         present = sorted(name for name in os.listdir(folder) if name.startswith(PREFIX) and name.endswith(".mdc"))
-    except OSError:
+    except FileNotFoundError:
         present = []
+    except OSError as error:
+        outcome.errors.append(f"{folder}: {error}")
+        return outcome
     for name in present:
         if name in wanted:
             continue
         path = folder / name
-        raw = _read(path, outcome)
-        if raw is None:
+        state, raw = _read(path, outcome)
+        if state != "file":
             continue
         mark = read_mark(raw.decode("utf-8", "replace"))
         if mark is None or mark.name != name or (mark.module, mark.item) in keep:
@@ -249,16 +261,21 @@ def write_rules(folder: Path, rules: List[Rule], keep: Set[Tuple[str, str]], bac
         if mark.edited and not _backup(path, raw, backups, outcome):
             continue
         try:
+            if sha256(path.read_bytes()) != sha256(raw):
+                continue  # Changed while this ran; the next run sees the change.
             path.unlink()
             outcome.removed.append(str(path))
         except OSError as error:
             outcome.errors.append(f"{path}: {error}")
     for name, rule in wanted.items():
         path = folder / name
-        raw = _read(path, outcome) if path.exists() else None
-        if path.exists() and raw is None:
+        state, raw = _read(path, outcome)
+        if state == "error":
             continue
-        if raw is not None:
+        if state == "other":
+            outcome.foreign.append(str(path))
+            continue
+        if state == "file":
             if raw == rule.text.encode("utf-8"):
                 continue
             mark = read_mark(raw.decode("utf-8", "replace"))
@@ -268,9 +285,11 @@ def write_rules(folder: Path, rules: List[Rule], keep: Set[Tuple[str, str]], bac
             if mark.edited and not _backup(path, raw, backups, outcome):
                 continue
         try:
-            atomic_write(path, rule.text.encode("utf-8"))
+            atomic_write(path, rule.text.encode("utf-8"), expect=sha256(raw) if state == "file" else None)
             outcome.written.append(str(path))
-        except (OSError, ChangedUnderneath) as error:
+        except ChangedUnderneath:
+            continue  # Changed while this ran; the next run sees the change.
+        except OSError as error:
             outcome.errors.append(f"{path}: {error}")
     if outcome.removed:
         try:
@@ -281,12 +300,24 @@ def write_rules(folder: Path, rules: List[Rule], keep: Set[Tuple[str, str]], bac
     return outcome
 
 
-def _read(path: Path, outcome: Outcome) -> Optional[bytes]:
+def _read(path: Path, outcome: Outcome) -> Tuple[str, Optional[bytes]]:
+    """("missing", None), ("file", bytes), ("other", None) for a link or anything not a regular file,
+    or ("error", None) after listing the error."""
     try:
-        return path.read_bytes()
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "missing", None
     except OSError as error:
         outcome.errors.append(f"{path}: {error}")
-        return None
+        return "error", None
+    import stat
+    if not stat.S_ISREG(info.st_mode):
+        return "other", None
+    try:
+        return "file", path.read_bytes()
+    except OSError as error:
+        outcome.errors.append(f"{path}: {error}")
+        return "error", None
 
 
 def _backup(path: Path, raw: bytes, backups: Path, outcome: Outcome) -> bool:
