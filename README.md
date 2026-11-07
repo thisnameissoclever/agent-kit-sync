@@ -42,7 +42,7 @@ agent-kit-sync accepts no responsibility for anything that leaks from a public c
 |---|---|---|---|
 | Skills | `~/.claude/skills/` | `~/.agents/skills/` | Reads the Claude Code and Codex folders |
 | Subagent definitions | `~/.claude/agents/` | `~/.codex/agents/` (TOML) | `~/.cursor/agents/` |
-| Instruction sections | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | Not yet |
+| Instruction sections | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.cursor/rules/agent-kit-sync--*.mdc`, written only |
 | Agent settings | `~/.claude/settings.json` | `~/.codex/config.toml` | Not yet |
 | Hooks | Registered in `settings.json` | Registered in `hooks.json` | Runs Claude Code's hooks |
 
@@ -189,6 +189,8 @@ Write plainly.
 
 agent-kit-sync changes only text between its own markers. New sections are added at the end of the file; move a block anywhere and it stays there. A section can have different wording for one app with `variants = { codex = "sections/plain.codex.md" }`.
 
+Cursor does not read `~/.claude/CLAUDE.md`. agent-kit-sync writes each section meant for Cursor as its own rule file, `~/.cursor/rules/agent-kit-sync--MODULE--ITEM.mdc`, which Cursor applies to every chat. Cursor does not follow `@path` lines, so each line that names a file agent-kit-sync installs, such as `@{{kit.module}}/writing-style.md`, is replaced by that file's text, and a line that names no installed file raises an alert. Cursor reads only the first 102,400 bytes of a rule, so a longer section is split at blank lines into `--partN` files. These rule files are written only, never read back: edit the section in `CLAUDE.md` or `AGENTS.md`, or the installed file, and the change reaches every app. An edit made in one of these rule files is saved to the kit folder's `state/backups/cursor-rules/`, replaced, and reported in an alert; removing one changes nothing, and the next sync writes it again. A file at one of these names that agent-kit-sync did not write is left alone with an alert, and no other rule file is touched. Cursor reads these files only for a workspace inside your user folder; for a workspace elsewhere, such as on another drive, the session-start hook tells the agent to read them.
+
 `agent-kit-sync status` shows the size of each instruction file. Codex reads its global `AGENTS.md` in full; its 32 KiB limit applies only to `AGENTS.md` files in project folders, which agent-kit-sync does not write. Codex reads `AGENTS.override.md` instead of `AGENTS.md` when that file exists, and `agent-kit-sync doctor` reports it.
 
 ## Hooks
@@ -333,7 +335,7 @@ Your protections are the checks, the policy settings `code_changes`, `outgoing`,
 
 ## Current limits
 
-- Cursor's instructions and settings, and Antigravity, are not supported yet.
+- Cursor's settings, and Antigravity, are not supported yet.
 - Skills from other repositories, such as public skill collections, cannot be added as sources yet.
 - agent-kit-sync itself is tested on Windows by the hosted tests only. Your own hooks are tested on Windows only when a Windows machine installs them.
 

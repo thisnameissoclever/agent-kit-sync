@@ -634,6 +634,7 @@ def cmd_uninstall(args, layout: Layout) -> int:
         engine.index.hooks = []
         engine._write_copies(plan)
         engine._write_sections(plan)
+        engine.write_cursor_rules(plan, everything_removed=True)
         engine._write_settings(plan)
         engine.index.save()
         unregister(layout, machine)

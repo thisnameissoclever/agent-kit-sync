@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -162,6 +163,7 @@ class Engine:
         for alert in self.alerts.open():
             if alert.get("key", "").startswith("size:"):
                 self.alerts.close(alert["key"])
+        self._forget_cursor_entries()
         modules = self._load_or_alert()
         if modules is None:
             return self.report
@@ -1262,6 +1264,7 @@ class Engine:
         self._write_copies(plan)
         self._write_sections(plan)
         self.index.save()
+        self.write_cursor_rules(plan)
         self._write_settings(plan)
         self.index.save()
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
@@ -1481,6 +1484,57 @@ class Engine:
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
             self.index.save()
             self.journal.finish()
+
+    def _forget_cursor_entries(self) -> None:
+        """Drop index entries for Cursor that a development version of agent-kit-sync recorded, when it
+        read Cursor's rule files back. Cursor's rules are output only, so no entry may make a missing
+        or edited rule look like a change to carry back."""
+        blocks = [key for key, entry in self.index.blocks.items() if entry.get("app") == "cursor"]
+        copies = [key for key, entry in self.index.copies.items() if str(entry.get("render_kind", "")).startswith("cursor-rule-")]
+        for key in blocks:
+            del self.index.blocks[key]
+        for key in copies:
+            self.index.drop_copy(key)
+        if blocks or copies:
+            self.index.save()
+
+    def write_cursor_rules(self, plan: Plan, everything_removed: bool = False) -> None:
+        """Write Cursor's rule files from the sections meant for Cursor. They are output only."""
+        from . import cursor_rules
+        home = self.machine.app_homes.get("cursor")
+        if "cursor" not in self.machine.apps or home is None:
+            for key in ("cursor-rules", "cursor-rule-import", "cursor-rule-size", "cursor-rule-edited", "cursor-rule-foreign"):
+                self.alerts.close(key)
+            return
+        support = {str(copy.path): copy.data for copy in plan.copies if copy.app == "kit" and copy.kind == "file"}
+        blocks = [] if everything_removed else [b for b in plan.cursor_blocks if not self.frozen(f"{b[0]}/{b[1]}")]
+        rules, unmatched, oversized = cursor_rules.plan_rules(blocks, support)
+        # A module that failed this run keeps its rule files as they are.
+        keep = set()
+        failed = set(plan.failed) if not everything_removed else set()
+        folder = home / "rules"
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            names = []
+        for name in names:
+            owned = cursor_rules.owner(name)
+            if owned and not everything_removed and (owned[0] in failed or self.frozen(f"{owned[0]}/{owned[1]}")):
+                keep.add(owned)
+        outcome = cursor_rules.write_rules(folder, rules, keep, self.layout.state / "backups" / "cursor-rules")
+        self._alert_list("cursor-rule-import", unmatched, "Cursor does not follow @path lines, and these lines in synced sections name no file agent-kit-sync installs, so Cursor gets the bare line: {listed}. Install the file with a [[files]] item, or write its text into the section.")
+        self._alert_list("cursor-rule-size", oversized, f"Cursor reads only the first {cursor_rules.RULE_LIMIT:,} bytes of a rule, and these rule files are still larger after splitting: {{listed}}. Shorten the section's longest paragraph.")
+        self._alert_list("cursor-rule-edited", outcome.backed_up, "Cursor's rule files are written by agent-kit-sync and never carried back, so edits in them were replaced. Make the change in CLAUDE.md, AGENTS.md, or the installed file instead. The edited files were saved as: {listed}")
+        self._alert_list("cursor-rule-foreign", outcome.foreign, "agent-kit-sync did not write these Cursor rule files, because a file it did not write is at the same name: {listed}. Rename the file, then run agent-kit-sync sync.")
+        self._alert_list("cursor-rules", outcome.errors, "agent-kit-sync could not write some of Cursor's rule files: {listed}")
+
+    def _alert_list(self, key: str, items: List[str], message: str) -> None:
+        if not items:
+            if key != "cursor-rule-edited":
+                self.alerts.close(key)  # A replaced edit stays reported until the user closes it.
+            return
+        listed = ", ".join(sorted(set(items))[:5]) + (f", and {len(set(items)) - 5} more" if len(set(items)) > 5 else "")
+        self.alerts.raise_(key, message.format(listed=listed), "agent-kit-sync status")
 
     def _write_settings(self, plan: Plan) -> None:
         wanted = {}
