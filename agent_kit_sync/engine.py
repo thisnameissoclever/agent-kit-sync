@@ -45,6 +45,7 @@ class LocalChange:
     copy_key: str = ""
     path: Optional[Path] = None
     new: Optional[bytes] = None
+    found: Optional[str] = None   # SHA-256 of the copy or block as it was on disk when the change was found
 
 
 def same_line_breaks(edited: bytes, written: Optional[bytes]) -> bytes:
@@ -206,9 +207,10 @@ class Engine:
 
     def refresh_signatures(self) -> None:
         """Save each installed copy's size and modification time, which the dispatcher compares cheaply."""
-        for entry in self.index.copies.values():
+        for copy_key, entry in self.index.copies.items():
             current = read_or_none(Path(entry["path"]))
-            entry["sig"] = stat_signature(entry["path"]) if current is not None and sha256(current) == entry["hash"] else None
+            same = current is not None and (sha256(current) == entry["hash"] or self._line_breaks_only(copy_key, entry, current))
+            entry["sig"] = stat_signature(entry["path"]) if same else None
 
     # ------------------------------------------------------------ crash recovery
 
@@ -264,11 +266,12 @@ class Engine:
             if current is None:
                 changes.append(LocalChange("delete", item_key, module, item, entry["app"], copy_key, path))
             elif sha256(current) != entry["hash"]:
+                found = sha256(current)
                 if entry.get("render_kind", "copy") != "copy":
                     current = same_line_breaks(current, self.index.rendered(copy_key))
                     if sha256(current) == entry["hash"]:
                         continue  # Only the line breaks changed, as an editor on Windows may do; nothing to carry back.
-                changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current))
+                changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current, found))
         changes += self._new_skill_files(known)
         for app, path in self._instruction_paths().items():
             text = read_or_none(path)
@@ -288,7 +291,8 @@ class Engine:
                 elif sha256(blocks[entry["key"]].encode("utf-8")) != entry["hash"]:
                     block = same_line_breaks(blocks[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
                     if sha256(block) != entry["hash"]:
-                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block))
+                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block,
+                                                   sha256(blocks[entry["key"]].encode("utf-8"))))
         for setting_key, entry in sorted(self.index.settings.items()):
             if entry.get("force") or (entry.get("held") and self.held.find(entry["held"])):
                 continue
@@ -397,9 +401,12 @@ class Engine:
             raise render.RenderError("this item comes with agent-kit-sync itself; put local changes in an override instead")
         for change in changes:
             if change.kind != "setting":
-                # The file as it is on disk, which can differ from change.new in its line breaks only.
-                on_disk = read_or_none(change.path) if change.kind == "edit" and change.path is not None else change.new
-                self.carried[change.copy_key] = sha256(on_disk) if on_disk is not None else None
+                # The copy as it was on disk when the change was found, which can differ from change.new in
+                # its line breaks only. A later read could see an edit saved since, and treat it as carried.
+                if change.found is not None:
+                    self.carried[change.copy_key] = change.found
+                else:
+                    self.carried[change.copy_key] = sha256(change.new) if change.new is not None else None
                 if change.new is not None:
                     self.carried_text[change.copy_key] = sha256(change.new)
         settings_changes = [c for c in changes if c.kind == "setting"]
@@ -1311,6 +1318,8 @@ class Engine:
                 del wanted[copy_key]
         seen_targets: Dict[Path, str] = {}
         journal = []
+        checked: Dict[str, Optional[str]] = {}   # copy key: the hash of the file when it was checked
+        rebased = False
         for copy in wanted.values():
             target = real(copy.path)
             if target in seen_targets:
@@ -1333,6 +1342,8 @@ class Engine:
                     # renders to that edit. Record it as the copy written here, so the next run
                     # compares the newer edit with the earlier one and not with the copy before both.
                     self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
+                    self._settled(copy.key)
+                    rebased = True
                 continue
             if current == copy.data:
                 if entry is None:
@@ -1340,31 +1351,49 @@ class Engine:
                     self._backup_unmanaged(copy, current, None)
                 if entry is None or entry["hash"] != sha256(copy.data):
                     self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
+                self._settled(copy.key)
                 continue
+            checked[copy.key] = sha256(current) if current is not None else None
             journal.append({"path": str(target), "hash": sha256(copy.data), "copy_key": copy.key, "index": self._copy_entry(copy), "rendered": True})
+        if rebased:
+            self.index.save()  # Rebased entries do not depend on a write, so a crash below must not lose them.
         self.journal.begin(journal)
         for record in journal:
             copy = wanted[record["copy_key"]]
             entry = self.index.copies.get(copy.key)
             current = read_or_none(copy.path)
+            if (sha256(current) if current is not None else None) != checked[copy.key]:
+                continue  # Changed since it was checked; the next run sees the change.
             self._backup_unmanaged(copy, current, entry)
             self.record.file(real(copy.path), current)
             try:
-                atomic_write(copy.path, copy.data, executable=copy.executable, expect=sha256(current) if current is not None else None)
+                atomic_write(copy.path, copy.data, executable=copy.executable, expect=checked[copy.key])
             except ChangedUnderneath:
                 continue
             self.index.put_copy(copy.key, record["index"], copy.data)
+            self._settled(copy.key)
             self.report.installed.append(copy.key)
         self.index.save()
         self.journal.finish()
         self._remove_stale(set(wanted), plan)
 
-    def _copy_line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
+    def _settled(self, key: str) -> None:
+        """Forget that this run carried `key` back, once the index records what is on disk for it or
+        what it was rebased to. A run installs twice, before and after it merges the remote, and the
+        second install must compare the file with what the first one wrote."""
+        self.carried.pop(key, None)
+        self.carried_text.pop(key, None)
+
+    def _line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
         """True when an installed copy differs from the one written only in its line breaks, which
-        find_local_changes does not count as an edit, so the copy can be replaced or removed."""
-        if copy_key in self.carried or entry.get("render_kind", "copy") == "copy":
+        find_local_changes does not count as an edit."""
+        if entry.get("render_kind", "copy") == "copy":
             return False
         return sha256(same_line_breaks(current, self.index.rendered(copy_key))) == entry["hash"]
+
+    def _copy_line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
+        """The same, for a copy this run did not carry back, so it can be replaced or removed."""
+        return copy_key not in self.carried and self._line_breaks_only(copy_key, entry, current)
 
     def _copy_entry(self, copy: Copy) -> dict:
         return {"path": str(copy.path), "app": copy.app, "item_key": f"{copy.module}/{copy.item}", "kind": copy.kind,
@@ -1484,6 +1513,12 @@ class Engine:
                 if found != expected:
                     desired[entry["key"]] = present[entry["key"]]
                     skip.add(entry["key"])
+            early = [block for block in by_app.get(app, []) if block.key in rebase and block.key in skip]
+            for block in early:
+                self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
+                self._settled(f"{app}|{block.key}")
+            if early:
+                self.index.save()  # These do not depend on the write below, so a failed write or a crash must not lose them.
             managed = [entry["key"] for entry in self.index.blocks.values() if entry["app"] == app] + list(desired)
             unwrap = []
             if self.restoring:
@@ -1510,6 +1545,7 @@ class Engine:
                 if block.key in skip and block.key not in rebase:
                     continue
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
+                self._settled(f"{app}|{block.key}")
             self.index.save()
             self.journal.finish()
 

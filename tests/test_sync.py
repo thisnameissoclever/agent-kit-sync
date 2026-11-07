@@ -1207,6 +1207,30 @@ class EditDuringRunTests(TwoMachines):
         self.assertIn("Read the whole draft and report every problem.", source)
         self.assertIn("Read the whole draft", a.read(".agents", "skills", "review", "SKILL.md"))
 
+    def test_edit_saved_before_its_item_is_carried_back_is_kept(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "skills", "review", "SKILL.md")
+        a.write(path, path.read_text().replace("report problems", "report every problem"))
+        from agent_kit_sync.engine import Engine
+        with a.env():
+            engine = Engine(a.layout)
+            carry_item = engine._carry_item
+
+            def edit_then_carry(module, item, changes):
+                if item.key == "writing/review":
+                    a.write(path, path.read_text(encoding="utf-8").replace("Read the draft", "Read the whole draft"))
+                return carry_item(module, item, changes)
+
+            engine._carry_item = edit_then_carry
+            engine.run()
+        self.assertIn("Read the whole draft and report every problem.", a.read(".claude", "skills", "review", "SKILL.md"))
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        source = (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text()
+        self.assertIn("Read the whole draft and report every problem.", source)
+
     def test_edit_during_a_run_that_carried_nothing_back_stays_an_edit(self):
         self.standard_config()
         a = self.machine("a")
@@ -1228,16 +1252,17 @@ class WindowsLineBreakTests(TwoMachines):
         path.write_bytes(data)
         st = path.stat()
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        return data
 
     def test_instruction_file_saved_with_crlf_still_gets_updates(self):
         self.standard_config()
         a, b = self.machine("a"), self.machine("b")
         a.sync()
         b.sync()
-        self.save_with_crlf(a.path(".claude", "CLAUDE.md"))
+        saved = self.save_with_crlf(a.path(".claude", "CLAUDE.md"))
         _engine, report = a.sync()
         self.assertEqual(report.edits, [])
-        self.assertIn(b"\r\n", a.path(".claude", "CLAUDE.md").read_bytes())  # Nothing to update, so it stays as saved.
+        self.assertEqual(a.path(".claude", "CLAUDE.md").read_bytes(), saved)  # Nothing to update, so it stays as saved.
         path = b.path(".claude", "CLAUDE.md")
         b.write(path, path.read_text().replace("Write plainly.", "Write plainly and briefly."))
         b.sync()
@@ -1252,10 +1277,10 @@ class WindowsLineBreakTests(TwoMachines):
         a, b = self.machine("a"), self.machine("b")
         a.sync()
         b.sync()
-        self.save_with_crlf(a.path(".claude", "agents", "helper.md"))
+        saved = self.save_with_crlf(a.path(".claude", "agents", "helper.md"))
         _engine, report = a.sync()
         self.assertEqual(report.edits, [])
-        self.assertIn(b"\r\n", a.path(".claude", "agents", "helper.md").read_bytes())  # Nothing to update, so it stays as saved.
+        self.assertEqual(a.path(".claude", "agents", "helper.md").read_bytes(), saved)  # Nothing to update, so it stays as saved.
         path = b.path(".claude", "agents", "helper.md")
         b.write(path, path.read_text().replace("Help with the task.", "Help carefully."))
         b.sync()
@@ -1280,6 +1305,58 @@ class WindowsLineBreakTests(TwoMachines):
         self.assertEqual(report.errors, [])
         self.assertFalse(a.path(".claude", "agents", "helper.md").exists())
         self.assertIn("claude|writing/helper|agents/helper.md", report.removed)
+
+    def test_copy_left_with_crlf_does_not_start_a_sync_at_every_stop(self):
+        from agent_kit_sync.dispatch import copies_changed
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        self.save_with_crlf(a.path(".claude", "agents", "helper.md"))
+        a.sync()
+        index = json.loads((a.layout.state / "index.json").read_text(encoding="utf-8"))
+        self.assertFalse(copies_changed(index))
+
+    def test_crlf_save_with_a_real_edit_is_carried_back(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        self.save_with_crlf(path)
+        a.write(path, path.read_text(encoding="utf-8", newline="").replace("Help with the task.", "Help carefully."))
+        self.assertIn(b"\r\n", path.read_bytes())
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertEqual(report.edits, ["writing/helper"])
+        source = (a.layout.config / "modules/writing/agents/helper.md").read_bytes()
+        self.assertIn(b"Help carefully.", source)
+        self.assertNotIn(b"\r", source)
+
+    def test_crlf_block_edit_and_an_incoming_change_both_arrive_in_one_run(self):
+        self.standard_config()
+        source_path = self.seed / "modules/writing/sections/plain.md"
+        lines = "".join(f"Line {n}.\n" for n in range(1, 9))
+        source_path.write_text(source_path.read_text(encoding="utf-8") + lines, encoding="utf-8")
+        git(self.seed, "commit", "-qam", "longer section")
+        git(self.seed, "push", "-q")
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        other = b.path(".claude", "CLAUDE.md")
+        b.write(other, other.read_text().replace("Line 8.", "Line eight."))
+        b.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        self.save_with_crlf(path)
+        a.write(path, path.read_text(encoding="utf-8", newline="").replace("Write plainly.", "Write plainly and briefly."))
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        text = a.read(".claude", "CLAUDE.md")
+        self.assertIn("Write plainly and briefly.", text)
+        self.assertIn("Line eight.", text)
+        _engine, report = a.sync()
+        self.assertEqual(report.edits, [])
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_bytes()
+        self.assertIn(b"Write plainly and briefly.", source)
+        self.assertNotIn(b"\r", source)
 
 
 if __name__ == "__main__":
