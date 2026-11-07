@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -1262,6 +1263,7 @@ class Engine:
         self._write_copies(plan)
         self._write_sections(plan)
         self.index.save()
+        self.write_cursor_rules(plan)
         self._write_settings(plan)
         self.index.save()
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
@@ -1481,6 +1483,70 @@ class Engine:
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
             self.index.save()
             self.journal.finish()
+
+    def write_cursor_rules(self, plan: Plan, everything_removed: bool = False) -> None:
+        """Write Cursor's rule files from the sections meant for Cursor. They are output only: nothing
+        in them is carried back, so no state of Cursor's rules folder can change the config repo, and
+        a problem with them raises an alert instead of stopping the run."""
+        try:
+            self._write_cursor_rules(plan, everything_removed)
+        except Exception as error:  # noqa: BLE001 - Cursor's output must never stop a sync.
+            self.alerts.raise_("cursor-rules", f"agent-kit-sync could not write Cursor's rule files: {error}", "agent-kit-sync status")
+
+    def _write_cursor_rules(self, plan: Plan, everything_removed: bool) -> None:
+        from . import cursor_rules
+        folder = Path.home() / ".cursor" / "rules"   # The folder Cursor reads; it has no setting to move it.
+        backups = self.layout.state / "backups" / "cursor-rules"
+        if "cursor" not in self.machine.apps or everything_removed:
+            # Cursor left this machine, or agent-kit-sync is being removed: take only its own files away.
+            outcome = cursor_rules.write_rules(folder, [], set(), backups)
+            for key in ("cursor-rules", "cursor-rule-import", "cursor-rule-size", "cursor-rule-foreign"):
+                self.alerts.close(key)
+            self._close_edited_notice()
+            if outcome.backed_up:
+                self._alert_list("cursor-rule-edited", outcome.backed_up, "agent-kit-sync removed its Cursor rule files, and saved the ones that had been edited as: {listed}")
+            if outcome.errors:
+                self._alert_list("cursor-rules", outcome.errors, "agent-kit-sync could not remove some of its Cursor rule files: {listed}")
+            return
+        support = {str(copy.path): copy.data for copy in plan.copies if copy.app == "kit" and copy.kind == "file"}
+        failed = set(plan.failed)
+        for entry in self.index.copies.values():
+            # A failed module keeps its earlier installed files; a section importing one still gets its text.
+            if entry.get("app") == "kit" and entry.get("kind") == "file" and entry.get("item_key", "").split("/", 1)[0] in failed:
+                path = Path(entry["path"])
+                try:
+                    data = read_or_none(path)
+                except OSError:
+                    data = None
+                if data is not None:
+                    support.setdefault(str(path), data)
+        blocks = [b for b in plan.cursor_blocks if not self.frozen(f"{b[0]}/{b[1]}")]
+        planned = cursor_rules.plan_rules(blocks, support)
+        # A module that failed this run, or an item with a held edit, keeps its rule files as they are.
+        keep = {(module, item) for module, item in cursor_rules.owners(folder) if module in failed or self.frozen(f"{module}/{item}")}
+        outcome = cursor_rules.write_rules(folder, planned.rules, keep, backups)
+        self._alert_list("cursor-rule-import", planned.unmatched + planned.unreadable, "Cursor does not follow @path lines, and these lines in synced sections name no file agent-kit-sync installs as text, so Cursor gets the bare line: {listed}. Install the file with a [[files]] item, or write its text into the section.")
+        self._alert_list("cursor-rule-size", planned.oversized, f"Cursor reads only the first {cursor_rules.RULE_LIMIT:,} bytes of a rule, and these rule files are still larger after splitting: {{listed}}. Shorten the section's longest paragraph.")
+        self._alert_list("cursor-rule-foreign", outcome.foreign, "agent-kit-sync did not write these Cursor rule files, because a file it did not write is at the same name: {listed}. Rename the file, then run agent-kit-sync sync.")
+        self._alert_list("cursor-rules", outcome.errors, "agent-kit-sync could not write some of Cursor's rule files: {listed}")
+        if outcome.backed_up:
+            self._alert_list("cursor-rule-edited", outcome.backed_up, "Cursor's rule files are written by agent-kit-sync and never carried back, so edits in them were replaced. Make the change in CLAUDE.md, AGENTS.md, or the installed file instead. The edited files were saved as: {listed}")
+        else:
+            self._close_edited_notice()
+
+    def _close_edited_notice(self) -> None:
+        """The notice of replaced edits stays a day, so every app's next session shows it, then closes."""
+        for alert in self.alerts.open():
+            if alert.get("key") == "cursor-rule-edited" and time.time() - float(alert.get("time", 0)) > 86400:
+                self.alerts.close("cursor-rule-edited")
+
+    def _alert_list(self, key: str, items: List[str], message: str) -> None:
+        if not items:
+            self.alerts.close(key)
+            return
+        unique = sorted(set(items))
+        listed = ", ".join(unique[:5]) + (f", and {len(unique) - 5} more" if len(unique) > 5 else "")
+        self.alerts.raise_(key, message.format(listed=listed), "agent-kit-sync status")
 
     def _write_settings(self, plan: Plan) -> None:
         wanted = {}

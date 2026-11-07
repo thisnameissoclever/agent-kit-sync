@@ -87,6 +87,7 @@ class Plan:
     skipped: Dict[str, str] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     failed: List[str] = field(default_factory=list)   # modules that could not be rendered
+    cursor_blocks: List[Tuple[str, str, str]] = field(default_factory=list)   # (module, item, text) of each section for Cursor
 
     def instruction_files(self, machine: Machine) -> Dict[str, Path]:
         return {app: machine.app_homes[app] / name for app, name in INSTRUCTION_FILES.items() if app in machine.apps}
@@ -254,12 +255,12 @@ class Planner:
             if reason is not None:
                 plan.skipped[module.name] = reason
                 continue
-            before = (len(plan.copies), len(plan.sections), len(plan.settings), len(plan.hooks))
+            before = (len(plan.copies), len(plan.sections), len(plan.settings), len(plan.hooks), len(plan.cursor_blocks))
             try:
                 self._module(plan, module, order)
             except (render.RenderError, OSError, ValueError, UnicodeDecodeError) as error:
                 # Drop whatever this module planned, so the engine keeps its previous copies.
-                del plan.copies[before[0]:], plan.sections[before[1]:], plan.settings[before[2]:], plan.hooks[before[3]:]
+                del plan.copies[before[0]:], plan.sections[before[1]:], plan.settings[before[2]:], plan.hooks[before[3]:], plan.cursor_blocks[before[4]:]
                 plan.errors.append(f"module {module.name}: {error}")
                 plan.failed.append(module.name)
                 plan.skipped[module.name] = f"error: {error}"
@@ -323,7 +324,7 @@ class Planner:
     def _section(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
         prepend, append, replace = self._local_text(module.name, item.name)
         for app in apps:
-            if app not in INSTRUCTION_FILES:
+            if app != "cursor" and app not in INSTRUCTION_FILES:
                 continue
             rel = dict(item.data.get("variants", {})).get(app, item.data["file"])
             raw = replace if replace is not None else tree.read(rel)
@@ -333,7 +334,11 @@ class Planner:
             from .sections import with_local
             if prepend is not None or append is not None:
                 text = with_local(text, prepend, append)
-            plan.sections.append(SectionBlock(app, item.key, module.name, item.name, rel, text, module.local))
+            if app == "cursor":
+                # Cursor reads rule files, written as output only; see cursor_rules.
+                plan.cursor_blocks.append((module.name, item.name, text))
+            else:
+                plan.sections.append(SectionBlock(app, item.key, module.name, item.name, rel, text, module.local))
 
     def _skill(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
         rel_dir = item.data["dir"].rstrip("/")

@@ -375,6 +375,11 @@ def stdout(event: str, out: bytes, state: str, session: str, sent: Optional[dict
             data = None
     # The dispatcher's own answer is always JSON or empty.
     data = answer(event, data, state, session, sent) if isinstance(data, dict) else {}
+    if event == "session_start":
+        pointer = rules_pointer(sent or {})
+        if pointer:
+            context = data.get("additional_context")
+            data["additional_context"] = pointer + ("\n\n" + context if isinstance(context, str) and context else "")
     return finish(event, data, state, session)
 
 
@@ -387,3 +392,39 @@ def finish(event: str, data: dict, state: str, session: str) -> bytes:
         if isinstance(specific, dict) and isinstance(specific.get("additionalContext"), str):
             specific["additionalContext"] = data["additional_context"]
     return json.dumps(data).encode("utf-8")
+
+
+# ------------------------------------------------------------------ rules outside the user folder
+
+
+def _inside(path: str, folder: str) -> bool:
+    """True when `path` is `folder` or inside it, compared as written and with links resolved. Cursor walks
+    up the folders of the path it opened, so a link into the user folder counts as inside either way."""
+    for resolve in (os.path.abspath, os.path.realpath):
+        try:
+            a, b = os.path.normcase(resolve(path)), os.path.normcase(resolve(folder))
+            if os.path.commonpath([a, b]) == b:
+                return True
+        except ValueError:
+            continue  # On Windows, a path on another drive.
+    return False
+
+
+def rules_pointer(payload: dict) -> str:
+    """Cursor loads the rule files in <user folder>/.cursor/rules only for a workspace inside the user
+    folder. When no workspace folder is inside it, such as a project on another drive, tell the agent to
+    read them."""
+    roots = [native_root(root) for root in payload.get("workspace_roots") or [] if isinstance(root, str) and root]
+    home = os.path.expanduser("~")
+    if not roots or any(_inside(root, home) for root in roots):
+        return ""
+    folder = os.path.join(home, ".cursor", "rules")  # The folder Cursor reads; it has no setting to move it.
+    try:
+        files = sorted(os.path.join(folder, name) for name in os.listdir(folder) if name.startswith("agent-kit-sync--") and name.endswith(".mdc"))
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    listed = "\n".join(f"- {path}" for path in files)
+    return (f"This workspace ({', '.join(roots)}) is outside {home}, so Cursor did not load the user's rule files from {folder}. "
+            f"Read each of these files in full before you start, and follow them as you would follow a rule Cursor loaded:\n{listed}")

@@ -405,5 +405,64 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
+class RulesPointerTests(unittest.TestCase):
+    """Cursor loads <user folder>/.cursor/rules only for a workspace inside the user folder."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".cursor" / "rules").mkdir(parents=True)
+        (self.home / ".cursor" / "rules" / "agent-kit-sync--writing--rules.mdc").write_text("---\nalwaysApply: true\n---\n\nRule.\n", encoding="utf-8")
+        (self.home / ".cursor" / "rules" / "mine.mdc").write_text("Not ours.\n", encoding="utf-8")
+        self.inside = self.home / "project"
+        self.inside.mkdir()
+        self.outside = self.tmp / "elsewhere"
+        self.outside.mkdir()
+        self.saved = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = str(self.home)
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        remove_tree(self.tmp)
+
+    def start(self, root, context=None):
+        out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}} if context else {}
+        sent = cursor.to_claude("session_start", cursor_payload("sessionStart", workspace_roots=[str(root)]))
+        return json.loads(cursor.stdout("session_start", json.dumps(out).encode(), str(self.tmp / "state"), "s", sent))
+
+    def test_a_workspace_outside_the_user_folder_is_told_to_read_the_rules(self):
+        text = self.start(self.outside, "Other context.")["additional_context"]
+        self.assertIn(str(self.home / ".cursor" / "rules" / "agent-kit-sync--writing--rules.mdc"), text)
+        self.assertNotIn("mine.mdc", text)
+        self.assertTrue(text.endswith("Other context."))
+
+    def test_a_workspace_inside_the_user_folder_gets_nothing_extra(self):
+        self.assertEqual(self.start(self.inside), {})
+        self.assertEqual(self.start(self.inside, "Other context.")["additional_context"], "Other context.")
+
+    def test_a_workspace_with_one_root_inside_gets_nothing(self):
+        out = {}
+        sent = cursor.to_claude("session_start", cursor_payload("sessionStart", workspace_roots=[str(self.outside), str(self.inside)]))
+        self.assertEqual(json.loads(cursor.stdout("session_start", json.dumps(out).encode(), str(self.tmp / "state"), "s", sent)), {})
+
+    def test_a_link_into_the_user_folder_counts_as_inside(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symbolic links")
+        link = self.home / "linked"
+        try:
+            os.symlink(self.outside, link, target_is_directory=True)
+        except OSError:
+            self.skipTest("cannot create symbolic links here")
+        self.assertEqual(self.start(link), {})
+
+    def test_no_rule_files_means_no_pointer(self):
+        remove_tree(self.home / ".cursor" / "rules")
+        self.assertEqual(self.start(self.outside), {})
+
+
 if __name__ == "__main__":
     unittest.main()
