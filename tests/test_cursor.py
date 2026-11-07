@@ -99,7 +99,7 @@ class TranslationTests(unittest.TestCase):
 
     def test_a_write_to_an_existing_file_reads_as_an_edit(self):
         target = self.project / "notes.md"
-        target.write_text("old text\n", encoding="utf-8")
+        target.write_bytes(b"old text\n")
         out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Write", tool_input={"file_path": str(target), "content": "old text\nnew line\n"}))
         self.assertEqual(out["tool_name"], "Edit")
         self.assertEqual(out["tool_input"], {"file_path": str(target), "old_string": "old text\n", "new_string": "old text\nnew line\n"})
@@ -108,6 +108,13 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(new["tool_name"], "Write")
         after = cursor.to_claude("post_tool_use", cursor_payload("postToolUse", tool_name="Write", tool_input={"file_path": str(target), "content": "y"}))
         self.assertEqual(after["tool_name"], "Write")
+        # A file with Windows line breaks, written back with plain ones, shows only the real change.
+        target.write_bytes(b"one\r\ntwo\r\n")
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Write", tool_input={"file_path": str(target), "content": "one\ntwo\nthree\n"}))
+        self.assertEqual(out["tool_input"]["old_string"], "one\ntwo\n")
+        # The same line breaks on both sides are kept as they are.
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Write", tool_input={"file_path": str(target), "content": "one\r\ntwo\r\nthree\r\n"}))
+        self.assertEqual(out["tool_input"]["old_string"], "one\r\ntwo\r\n")
 
     def test_transcript_becomes_claude_codes_format(self):
         source = self.tmp / "cursor.jsonl"
@@ -206,7 +213,7 @@ class TranslationTests(unittest.TestCase):
 
     def test_a_changed_edit_goes_back_to_cursor_as_a_whole_write(self):
         target = self.project / "notes.md"
-        target.write_text("one\ntwo\n", encoding="utf-8")
+        target.write_bytes(b"one\ntwo\n")
         sent = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Write", tool_input={"file_path": str(target), "content": "one\ntwo\nthree\n"}))
         changed = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                           "updatedInput": {"file_path": str(target), "old_string": "one\ntwo\n", "new_string": "one\ntwo\n3\n"}}}

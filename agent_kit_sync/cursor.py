@@ -138,6 +138,9 @@ def edit_of_existing_file(tool_input: dict) -> Optional[dict]:
             old = handle.read(MAX_EDITED_FILE + 1).decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    if "\r\n" in old and "\r\n" not in content:
+        # The new text uses plain line breaks; compare like with like, or every line would look new.
+        old = old.replace("\r\n", "\n")
     return {"file_path": path, "old_string": old, "new_string": content}
 
 
