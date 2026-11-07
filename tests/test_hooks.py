@@ -277,7 +277,7 @@ class DispatchUnitTests(unittest.TestCase):
         self.assertEqual(dispatch.tool_kind("claude", "Bash"), "shell")
         self.assertEqual(dispatch.tool_kind("codex", "apply_patch"), "write")
         self.assertEqual(dispatch.tool_kind("claude", "mcp__x__y"), "mcp")
-        self.assertEqual(dispatch.matcher_for("claude", ["shell"]), "^(?:Bash|PowerShell)$")
+        self.assertEqual(dispatch.matcher_for("claude", ["shell"]), "^(?:Bash|PowerShell|Shell)$")
         self.assertEqual(dispatch.matcher_for("claude", []), "*")
 
     def test_closed_failure_blocks_and_open_failure_warns(self):
@@ -436,7 +436,7 @@ class InstalledToolTests(TwoMachines):
         events = sorted(settings["hooks"])
         self.assertEqual(events, ["PostToolUse", "PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
         pre = settings["hooks"]["PreToolUse"][0]
-        self.assertEqual(pre["matcher"], "^(?:Bash|PowerShell)$")
+        self.assertEqual(pre["matcher"], "^(?:Bash|PowerShell|Shell)$")
         handler = pre["hooks"][0]
         # One command string, so a program that keeps only type and command keeps a working entry.
         self.assertIn(sorted(handler), (["command", "timeout", "type"], ["command", "shell", "timeout", "type"]))

@@ -54,8 +54,8 @@ def needed(hooks: List[dict], app: str) -> Dict[str, dict]:
                     entry["matcher"] = "*"
                     entry["names"] = set()
                 else:
-                    import re
-                    entry["names"] |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_.*]*", match[4:-2]))
+                    # matcher_for writes ^(?:NAME|NAME)$; a name may hold regex characters, such as MCP:.*
+                    entry["names"] |= set(match[4:-2].split("|"))
                     entry["matcher"] = "^(?:" + "|".join(sorted(entry["names"])) + ")$"
             else:
                 entry["matcher"] = "*"

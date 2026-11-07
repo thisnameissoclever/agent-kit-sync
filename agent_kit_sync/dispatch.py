@@ -23,12 +23,17 @@ APP_TOOLS = {
                "search": ["Grep", "Glob"], "web": ["WebFetch", "WebSearch"], "task": ["Agent", "Task"], "mcp": ["mcp__.*"]},
     "codex": {"shell": ["Bash"], "read": [], "write": ["apply_patch"], "edit": ["apply_patch"], "search": [], "web": [], "task": ["Agent"], "mcp": ["mcp__.*"]},
 }
+# Cursor runs Claude Code's entries and tests each matcher as a regular expression against its own
+# tool names, so a Claude Code matcher also lists these. Cursor reports every file edit as Write, and
+# an MCP tool as MCP:<tool name>. Claude Code's own Write then also matches an edit hook's matcher;
+# the tool-kind filter in main() still runs only the hooks for the tool that was used.
+CURSOR_TOOLS = {"shell": ["Shell"], "edit": ["Write"], "mcp": ["MCP:.*"]}
 WRITE_TOOLS = {"claude": ["Write", "Edit", "MultiEdit", "NotebookEdit"], "codex": ["apply_patch"]}
 CLAUDE_MIN_ON_FAILURE = (2, 1, 295)
 
 
 def tool_kind(app: str, name: str) -> str:
-    if name.startswith("mcp__"):
+    if name.startswith(("mcp__", "MCP:")):
         return "mcp"
     for kind, names in APP_TOOLS.get(app, {}).items():
         if name in names:
@@ -45,6 +50,8 @@ def matcher_for(app: str, tools) -> str:
     names = []
     for kind in tools:
         names.extend(APP_TOOLS.get(app, {}).get(kind, []))
+        if app == "claude":
+            names.extend(CURSOR_TOOLS.get(kind, []))
     names = sorted(set(names))
     return "^(?:" + "|".join(names) + ")$" if names else "*"
 
@@ -53,8 +60,11 @@ def matcher_for(app: str, tools) -> str:
 
 
 def caller(app: str, payload: dict) -> str:
-    """Cursor runs Claude Code's entries; report the app that actually called."""
-    if app == "claude" and ("cursor_version" in payload or os.environ.get("CURSOR_VERSION")):
+    """Cursor runs Claude Code's entries and puts cursor_version in every hook's input; report the app that actually called.
+
+    The environment is not used: Claude Code started from a terminal inside Cursor inherits Cursor's variables.
+    """
+    if app == "claude" and isinstance(payload, dict) and "cursor_version" in payload:
         return "cursor"
     return app
 
@@ -187,7 +197,7 @@ def combine(app: str, event: str, results) -> Combined:
             if text and event in ("session_start", "user_prompt"):
                 out.context.append(text)
             continue
-        specific = data.get("hookSpecificOutput") or {}
+        specific = data.get("hookSpecificOutput") if isinstance(data.get("hookSpecificOutput"), dict) else {}
         permission = specific.get("permissionDecision")
         if permission in ("deny", "ask", "allow"):
             out.note_decision(permission, str(specific.get("permissionDecisionReason", "")) if permission != "allow" else "")
@@ -370,6 +380,28 @@ def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny:
     return 0, json.dumps(data).encode("utf-8"), stderr, alerts
 
 
+def without_transcripts(payload: dict) -> dict:
+    """Cursor's input without its transcripts, which a hook expecting Claude Code's format would misread."""
+    return {key: value for key, value in payload.items() if key not in ("transcript_path", "agent_transcript_path")}
+
+
+def cursor_fallback(event: str, combined: Combined) -> bytes:
+    """The hooks' decision in Cursor's fields, for when the full translation of the answer fails."""
+    reason = "\n".join(r for r in combined.reasons if isinstance(r, str) and r) or "A hook refused this."
+    answer = {}
+    if event == "pre_tool_use" and combined.updated_input is not None and combined.decision not in ("deny", "ask"):
+        # A hook changed the input, and the change could not be passed on; running the original would ignore the hook.
+        reason = "A hook changed this tool call, and agent-kit-sync could not pass the change to Cursor, so the call was refused. Try it again."
+        answer = {"permission": "deny", "agent_message": reason, "user_message": reason}
+    elif event == "pre_tool_use" and combined.decision in ("deny", "ask"):
+        answer = {"permission": "deny", "agent_message": reason, "user_message": reason}
+    elif event == "user_prompt" and combined.decision in ("deny", "continue"):
+        answer = {"continue": False, "user_message": reason}
+    elif event in ("stop", "subagent_stop") and combined.decision in ("deny", "continue"):
+        answer = {"followup_message": reason}
+    return json.dumps(answer).encode("utf-8")
+
+
 def main(layout_root, launcher, app: str, event: str) -> int:
     layout_root = str(layout_root)
     raw = sys.stdin.buffer.read() if not sys.stdin.isatty() else b""
@@ -378,18 +410,42 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     except ValueError:
         payload = {}
     state = os.path.join(layout_root, "state")
+    calling = caller(app, payload)
+    if calling == "cursor":
+        # Cursor sends its own input; every hook gets the input Claude Code would have sent. Each step
+        # falls back instead of failing, because a dispatcher that crashes runs no hook at all.
+        from . import cursor
+        try:
+            payload = cursor.to_claude(event, payload)
+        except Exception:
+            # Keep at least Claude Code's event and tool names, which hooks check first.
+            payload = dict(without_transcripts(payload), hook_event_name=APP_EVENTS["claude"].get(event, payload.get("hook_event_name")))
+            name = payload.get("tool_name")
+            if isinstance(name, str):
+                payload["tool_name"] = cursor.TOOL_NAMES.get(name, name)
+        if event == "session_start":
+            try:
+                cursor.remove_old(state)
+            except Exception:
+                pass
     try:
         with open(os.path.join(state, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
     except (OSError, ValueError):
         index = {}
     hooks = [h for h in index.get("hooks", []) if event in h.get("events", [])]
-    calling = caller(app, payload)
     hooks = [h for h in hooks if not h.get("apps") or calling in h["apps"] or (calling == "cursor" and "claude" in h["apps"])]
     if event in ("pre_tool_use", "post_tool_use"):
         kind = tool_kind(app, str(payload.get("tool_name", "")))
         hooks = [h for h in hooks if not h.get("tools") or kind in h["tools"]]
     hooks.sort(key=lambda h: (h.get("order", 0), h.get("name", "")))
+    if calling == "cursor":
+        if hooks:
+            try:
+                payload = cursor.with_transcripts(payload, state)
+            except Exception:
+                payload = without_transcripts(payload)
+        raw = json.dumps(payload).encode("utf-8")
     results = []
     if hooks:
         from concurrent.futures import ThreadPoolExecutor
@@ -400,10 +456,12 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
     fresh = []
-    if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop"):
+    # Cursor shows nothing a hook says when the agent stops, so an alert waits for a later event.
+    if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop"):
         fresh = unseen_alerts(state, session)
     cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
-    passed = pass_through(app, event, results, fresh, cursor_ask_is_deny)
+    # Cursor gets every answer through emit(), so cursor.stdout() reads one shape, not exit code 2 or plain text.
+    passed = None if calling == "cursor" else pass_through(app, event, results, fresh, cursor_ask_is_deny)
     if passed is None:
         combined = combine(app, event, results)
         user, context = alert_lines(event, fresh)
@@ -428,6 +486,12 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         err = lone["stderr"] if lone and lone["hook"].get("protocol", "native") == "native" and not failed(lone) else b""
     else:
         code, out, err, delivered = passed
+    if calling == "cursor":
+        try:
+            out = cursor.stdout(event, out, state, session, payload)
+        except Exception:
+            out = cursor_fallback(event, combined)
+            delivered = []  # The fallback answer carries no alerts; show them at a later event.
     if session:
         mark_shown(state, session, delivered)
     if err:
