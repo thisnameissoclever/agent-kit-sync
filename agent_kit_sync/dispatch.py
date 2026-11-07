@@ -23,12 +23,16 @@ APP_TOOLS = {
                "search": ["Grep", "Glob"], "web": ["WebFetch", "WebSearch"], "task": ["Agent", "Task"], "mcp": ["mcp__.*"]},
     "codex": {"shell": ["Bash"], "read": [], "write": ["apply_patch"], "edit": ["apply_patch"], "search": [], "web": [], "task": ["Agent"], "mcp": ["mcp__.*"]},
 }
+# Cursor runs Claude Code's entries and tests each matcher as a regular expression against its own
+# tool names, so a Claude Code matcher also lists these. Claude Code has no tools by these names.
+# Cursor reports every file edit as Write, and an MCP tool as MCP:<tool name>.
+CURSOR_TOOLS = {"shell": ["Shell"], "edit": ["Write"], "mcp": ["MCP:.*"]}
 WRITE_TOOLS = {"claude": ["Write", "Edit", "MultiEdit", "NotebookEdit"], "codex": ["apply_patch"]}
 CLAUDE_MIN_ON_FAILURE = (2, 1, 295)
 
 
 def tool_kind(app: str, name: str) -> str:
-    if name.startswith("mcp__"):
+    if name.startswith(("mcp__", "MCP:")):
         return "mcp"
     for kind, names in APP_TOOLS.get(app, {}).items():
         if name in names:
@@ -45,6 +49,8 @@ def matcher_for(app: str, tools) -> str:
     names = []
     for kind in tools:
         names.extend(APP_TOOLS.get(app, {}).get(kind, []))
+        if app == "claude":
+            names.extend(CURSOR_TOOLS.get(kind, []))
     names = sorted(set(names))
     return "^(?:" + "|".join(names) + ")$" if names else "*"
 
@@ -53,8 +59,11 @@ def matcher_for(app: str, tools) -> str:
 
 
 def caller(app: str, payload: dict) -> str:
-    """Cursor runs Claude Code's entries; report the app that actually called."""
-    if app == "claude" and ("cursor_version" in payload or os.environ.get("CURSOR_VERSION")):
+    """Cursor runs Claude Code's entries and puts cursor_version in every hook's input; report the app that actually called.
+
+    The environment is not used: Claude Code started from a terminal inside Cursor inherits Cursor's variables.
+    """
+    if app == "claude" and isinstance(payload, dict) and "cursor_version" in payload:
         return "cursor"
     return app
 
@@ -378,18 +387,28 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     except ValueError:
         payload = {}
     state = os.path.join(layout_root, "state")
+    calling = caller(app, payload)
+    if calling == "cursor":
+        # Cursor sends its own input; every hook gets the input Claude Code would have sent.
+        from . import cursor
+        payload = cursor.to_claude(event, payload)
+        if event == "session_start":
+            cursor.remove_old(state)
     try:
         with open(os.path.join(state, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
     except (OSError, ValueError):
         index = {}
     hooks = [h for h in index.get("hooks", []) if event in h.get("events", [])]
-    calling = caller(app, payload)
     hooks = [h for h in hooks if not h.get("apps") or calling in h["apps"] or (calling == "cursor" and "claude" in h["apps"])]
     if event in ("pre_tool_use", "post_tool_use"):
         kind = tool_kind(app, str(payload.get("tool_name", "")))
         hooks = [h for h in hooks if not h.get("tools") or kind in h["tools"]]
     hooks.sort(key=lambda h: (h.get("order", 0), h.get("name", "")))
+    if calling == "cursor":
+        if hooks:
+            payload = cursor.with_transcripts(payload, state)
+        raw = json.dumps(payload).encode("utf-8")
     results = []
     if hooks:
         from concurrent.futures import ThreadPoolExecutor
@@ -400,7 +419,8 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
     fresh = []
-    if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop"):
+    # Cursor shows nothing a hook says when the agent stops, so an alert waits for the next session.
+    if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop"):
         fresh = unseen_alerts(state, session)
     cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
     passed = pass_through(app, event, results, fresh, cursor_ask_is_deny)
@@ -428,6 +448,8 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         err = lone["stderr"] if lone and lone["hook"].get("protocol", "native") == "native" and not failed(lone) else b""
     else:
         code, out, err, delivered = passed
+    if calling == "cursor" and code == 0:
+        out = cursor.stdout(event, out, state, session, payload)
     if session:
         mark_shown(state, session, delivered)
     if err:
