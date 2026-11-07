@@ -33,8 +33,9 @@ MAX_TRANSCRIPT = 4_000_000
 MAX_EDITED_FILE = 1_000_000
 # Translated transcripts and full context texts older than this are removed when a Cursor session starts.
 KEEP_SECONDS = 7 * 24 * 3600
-# An older copy of a transcript is removed only after this long, so a hook that was handed it can still read it.
-SUPERSEDED_SECONDS = 600
+# A copy of a transcript not handed to a hook for this long is removed when a newer copy is written. It is
+# longer than any hook's timeout, so a hook that was handed a copy can still read it.
+SUPERSEDED_SECONDS = 120
 
 
 def native_root(root: str, windows: bool = os.name == "nt") -> str:
@@ -73,8 +74,13 @@ def to_claude(event: str, payload: dict) -> dict:
             if out["tool_name"] == "Bash":
                 # The shell command's own folder, which first-use-review and others run git and gh in.
                 folder = tool_input.get("cwd") or tool_input.get("working_directory")
-                if isinstance(folder, str) and folder and os.path.isdir(folder):
-                    out["cwd"] = folder
+                if isinstance(folder, str) and folder:
+                    folder = native_root(folder)
+                    base = out.get("cwd") if isinstance(out.get("cwd"), str) else None
+                    if not os.path.isabs(folder) and base:
+                        folder = os.path.join(base, folder)
+                    if os.path.isabs(folder) and os.path.isdir(folder):
+                        out["cwd"] = os.path.abspath(folder)
             if event == "pre_tool_use" and out["tool_name"] == "Write":
                 as_edit = edit_of_existing_file(out["tool_input"])
                 if as_edit is not None:
@@ -176,7 +182,8 @@ def translate_transcript(source: str, folder: str) -> Optional[str]:
 
     Each version of the transcript, by its size and time, gets its own copy, so a copy is never
     replaced while a hook reads it; Windows refuses to replace a file another program has open.
-    A new copy removes the older copies of the same transcript once they are ten minutes old.
+    Handing out a copy refreshes its time, and a new copy removes the older copies of the same
+    transcript that no hook was handed for two minutes.
     """
     try:
         info = os.stat(source)
@@ -186,6 +193,10 @@ def translate_transcript(source: str, folder: str) -> Optional[str]:
     version = hashlib.sha256(f"{info.st_size} {info.st_mtime_ns}".encode("utf-8")).hexdigest()[:12]
     target = os.path.join(folder, f"{name}-{version}.jsonl")
     if os.path.isfile(target):
+        try:
+            os.utime(target)
+        except OSError:
+            pass
         return target
     try:
         with open(source, "rb") as stream:
@@ -251,7 +262,7 @@ def remove_old(state: str) -> None:
 
 def _length(text: str) -> int:
     """The text's length as JavaScript counts it: a character outside the Basic Multilingual Plane is two."""
-    return len(text) + sum(1 for character in text if ord(character) > 0xFFFF)
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def bounded_context(text: str, state: str, session: str, event: str) -> str:
@@ -334,9 +345,17 @@ def answer(event: str, data: dict, state: str, session: str, sent: Optional[dict
         if data.get("decision") == "block" and reason:
             context = reason + ("\n\n" + context if context else "")
     notice = data.get("systemMessage")
-    if isinstance(notice, str) and notice.strip() and notice not in context and not (data.get("agent_message") and data["agent_message"] in notice):
-        # Claude Code shows systemMessage to the user; Cursor shows nothing, so the agent is told.
-        context = (context + "\n\n" if context else "") + NOTICE + notice
+    if isinstance(notice, str) and notice.strip():
+        # Claude Code shows systemMessage to the user. Cursor shows the user only the message of a refused
+        # tool call or prompt, so a notice goes there when there is one, and to the agent otherwise.
+        said = "\n".join(str(data.get(key) or "") for key in ("agent_message", "user_message")) + "\n" + context
+        lines = [line for line in notice.splitlines() if line.strip() and not any(line.strip() in part or part in line for part in said.splitlines() if part.strip())]
+        if lines:
+            refused = data.get("permission") == "deny" or data.get("continue") is False
+            if refused:
+                data["user_message"] = (str(data["user_message"]) + "\n" if data.get("user_message") else "") + "\n".join(lines)
+            else:
+                context = (context + "\n\n" if context else "") + NOTICE + "\n".join(lines)
     if context and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use"):
         data["additional_context"] = context
     return data
@@ -351,12 +370,8 @@ def stdout(event: str, out: bytes, state: str, session: str, sent: Optional[dict
             data = json.loads(text)
         except ValueError:
             data = None
-    if isinstance(data, dict):
-        data = answer(event, data, state, session, sent)
-    elif text and event in ("session_start", "user_prompt"):
-        data = {"additional_context": text}  # Plain text is context on these events in Claude Code.
-    else:
-        data = {}
+    # The dispatcher's own answer is always JSON or empty.
+    data = answer(event, data, state, session, sent) if isinstance(data, dict) else {}
     return finish(event, data, state, session)
 
 

@@ -144,7 +144,7 @@ class TranslationTests(unittest.TestCase):
         self.assertNotIn("transcript_path", gone)
         # Cursor's null transcript_path is left out too.
         self.assertNotIn("transcript_path", cursor.with_transcripts(cursor_payload("stop"), self.state))
-        # Each version has its own copy; an older copy stays until it is ten minutes old, so a hook handed it can read it.
+        # Each version has its own copy; an older copy stays until no hook was handed it for two minutes.
         copies = sorted(p for p in Path(self.state, "cursor").iterdir() if p.suffix == ".jsonl")
         self.assertEqual(len(copies), 2)
         old = next(p for p in copies if str(p) != again["transcript_path"])
@@ -152,6 +152,33 @@ class TranslationTests(unittest.TestCase):
         cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "Third."}]}}])
         cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
         self.assertFalse(old.exists())
+
+    def test_copies_do_not_pile_up_as_the_transcript_grows(self):
+        source = self.tmp / "cursor.jsonl"
+        folder = Path(self.state, "cursor")
+        for step in range(5):
+            cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "x" * (step + 1)}]}}])
+            cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
+            for old in folder.iterdir():
+                os.utime(old, (time.time() - 300, time.time() - 300))
+        self.assertEqual(len([p for p in folder.iterdir() if p.suffix == ".jsonl"]), 1)
+
+    def test_handing_out_a_copy_keeps_it(self):
+        source = self.tmp / "cursor.jsonl"
+        cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "one"}]}}])
+        first = cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)["transcript_path"]
+        os.utime(first, (time.time() - 300, time.time() - 300))
+        cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)  # Hands out the same copy.
+        cursor_transcript(source, [{"role": "user", "message": {"content": [{"type": "text", "text": "two"}]}}])
+        cursor.with_transcripts(cursor.to_claude("stop", cursor_payload("stop", transcript_path=str(source))), self.state)
+        self.assertTrue(Path(first).exists())
+
+    def test_relative_and_windows_tool_folders(self):
+        sub = self.project / "pkg"
+        sub.mkdir()
+        out = cursor.to_claude("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "ls", "working_directory": "pkg"}, cwd="", workspace_roots=[str(self.project)]))
+        self.assertEqual(out["cwd"], str(sub))
+        self.assertEqual(cursor.native_root("/D:/work", windows=True), "D:/work")
 
     def test_a_lone_surrogate_does_not_stop_the_copy_or_the_answer(self):
         source = self.tmp / "cursor.jsonl"
@@ -176,7 +203,6 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(json.loads(cursor.stdout("session_start", json.dumps(start).encode(), self.state, "s"))["additional_context"], "Read the rules.")
         # Cursor counts empty output as a failed hook.
         self.assertEqual(cursor.stdout("pre_tool_use", b"", self.state, "s"), b"{}")
-        self.assertEqual(json.loads(cursor.stdout("session_start", b"Plain context.\n", self.state, "s")), {"additional_context": "Plain context."})
 
     def test_a_changed_edit_goes_back_to_cursor_as_a_whole_write(self):
         target = self.project / "notes.md"
@@ -196,9 +222,17 @@ class TranslationTests(unittest.TestCase):
         notice = {"systemMessage": "Writing check: something."}
         out = json.loads(cursor.stdout("pre_tool_use", json.dumps(notice).encode(), self.state, "s"))
         self.assertIn("Writing check: something.", out["additional_context"])
-        # A refusal already says it to the agent; the notice is not repeated.
-        deny = {"systemMessage": "Writing check: No.", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "No."}}
-        self.assertNotIn("additional_context", json.loads(cursor.stdout("pre_tool_use", json.dumps(deny).encode(), self.state, "s")))
+        # On a refusal, the lines not already said go to the message Cursor shows the user, once.
+        deny = {"systemMessage": "Writing check: No.\nagent-kit-sync: the j/g hook failed (boom) and was skipped.",
+                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "No."}}
+        out = json.loads(cursor.stdout("pre_tool_use", json.dumps(deny).encode(), self.state, "s"))
+        self.assertNotIn("additional_context", out)
+        self.assertEqual(out["user_message"], "No.\nagent-kit-sync: the j/g hook failed (boom) and was skipped.")
+        two = {"systemMessage": "Writing check: A\nWriting check: B", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "A\nB"}}
+        self.assertEqual(json.loads(cursor.stdout("pre_tool_use", json.dumps(two).encode(), self.state, "s"))["user_message"], "A\nB")
+        # Cursor has no place for a notice at stop.
+        stop = json.loads(cursor.stdout("stop", json.dumps({"systemMessage": "Archive check: careful."}).encode(), self.state, "s"))
+        self.assertEqual(stop, {"systemMessage": "Archive check: careful."})
 
     def test_a_post_tool_use_block_becomes_context(self):
         block = {"decision": "block", "reason": "Check the file again."}
@@ -299,6 +333,46 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotIn("permission", out)
         # The test hook itself fails on that input; the notice reaches the agent, since Cursor shows the user nothing.
         self.assertIn("failed", out["additional_context"])
+
+    def run_patched(self, event, payload, patch):
+        import subprocess
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); from agent_kit_sync import cursor, dispatch\n"
+            "def broken(*args, **kwargs): raise UnicodeEncodeError('utf-8', '', 0, 1, 'lone surrogate')\n"
+            + patch + "\n"
+            "sys.exit(dispatch.main(sys.argv[2], sys.argv[3], 'claude', sys.argv[4]))"
+        )
+        env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py"), event],
+                                input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_input_translation_that_raises_still_runs_the_hooks(self):
+        payload = cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "rm -rf /tmp/x"}, transcript_path="/nowhere.jsonl")
+        for patch in ("cursor.to_claude = broken", "cursor.with_transcripts = broken"):
+            with self.subTest(patch=patch):
+                out = self.run_patched("pre_tool_use", payload, patch)
+                self.assertEqual(out["permission"], "deny")
+
+    def test_a_malformed_hook_answer_does_not_stop_the_dispatcher(self):
+        hook = self.tmp / "odd.py"
+        hook.write_text("print('{\"hookSpecificOutput\": \"x\"}')\n", encoding="utf-8")
+        index = json.loads((self.kit / "state" / "index.json").read_text(encoding="utf-8"))
+        index["hooks"].append(dict(index["hooks"][0], name="odd", path=str(hook)))
+        (self.kit / "state" / "index.json").write_text(json.dumps(index), encoding="utf-8")
+        code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "rm -rf /tmp/x"}))
+        self.assertEqual((code, out["permission"]), (0, "deny"))
+
+    def test_alerts_reach_cursors_agent_but_wait_at_stop(self):
+        alert = {"id": "a1", "message": "Something failed.", "command": "agent-kit-sync status"}
+        (self.kit / "state" / "alerts.json").write_text(json.dumps([alert]), encoding="utf-8")
+        _code, out = self.run_dispatcher("stop", cursor_payload("stop", session_id="s9", status="completed", loop_count=1))
+        self.assertNotIn("Something failed.", json.dumps(out))
+        _code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", session_id="s9", tool_name="Shell", tool_input={"command": "ls"}))
+        self.assertIn("Something failed.", out["additional_context"])
+        _code, out = self.run_dispatcher("pre_tool_use", cursor_payload("preToolUse", session_id="s9", tool_name="Shell", tool_input={"command": "ls"}))
+        self.assertNotIn("additional_context", out)
 
     def test_a_translation_that_raises_keeps_the_hooks_decision(self):
         import subprocess

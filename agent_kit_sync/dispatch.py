@@ -197,7 +197,7 @@ def combine(app: str, event: str, results) -> Combined:
             if text and event in ("session_start", "user_prompt"):
                 out.context.append(text)
             continue
-        specific = data.get("hookSpecificOutput") or {}
+        specific = data.get("hookSpecificOutput") if isinstance(data.get("hookSpecificOutput"), dict) else {}
         permission = specific.get("permissionDecision")
         if permission in ("deny", "ask", "allow"):
             out.note_decision(permission, str(specific.get("permissionDecisionReason", "")) if permission != "allow" else "")
@@ -389,7 +389,11 @@ def cursor_fallback(event: str, combined: Combined) -> bytes:
     """The hooks' decision in Cursor's fields, for when the full translation of the answer fails."""
     reason = "\n".join(r for r in combined.reasons if isinstance(r, str) and r) or "A hook refused this."
     answer = {}
-    if event == "pre_tool_use" and combined.decision in ("deny", "ask"):
+    if event == "pre_tool_use" and combined.updated_input is not None and combined.decision not in ("deny", "ask"):
+        # A hook changed the input, and the change could not be passed on; running the original would ignore the hook.
+        reason = "A hook changed this tool call, and agent-kit-sync could not pass the change to Cursor, so the call was refused. Try it again."
+        answer = {"permission": "deny", "agent_message": reason, "user_message": reason}
+    elif event == "pre_tool_use" and combined.decision in ("deny", "ask"):
         answer = {"permission": "deny", "agent_message": reason, "user_message": reason}
     elif event == "user_prompt" and combined.decision in ("deny", "continue"):
         answer = {"continue": False, "user_message": reason}
@@ -414,7 +418,11 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         try:
             payload = cursor.to_claude(event, payload)
         except Exception:
-            payload = without_transcripts(payload)
+            # Keep at least Claude Code's event and tool names, which hooks check first.
+            payload = dict(without_transcripts(payload), hook_event_name=APP_EVENTS["claude"].get(event, payload.get("hook_event_name")))
+            name = payload.get("tool_name")
+            if isinstance(name, str):
+                payload["tool_name"] = cursor.TOOL_NAMES.get(name, name)
         if event == "session_start":
             try:
                 cursor.remove_old(state)
@@ -483,6 +491,7 @@ def main(layout_root, launcher, app: str, event: str) -> int:
             out = cursor.stdout(event, out, state, session, payload)
         except Exception:
             out = cursor_fallback(event, combined)
+            delivered = []  # The fallback answer carries no alerts; show them at a later event.
     if session:
         mark_shown(state, session, delivered)
     if err:
