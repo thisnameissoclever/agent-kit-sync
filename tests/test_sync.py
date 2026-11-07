@@ -1247,12 +1247,15 @@ class EditDuringRunTests(TwoMachines):
 class WindowsLineBreakTests(TwoMachines):
     """A copy saved again with Windows line breaks, and no other change, still receives updates."""
 
-    def save_with_crlf(self, path):
-        data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    def write_bytes(self, path, data):
+        """Save exact bytes, with a later modification time, as an editor does."""
         path.write_bytes(data)
         st = path.stat()
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
         return data
+
+    def save_with_crlf(self, path):
+        return self.write_bytes(path, path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 
     def test_instruction_file_saved_with_crlf_still_gets_updates(self):
         self.standard_config()
@@ -1322,7 +1325,7 @@ class WindowsLineBreakTests(TwoMachines):
         a.sync()
         path = a.path(".claude", "agents", "helper.md")
         self.save_with_crlf(path)
-        a.write(path, path.read_text(encoding="utf-8", newline="").replace("Help with the task.", "Help carefully."))
+        self.write_bytes(path, path.read_bytes().replace(b"Help with the task.", b"Help carefully."))
         self.assertIn(b"\r\n", path.read_bytes())
         engine, report = a.sync()
         self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
@@ -1346,7 +1349,7 @@ class WindowsLineBreakTests(TwoMachines):
         b.sync()
         path = a.path(".claude", "CLAUDE.md")
         self.save_with_crlf(path)
-        a.write(path, path.read_text(encoding="utf-8", newline="").replace("Write plainly.", "Write plainly and briefly."))
+        self.write_bytes(path, path.read_bytes().replace(b"Write plainly.", b"Write plainly and briefly."))
         engine, report = a.sync()
         self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
         text = a.read(".claude", "CLAUDE.md")
