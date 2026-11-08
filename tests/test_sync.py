@@ -1257,20 +1257,25 @@ class EditDuringRunTests(TwoMachines):
         b.sync()
         path = a.path(".claude", "agents", "helper.md")
         from agent_kit_sync.engine import Engine
+        import agent_kit_sync.engine as engine_module
+        real_write = engine_module.atomic_write
+
+        def edit_then_write(target, data, **kwargs):
+            # The edit lands after every check, just before the write, so only the write's own check sees it.
+            if os.path.realpath(target) == os.path.realpath(path) and b"Help carefully." in data:
+                a.write(path, path.read_text(encoding="utf-8").replace("Help with the task.", "Help with the whole task."))
+            return real_write(target, data, **kwargs)
+
         with a.env():
             engine = Engine(a.layout)
-            begin = engine.journal.begin
-
-            def edit_then_begin(entries):
-                if any(e.get("copy_key") == "claude|writing/helper|agents/helper.md" for e in entries):
-                    a.write(path, path.read_text(encoding="utf-8").replace("Help with the task.", "Help with the whole task."))
-                return begin(entries)
-
-            engine.journal.begin = edit_then_begin
-            engine.run()
+            engine_module.atomic_write = edit_then_write
+            try:
+                engine.run()
+            finally:
+                engine_module.atomic_write = real_write
             record = engine.record.data["files"]
         self.assertIn("Help with the whole task.", a.read(".claude", "agents", "helper.md"))
-        self.assertNotIn(str(path), [entry["path"] for entry in record])
+        self.assertNotIn(os.path.realpath(path), [os.path.realpath(entry["path"]) for entry in record])
 
     def test_rebase_survives_a_write_that_fails(self):
         self.standard_config()
@@ -1309,13 +1314,67 @@ class EditDuringRunTests(TwoMachines):
                 engine.run()
             finally:
                 engine_module.atomic_write = real_write
+            record = engine.record.data["files"]
         self.assertNotIn("Other rule, changed.", a.read(".claude", "CLAUDE.md"))  # The write did fail.
+        self.assertNotIn(os.path.realpath(path), [os.path.realpath(entry["path"]) for entry in record])
         engine, report = a.sync()
         self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
         source = (a.layout.config / "modules/writing/sections/plain.md").read_text()
         self.assertIn("Write plainly and briefly.", source)
         self.assertIn("Always keep projects", source)
         self.assertIn("Other rule, changed.", a.read(".claude", "CLAUDE.md"))
+
+    def test_added_skill_file_is_not_backed_up_and_is_removed_when_retired(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        notes = a.path(".claude", "skills", "review", "notes.md")
+        a.write(notes, "Notes.\n")
+        a.sync()
+        a.sync()
+        self.assertEqual(a.read(".agents", "skills", "review", "notes.md"), "Notes.\n")
+        self.assertEqual(list((a.layout.state / "backups").rglob("notes.md")) if (a.layout.state / "backups").exists() else [], [])
+        b.sync()
+        (b.layout.config / "modules/writing/skills/review/notes.md").unlink()
+        b.sync()
+        a.sync()
+        self.assertFalse(notes.exists())
+        self.assertFalse(a.path(".agents", "skills", "review", "notes.md").exists())
+        a.sync()
+        self.assertFalse(notes.exists())
+        self.assertFalse((a.layout.config / "modules/writing/skills/review/notes.md").exists())
+
+    def test_saved_index_never_lists_a_retired_hook(self):
+        self.standard_config()
+        manifest = self.seed / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[hooks]]\nname = "check"\nfile = "hooks/check.py"\nevents = ["stop"]\ntests = ["hooks/test_check.py"]\n', encoding="utf-8")
+        (self.seed / "modules/writing/hooks").mkdir()
+        (self.seed / "modules/writing/hooks/check.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+        (self.seed / "modules/writing/hooks/test_check.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "-qm", "hook")
+        git(self.seed, "push", "-q")
+        a = self.machine("a")
+        a.sync()
+        hook = a.layout.installed / "writing" / "hooks" / "check.py"
+        self.assertTrue(hook.is_file())
+        manifest = a.layout.config / "modules/writing/module.toml"
+        text = manifest.read_text(encoding="utf-8")
+        manifest.write_text(text[:text.index("[[hooks]]", text.index("[[settings]]"))], encoding="utf-8")
+        from agent_kit_sync.engine import Engine
+        with a.env():
+            engine = Engine(a.layout)
+
+            def failing_sections(plan):
+                raise OSError("instruction file not writable")
+
+            engine._write_sections = failing_sections
+            with self.assertRaises(OSError):
+                engine.run(network=False)
+        self.assertFalse(hook.exists())
+        index = json.loads((a.layout.state / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual([h for h in index.get("hooks", []) if h["name"] == "check"], [])
 
     def test_edit_during_a_run_that_carried_nothing_back_stays_an_edit(self):
         self.standard_config()

@@ -430,7 +430,7 @@ class Engine:
             return
         tree = Tree(module.root)
         new_files: Dict[str, Optional[bytes]] = {}
-        conflicts: List[LocalChange] = []
+        conflicts: List[Tuple[LocalChange, LocalChange]] = []   # (the edit held, the edit kept)
         by_source: Dict[str, List[LocalChange]] = {}
         for change in edits + deletes:
             source_rel = self._source_rel(change)
@@ -442,7 +442,7 @@ class Engine:
             for change in group:
                 results.append(self._source_bytes(module, item, change, tree, source_rel))
             if len({r for r in results}) > 1:
-                conflicts.extend(group[:-1])
+                conflicts.extend((change, winner) for change in group[:-1])
             new_files[source_rel] = results[-1]
         for change in edits:
             if change.kind in ("edit", "section-edit"):
@@ -464,8 +464,8 @@ class Engine:
                     prune_empty_dirs(target.parent, module.root)
             else:
                 atomic_write(target, data, executable=self._executable_for(changes, source_rel))
-        for change in conflicts:
-            self.held.add(f"edit-conflict:{change.copy_key}", "edit-conflict", f"Two copies of {item.key} on this machine were edited differently before a sync. The {self._app_label(changes[-1].app)} edit was kept; this one, from {self._app_label(change.app)}, is saved here.", ["discard", "use-this"], {"edited": change.new or b""}, item_key=item.key)
+        for change, kept in conflicts:
+            self.held.add(f"edit-conflict:{change.copy_key}", "edit-conflict", f"Two copies of {item.key} on this machine were edited differently before a sync. The {self._app_label(kept.app)} edit was kept; this one, from {self._app_label(change.app)}, is saved here.", ["discard", "use-this"], {"edited": change.new or b""}, item_key=item.key)
         self.report.edits.append(item.key)
 
     def _verify_render(self, module: Module, item: Item, change: LocalChange, new_files: Dict[str, Optional[bytes]]) -> None:
@@ -1273,8 +1273,7 @@ class Engine:
             {"module": h.module, "name": h.name, "path": str(h.path), "events": h.events, "tools": h.tools, "protocol": h.protocol,
              "args": h.args, "runtime": h.runtime, "timeout": h.timeout, "on_failure": h.on_failure, "apps": h.apps, "order": h.order}
             for h in plan.hooks]
-        self._write_copies(plan)
-        self.index.hooks = hooks  # After the hook files are written, so a saved index never names a missing one.
+        self._write_copies(plan, hooks)
         self._write_sections(plan)
         self.index.save()
         self.write_cursor_rules(plan)
@@ -1310,7 +1309,7 @@ class Engine:
                 del self.index.items[item_key]
         self.index.save()
 
-    def _write_copies(self, plan: Plan) -> None:
+    def _write_copies(self, plan: Plan, hooks: Optional[List[dict]] = None) -> None:
         wanted: Dict[str, Copy] = {}
         for copy in plan.copies:
             if self.frozen(f"{copy.module}/{copy.item}"):
@@ -1380,6 +1379,10 @@ class Engine:
             self.index.put_copy(copy.key, record["index"], copy.data)
             self._settled(copy.key)
             self.report.installed.append(copy.key)
+        if hooks is not None:
+            # After the hook files are written and before removals, listing only hooks whose file is
+            # here, so a saved index never names a missing hook.
+            self.index.hooks = [h for h in hooks if Path(h["path"]).is_file()]
         self.index.save()
         self.journal.finish()
         self._remove_stale(set(wanted), plan)
