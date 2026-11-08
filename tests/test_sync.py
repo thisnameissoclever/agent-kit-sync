@@ -1507,5 +1507,292 @@ class WindowsLineBreakTests(TwoMachines):
         self.assertNotIn(b"\r", source)
 
 
+class RemovalSafetyTests(TwoMachines):
+    """Removing copies and blocks from this machine never reads as a deletion for every machine, and
+    never loses a file the user had."""
+
+    def disable(self, machine, item_key):
+        data = machine.machine_data()
+        data.setdefault("overrides", {})[item_key] = {"kind": "disable"}
+        machine.write_machine(data)
+
+    def sync_with_change_during_run(self, machine, change):
+        """Run a sync that calls `change` right after it commits this machine's edits."""
+        from agent_kit_sync.engine import Engine
+        with machine.env():
+            engine = Engine(machine.layout)
+            commit_local = engine.commit_local
+
+            def commit_then_change(message):
+                commit_local(message)
+                change()
+
+            engine.commit_local = commit_then_change
+            return engine, engine.run()
+
+    def replace_own_helper(self, machine, text):
+        """Give `machine` its own Claude Code helper, then let the config repo's helper replace it."""
+        mine = machine.path(".claude", "agents", "helper.md")
+        machine.write(mine, text)
+        engine, _report = machine.sync()
+        collision = next(e for e in engine.held.all() if e["kind"] == "collision" and e["app"] == "claude")
+        from agent_kit_sync.resolve import resolve
+        with machine.env():
+            resolve(machine.layout, collision["id"], "config-replaces-local")
+        machine.sync()
+        self.assertNotEqual(mine.read_text(encoding="utf-8"), text)
+        return mine
+
+    def undo(self, machine):
+        from types import SimpleNamespace
+        from agent_kit_sync.commands import cmd_undo
+        with machine.env():
+            self.assertEqual(cmd_undo(SimpleNamespace(yes=True), machine.layout), 0)
+
+    def test_run_that_stops_while_removing_copies_is_not_read_as_a_deletion(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        self.disable(a, "writing/helper")
+        import agent_kit_sync.engine as engine_module
+        remove_file = engine_module.remove_file
+
+        def remove_then_stop(path, **kwargs):
+            remove_file(path, **kwargs)
+            raise RuntimeError("the machine lost power")
+
+        engine_module.remove_file = remove_then_stop
+        try:
+            with self.assertRaises(RuntimeError):
+                a.sync()
+        finally:
+            engine_module.remove_file = remove_file
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, [])
+        self.assertFalse(a.path(".claude", "agents", "helper.md").exists())
+        self.assertFalse(a.path(".codex", "agents", "helper.toml").exists())
+        self.assertTrue((a.layout.config / "modules/writing/agents/helper.md").exists())
+        b.sync()
+        self.assertTrue(b.path(".claude", "agents", "helper.md").exists())
+
+    def test_run_that_stops_after_removing_a_block_is_not_read_as_a_deletion(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        self.disable(a, "writing/plain")
+        import agent_kit_sync.engine as engine_module
+        atomic_write = engine_module.atomic_write
+
+        def write_then_stop(path, data, **kwargs):
+            result = atomic_write(path, data, **kwargs)
+            if Path(path).name == "CLAUDE.md":
+                raise RuntimeError("the machine lost power")
+            return result
+
+        engine_module.atomic_write = write_then_stop
+        try:
+            with self.assertRaises(RuntimeError):
+                a.sync()
+        finally:
+            engine_module.atomic_write = atomic_write
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, [])
+        self.assertNotIn("Write plainly.", a.read(".claude", "CLAUDE.md"))
+        self.assertNotIn("Write plainly.", a.read(".codex", "AGENTS.md"))
+        b.sync()
+        self.assertIn("Write plainly.", b.read(".claude", "CLAUDE.md"))
+
+    def test_undo_after_a_removal_keeps_the_users_own_file(self):
+        self.standard_config()
+        a = self.machine("a")
+        mine = self.replace_own_helper(a, "my own helper\n")
+        self.disable(a, "writing/helper")
+        a.sync()
+        self.assertEqual(mine.read_text(encoding="utf-8"), "my own helper\n")
+        a.write(mine, "my own helper, edited\n")
+        self.undo(a)
+        backup = a.layout.state / "backups" / ".claude" / "agents" / "helper.md"
+        self.assertEqual(backup.read_text(encoding="utf-8"), "my own helper, edited\n")
+
+    def test_undo_reverses_the_latest_of_two_runs_in_one_second(self):
+        from agent_kit_sync.state import RunRecord
+        a = self.machine("a")
+        a.layout.state.mkdir(parents=True, exist_ok=True)
+        path = a.path(".claude", "agents", "helper.md")
+        for name, when in (("20261107-120000-ffff", 100.0), ("20261107-120000-0000", 101.0)):
+            record = RunRecord(a.layout, run_id=name)
+            record.data["time"] = when
+            record.file(path, name.encode("utf-8"))
+            record.save()
+        self.assertEqual(RunRecord.latest(a.layout)["run"], "20261107-120000-0000")
+
+    def test_run_that_writes_and_then_retires_a_copy_records_the_restored_file(self):
+        from agent_kit_sync.state import RunRecord
+        a = self.machine("a")
+        path, backup = a.path(".claude", "agents", "helper.md"), a.layout.state / "backups" / "helper.md"
+        record = RunRecord(a.layout)
+        record.file(path, b"my own helper\n")
+        record.file(path, b"the config repo's helper\n", kind="remove", backup=backup)
+        self.assertEqual([(e["path"], e["kind"], e.get("backup")) for e in record.data["files"]], [(str(path), "copy", str(backup))])
+        self.assertEqual(Path(record.data["files"][0]["saved"]).read_bytes(), b"my own helper\n")
+
+    def test_deleting_a_copy_does_not_bring_back_the_file_it_replaced(self):
+        self.standard_config()
+        a = self.machine("a")
+        mine = self.replace_own_helper(a, "my own helper\n")
+        mine.unlink()
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, ["writing/helper"])
+        self.assertFalse(mine.exists())
+        kept = sorted((a.layout.state / "backups" / ".claude" / "agents").glob("helper.md.deleted-*"))
+        self.assertEqual([path.read_text(encoding="utf-8") for path in kept], ["my own helper\n"])
+        a.sync()
+        self.assertFalse(mine.exists())
+        # Undo has no copy to put back where the run found it already deleted, so a file made there since stays.
+        a.write(mine, "a new helper\n")
+        self.undo(a)
+        self.assertEqual(mine.read_text(encoding="utf-8"), "a new helper\n")
+
+    def test_copy_deleted_during_a_run_is_not_written_back(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        helper = a.path(".claude", "agents", "helper.md")
+        self.sync_with_change_during_run(a, helper.unlink)
+        self.assertFalse(helper.exists())
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, ["writing/helper"])
+        self.assertFalse(a.path(".codex", "agents", "helper.toml").exists())
+        b.sync()
+        self.assertFalse(b.path(".claude", "agents", "helper.md").exists())
+
+    def test_copy_edited_and_then_deleted_during_the_run_is_not_written_back(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        skill = a.path(".claude", "skills", "review", "SKILL.md")
+        a.write(skill, skill.read_text(encoding="utf-8").replace("report problems", "report every problem"))
+        _engine, report = self.sync_with_change_during_run(a, skill.unlink)
+        self.assertEqual(report.edits, ["writing/review"])
+        self.assertFalse(skill.exists())
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, ["writing/review"])
+        self.assertFalse(a.path(".agents", "skills", "review", "SKILL.md").exists())
+
+    def test_copy_deleted_during_a_run_comes_back_with_an_incoming_edit(self):
+        # As when a merge meets a deletion: the edit wins and the item stays.
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        other = b.path(".claude", "agents", "helper.md")
+        b.write(other, other.read_text(encoding="utf-8").replace("Help with the task.", "Help carefully."))
+        b.sync()
+        helper = a.path(".claude", "agents", "helper.md")
+        engine, _report = self.sync_with_change_during_run(a, helper.unlink)
+        self.assertIn("Help carefully.", helper.read_text(encoding="utf-8"))
+        self.assertIn("kept:claude|writing/helper|agents/helper.md", [x["key"] for x in engine.alerts.open()])
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, [])
+
+    def test_block_deleted_during_a_run_is_not_written_back(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        begin, end = "<!-- agent-kit-sync begin writing/plain -->", "<!-- agent-kit-sync end writing/plain -->"
+
+        def delete_block():
+            text = path.read_text(encoding="utf-8")
+            a.write(path, text[:text.index(begin)] + text[text.index(end) + len(end):].lstrip("\n"))
+
+        self.sync_with_change_during_run(a, delete_block)
+        self.assertNotIn("Write plainly.", a.read(".claude", "CLAUDE.md"))
+        _engine, report = a.sync()
+        self.assertEqual(report.deletions, ["writing/plain"])
+        b.sync()
+        self.assertNotIn("Write plainly.", b.read(".codex", "AGENTS.md"))
+
+    def test_a_copy_open_in_another_program_is_removed_by_a_later_run(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        helper = a.path(".claude", "agents", "helper.md")
+        locked = os.path.realpath(helper)
+        import pathlib
+        unlink = pathlib.Path.unlink
+
+        def unlink_unless_locked(path, *args, **kwargs):
+            if os.path.realpath(path) == locked:
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", str(path))
+            return unlink(path, *args, **kwargs)
+
+        self.disable(a, "writing/helper")
+        pathlib.Path.unlink = unlink_unless_locked
+        try:
+            _engine, report = a.sync()
+        finally:
+            pathlib.Path.unlink = unlink
+        self.assertTrue(helper.exists())
+        self.assertFalse(a.path(".codex", "agents", "helper.toml").exists())
+        _engine, report = a.sync()
+        self.assertFalse(helper.exists())
+        self.assertEqual(report.deletions, [])
+
+    def test_save_while_signatures_are_taken_still_starts_a_sync(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        helper = a.path(".claude", "agents", "helper.md")
+        import agent_kit_sync.engine as engine_module
+        from agent_kit_sync import dispatch
+        from agent_kit_sync.engine import Engine
+        read_or_none = engine_module.read_or_none
+        saved = []
+
+        def read_then_save(path):
+            data = read_or_none(path)
+            if not saved and os.path.realpath(path) == os.path.realpath(helper):
+                saved.append(path)
+                a.write(helper, data.decode("utf-8") + "More.\n")
+            return data
+
+        with a.env():
+            engine = Engine(a.layout)
+            engine_module.read_or_none = read_then_save
+            try:
+                engine.refresh_signatures()
+            finally:
+                engine_module.read_or_none = read_or_none
+        self.assertTrue(saved)
+        self.assertTrue(dispatch.copies_changed({"copies": engine.index.copies}))
+
+    def test_block_update_keeps_the_line_breaks_of_a_crlf_file(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        path.write_bytes(b"My own line.\r\n\r\n" + path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        other = b.path(".claude", "CLAUDE.md")
+        b.write(other, other.read_text(encoding="utf-8").replace("Write plainly.", "Write plainly and briefly."))
+        b.sync()
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        raw = path.read_bytes()
+        self.assertTrue(raw.startswith(b"My own line.\r\n"))
+        self.assertIn(b"Write plainly and briefly.\r\n", raw)
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        _engine, report = a.sync()
+        self.assertEqual((report.edits, report.installed), ([], []))
+        self.assertEqual(path.read_bytes(), raw)
+
+
 if __name__ == "__main__":
     unittest.main()

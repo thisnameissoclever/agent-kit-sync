@@ -97,6 +97,9 @@ def run_one(hook: dict, app: str, event: str, raw: bytes, payload: dict, env: di
     else:
         data = raw
     started = time.monotonic()
+    if not os.path.isfile(path):
+        # Python exits 2 when its script is missing, which would read as the hook blocking the action.
+        return {"hook": hook, "code": None, "stdout": b"", "stderr": f"its file {path} is missing".encode("utf-8"), "seconds": 0.0}
     try:
         result = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=hook.get("timeout", 10), env=env, cwd=payload.get("cwd") or None)
         return {"hook": hook, "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr, "seconds": time.monotonic() - started}

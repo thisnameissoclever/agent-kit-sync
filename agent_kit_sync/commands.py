@@ -564,8 +564,14 @@ def cmd_undo(args, layout: Layout) -> int:
             path = Path(entry["path"])
             if entry.get("kind") in ("instructions", "settings"):
                 continue  # Shared files: restored key by key and block by block below.
+            if entry.get("backup"):
+                # The run put the user's own file back here when it removed the copy. Keep that file,
+                # with any change made to it since, as the backup it came from before reversing.
+                _keep_as_backup(path, Path(entry["backup"]), record["run"])
             if entry.get("saved"):
                 atomic_write(path, Path(entry["saved"]).read_bytes())
+            elif entry.get("kind") == "remove":
+                continue  # The copy was already gone, so the run removed nothing here.
             elif path.exists():
                 path.unlink()
         for change in reversed(record.get("settings", [])):
@@ -593,6 +599,17 @@ def cmd_undo(args, layout: Layout) -> int:
         atomic_write(marker, json.dumps(saved).encode("utf-8"))
     say("Reversed the run. Changes it brought from other machines are pinned on this machine; run agent-kit-sync sync to push the reversal of this machine's own changes.")
     return 0
+
+
+def _keep_as_backup(path: Path, backup: Path, run_id: str) -> None:
+    current = read_or_none(path)
+    if current is None:
+        return
+    if backup.exists():
+        if backup.read_bytes() == current:
+            return
+        backup = backup.with_name(f"{backup.name}.before-undo-{run_id}")
+    atomic_write(backup, current)
 
 
 def _restore_blocks(path: Path, old_text: str) -> None:
