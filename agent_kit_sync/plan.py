@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import shutil
 import subprocess
@@ -146,8 +147,34 @@ def hook_cli(layout: Layout, machine: Machine) -> str:
     python = machine.python or sys.executable
     parts = [python, "-I", "-S", str(layout.launcher)]
     if os_name() == "windows":
-        return subprocess.list2cmdline(parts)
+        return windows_cli(parts)
     return " ".join(shlex.quote(part) for part in parts)
+
+
+PLAIN_WORD = re.compile(r"[\w./:-]+")
+
+
+def windows_cli(parts: List[str]) -> str:
+    """A command for Windows that Git Bash and PowerShell both run as written.
+
+    Paths use forward slashes, which Windows programs accept: Git Bash removes a backslash from an
+    unquoted word, and a backslash in a JSON or YAML double-quoted string starts an escape. A part
+    with a space or another character a shell reads is quoted for Bash and PowerShell alike. When
+    the program itself is quoted, PowerShell needs its call operator in front, which Bash refuses,
+    so it is added only where Claude Code runs hooks in PowerShell, on a machine without Git Bash.
+    A part no quoting suits for both shells, a path holding both ' and $, gets Command Prompt
+    quoting, which Git Bash runs and PowerShell does not. A command inside a double-quoted string is
+    escaped where it is placed; see render.substitute.
+    """
+    from .register import git_bash, windows_hook_quote
+    parts = [part.replace("\\", "/") for part in parts]
+    quoted = [part if PLAIN_WORD.fullmatch(part) else windows_hook_quote(part) for part in parts]
+    if None in quoted:
+        return subprocess.list2cmdline(parts)  # No quoting suits both shells; Command Prompt quoting is the best left.
+    command = " ".join(quoted)
+    if quoted[0] != parts[0] and not git_bash():
+        command = "& " + command
+    return command
 
 
 def hook_command(layout: Layout, machine: Machine, module: str, name: str) -> str:

@@ -272,6 +272,87 @@ class WindowsInvocationTests(unittest.TestCase):
         self.check(lambda command, payload, program: run_like_cursor(command, payload, self.tmp, program=program))
 
 
+class WindowsHookCommandTests(unittest.TestCase):
+    """{{kit.hook}} on Windows: a command that Git Bash, PowerShell, and a subagent header all keep intact."""
+
+    PYTHON = r"C:\Users\Pat Doe\AppData\Local\Programs\Python\Python313\python.exe"
+    LAUNCHER = r"C:\Users\Pat Doe\.agent-kit-sync\launcher.py"
+
+    def command(self, python, launcher, bash="bash.exe"):
+        from types import SimpleNamespace
+        from unittest import mock
+        from agent_kit_sync import plan, register
+        with mock.patch.object(plan, "os_name", return_value="windows"), mock.patch.object(register, "git_bash", return_value=bash):
+            return plan.hook_command(SimpleNamespace(launcher=launcher), SimpleNamespace(python=python), "m", "guard")
+
+    def test_paths_have_no_backslashes(self):
+        for python, launcher in ((r"C:\Python313\python.exe", r"C:\kit\launcher.py"), (self.PYTHON, self.LAUNCHER)):
+            with self.subTest(python=python):
+                command = self.command(python, launcher)
+                self.assertNotIn("\\", command)
+                self.assertTrue(command.endswith(" run-hook m/guard"), command)
+
+    def test_plain_paths_stay_unquoted(self):
+        self.assertEqual(self.command(r"C:\Python313\python.exe", r"C:\kit\launcher.py"), "C:/Python313/python.exe -I -S C:/kit/launcher.py run-hook m/guard")
+
+    def test_paths_with_spaces_are_quoted_for_both_shells(self):
+        self.assertEqual(self.command(self.PYTHON, self.LAUNCHER),
+                         "'C:/Users/Pat Doe/AppData/Local/Programs/Python/Python313/python.exe' -I -S 'C:/Users/Pat Doe/.agent-kit-sync/launcher.py' run-hook m/guard")
+        self.assertEqual(self.command(self.PYTHON, self.LAUNCHER, bash=None),
+                         "& 'C:/Users/Pat Doe/AppData/Local/Programs/Python/Python313/python.exe' -I -S 'C:/Users/Pat Doe/.agent-kit-sync/launcher.py' run-hook m/guard")
+
+    def test_command_survives_a_json_string_in_a_subagent_header(self):
+        command = self.command(self.PYTHON, self.LAUNCHER)
+        header = '{"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "' + command + '"}]}]}'
+        self.assertEqual(json.loads(header)["PreToolUse"][0]["hooks"][0]["command"], command)
+
+    def values(self, command):
+        from agent_kit_sync import render
+        return render.Values(home="C:/Users/Pat", projects="", worktrees="", module="", app="claude", os="windows", cli="", hooks={"m/guard": command})
+
+    def test_command_with_an_apostrophe_survives_a_subagent_header_and_carries_back(self):
+        from agent_kit_sync import render
+        command = self.command(r"C:\Users\O'Brien\py\python.exe", r"C:\Users\O'Brien\.agent-kit-sync\launcher.py")
+        self.assertIn('"', command)
+        source = ('---\nname: reviewer\nclaude.hooks: {"PreToolUse": [{"hooks": [{"type": "command", "command": "{{kit.hook m/guard}}"}]}]}\n---\n'
+                  'Run "{{kit.hook m/guard}}" by hand.\n')
+        values = self.values(command)
+        copy = render.render_agent_md(source, "claude", values).text
+        header = copy.split("\n")[2]
+        self.assertEqual(json.loads(header.split(": ", 1)[1])["PreToolUse"][0]["hooks"][0]["command"], command)
+        self.assertIn(f'Run "{command}" by hand.', copy)
+        edited = copy.replace("by hand.", "by hand when needed.")
+        self.assertEqual(render.carry_back_agent_md(source, "claude", copy, edited, values), source.replace("by hand.", "by hand when needed."))
+
+    def test_check_finds_a_literal_hook_command_with_quoted_paths(self):
+        from agent_kit_sync.checks import HOOK_COMMAND
+        for python, launcher in ((self.PYTHON, self.LAUNCHER), (r"C:\Users\O'Brien\py\python.exe", r"C:\Users\O'Brien\.agent-kit-sync\launcher.py")):
+            command = self.command(python, launcher)
+            for line in (command, json.dumps({"command": command})):
+                with self.subTest(line=line):
+                    self.assertTrue(HOOK_COMMAND.search(" " + line), line)
+        self.assertTrue(HOOK_COMMAND.search("x /usr/bin/python3 -I -S '/Users/Pat Doe/.agent-kit-sync/launcher.py' run-hook m/g"))
+        self.assertTrue(HOOK_COMMAND.search('x "C:\\Users\\Pat Doe\\py\\python.exe" -I -S "C:\\Users\\Pat Doe\\.agent-kit-sync\\launcher.py" run-hook m/g'))
+
+    @unittest.skipUnless(bash_program(), "Bash is not installed")
+    def test_bash_passes_each_part_unchanged(self):
+        import tempfile
+        folder = Path(tempfile.mkdtemp(prefix="aks-kithook-"))
+        try:
+            printer = folder / "print_args.py"
+            printer.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+            command = self.command(self.PYTHON, self.LAUNCHER)
+            program = command.split(" -I ", 1)[0]
+            # Run the command with Python standing in for the program, so the launcher path and the arguments are what Bash passes.
+            import shlex
+            line = shlex.quote(sys.executable) + " " + shlex.quote(str(printer)) + command[len(program):]
+            result = subprocess.run([bash_program(), "-c", line], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+            self.assertEqual(json.loads(result.stdout), ["-I", "-S", "C:/Users/Pat Doe/.agent-kit-sync/launcher.py", "run-hook", "m/guard"])
+        finally:
+            remove_tree(folder)
+
+
 class DispatchUnitTests(unittest.TestCase):
     def test_matcher_and_tool_kinds(self):
         self.assertEqual(dispatch.tool_kind("claude", "Bash"), "shell")
