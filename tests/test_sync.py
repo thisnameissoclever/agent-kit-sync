@@ -1616,6 +1616,18 @@ class RemovalSafetyTests(TwoMachines):
         backup = a.layout.state / "backups" / ".claude" / "agents" / "helper.md"
         self.assertEqual(backup.read_text(encoding="utf-8"), "my own helper, edited\n")
 
+    def test_undo_reverses_the_latest_of_two_runs_in_one_second(self):
+        from agent_kit_sync.state import RunRecord
+        a = self.machine("a")
+        a.layout.state.mkdir(parents=True, exist_ok=True)
+        path = a.path(".claude", "agents", "helper.md")
+        for name, when in (("20261107-120000-ffff", 100.0), ("20261107-120000-0000", 101.0)):
+            record = RunRecord(a.layout, run_id=name)
+            record.data["time"] = when
+            record.file(path, name.encode("utf-8"))
+            record.save()
+        self.assertEqual(RunRecord.latest(a.layout)["run"], "20261107-120000-0000")
+
     def test_run_that_writes_and_then_retires_a_copy_records_the_restored_file(self):
         from agent_kit_sync.state import RunRecord
         a = self.machine("a")

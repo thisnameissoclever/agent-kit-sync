@@ -170,16 +170,27 @@ class RunRecord:
         if not self.changed:
             return
         _save(self.dir / "record.json", self.data)
-        runs = sorted(p for p in self.root.iterdir() if p.is_dir()) if self.root.is_dir() else []
+        runs = self._in_order(self.root)
         for old in runs[: max(0, len(runs) - self.KEEP)]:
             _remove_tree(old)
 
+    @staticmethod
+    def _in_order(root: Path) -> List[Path]:
+        """Run folders, oldest first. A run's name holds its start time only to the second, followed by a
+        random part, so two runs in one second are ordered by the time saved in each record."""
+        if not root.is_dir():
+            return []
+
+        def started(folder: Path) -> tuple:
+            data = _load(folder / "record.json", None)
+            when = data.get("time") if isinstance(data, dict) else None
+            return (float(when) if isinstance(when, (int, float)) else folder.stat().st_mtime, folder.name)
+
+        return sorted((p for p in root.iterdir() if p.is_dir()), key=started)
+
     @classmethod
     def latest(cls, layout: Layout) -> Optional[dict]:
-        root = layout.state / "runs"
-        if not root.is_dir():
-            return None
-        for folder in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+        for folder in reversed(cls._in_order(layout.state / "runs")):
             data = _load(folder / "record.json", None)
             if data and not data.get("undone"):
                 data["_dir"] = str(folder)
