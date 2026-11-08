@@ -45,6 +45,8 @@ class LocalChange:
     copy_key: str = ""
     path: Optional[Path] = None
     new: Optional[bytes] = None
+    found: Optional[str] = None   # SHA-256 of the copy or block as it was on disk when the change was found
+    source: Optional[str] = None  # an added file's path in the module
 
 
 def same_line_breaks(edited: bytes, written: Optional[bytes]) -> bytes:
@@ -120,6 +122,7 @@ class Engine:
         self.carry_modules: List[Module] = []   # the modules edits are carried back to, for {{kit.hook}} commands
         self.replace_existing: Set[str] = set() # "app|module/item" allowed to overwrite unmanaged files
         self.carried: Dict[str, Optional[str]] = {}  # copy or block keys carried back, with their hash when found
+        self.carried_text: Dict[str, str] = {}       # the same keys, with the hash of the text that was carried back
         self.restoring = False                  # uninstall: put back files the tool replaced
 
     # ------------------------------------------------------------ loading
@@ -205,9 +208,10 @@ class Engine:
 
     def refresh_signatures(self) -> None:
         """Save each installed copy's size and modification time, which the dispatcher compares cheaply."""
-        for entry in self.index.copies.values():
+        for copy_key, entry in self.index.copies.items():
             current = read_or_none(Path(entry["path"]))
-            entry["sig"] = stat_signature(entry["path"]) if current is not None and sha256(current) == entry["hash"] else None
+            same = current is not None and (sha256(current) == entry["hash"] or self._line_breaks_only(copy_key, entry, current))
+            entry["sig"] = stat_signature(entry["path"]) if same else None
 
     # ------------------------------------------------------------ crash recovery
 
@@ -263,11 +267,12 @@ class Engine:
             if current is None:
                 changes.append(LocalChange("delete", item_key, module, item, entry["app"], copy_key, path))
             elif sha256(current) != entry["hash"]:
+                found = sha256(current)
                 if entry.get("render_kind", "copy") != "copy":
                     current = same_line_breaks(current, self.index.rendered(copy_key))
                     if sha256(current) == entry["hash"]:
                         continue  # Only the line breaks changed, as an editor on Windows may do; nothing to carry back.
-                changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current))
+                changes.append(LocalChange("edit", item_key, module, item, entry["app"], copy_key, path, current, found))
         changes += self._new_skill_files(known)
         for app, path in self._instruction_paths().items():
             text = read_or_none(path)
@@ -287,7 +292,8 @@ class Engine:
                 elif sha256(blocks[entry["key"]].encode("utf-8")) != entry["hash"]:
                     block = same_line_breaks(blocks[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
                     if sha256(block) != entry["hash"]:
-                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block))
+                        changes.append(LocalChange("section-edit", entry["item_key"], module, item, app, block_key, path, block,
+                                                   sha256(blocks[entry["key"]].encode("utf-8"))))
         for setting_key, entry in sorted(self.index.settings.items()):
             if entry.get("force") or (entry.get("held") and self.held.find(entry["held"])):
                 continue
@@ -344,7 +350,9 @@ class Engine:
                 if real(path) not in indexed:
                     data = read_or_none(path)
                     if data is not None:
-                        found.append(LocalChange("added", item_key, module_name, item_key.split("/", 1)[1], app, f"{app}|{item_key}|{base}/{rel}", path, data))
+                        # The key the planner gives this file's copy, so the write step finds what was carried back.
+                        found.append(LocalChange("added", item_key, module_name, item_key.split("/", 1)[1], app, f"{app}|{item_key}|{rel}", path, data,
+                                                 sha256(data), f"{base}/{rel}"))
         return found
 
     def _guard_deletions(self, changes: List[LocalChange]) -> List[LocalChange]:
@@ -396,9 +404,14 @@ class Engine:
             raise render.RenderError("this item comes with agent-kit-sync itself; put local changes in an override instead")
         for change in changes:
             if change.kind != "setting":
-                # The file as it is on disk, which can differ from change.new in its line breaks only.
-                on_disk = read_or_none(change.path) if change.kind == "edit" and change.path is not None else change.new
-                self.carried[change.copy_key] = sha256(on_disk) if on_disk is not None else None
+                # The copy as it was on disk when the change was found, which can differ from change.new in
+                # its line breaks only. A later read could see an edit saved since, and treat it as carried.
+                if change.found is not None:
+                    self.carried[change.copy_key] = change.found
+                else:
+                    self.carried[change.copy_key] = sha256(change.new) if change.new is not None else None
+                if change.new is not None:
+                    self.carried_text[change.copy_key] = sha256(change.new)
         settings_changes = [c for c in changes if c.kind == "setting"]
         for change in settings_changes:
             self._hold_setting(module, item, change)
@@ -417,7 +430,7 @@ class Engine:
             return
         tree = Tree(module.root)
         new_files: Dict[str, Optional[bytes]] = {}
-        conflicts: List[LocalChange] = []
+        conflicts: List[Tuple[LocalChange, LocalChange]] = []   # (the edit held, the edit kept)
         by_source: Dict[str, List[LocalChange]] = {}
         for change in edits + deletes:
             source_rel = self._source_rel(change)
@@ -429,7 +442,7 @@ class Engine:
             for change in group:
                 results.append(self._source_bytes(module, item, change, tree, source_rel))
             if len({r for r in results}) > 1:
-                conflicts.extend(group[:-1])
+                conflicts.extend((change, winner) for change in group[:-1])
             new_files[source_rel] = results[-1]
         for change in edits:
             if change.kind in ("edit", "section-edit"):
@@ -451,8 +464,8 @@ class Engine:
                     prune_empty_dirs(target.parent, module.root)
             else:
                 atomic_write(target, data, executable=self._executable_for(changes, source_rel))
-        for change in conflicts:
-            self.held.add(f"edit-conflict:{change.copy_key}", "edit-conflict", f"Two copies of {item.key} on this machine were edited differently before a sync. The {self._app_label(changes[-1].app)} edit was kept; this one, from {self._app_label(change.app)}, is saved here.", ["discard", "use-this"], {"edited": change.new or b""}, item_key=item.key)
+        for change, kept in conflicts:
+            self.held.add(f"edit-conflict:{change.copy_key}", "edit-conflict", f"Two copies of {item.key} on this machine were edited differently before a sync. The {self._app_label(kept.app)} edit was kept; this one, from {self._app_label(change.app)}, is saved here.", ["discard", "use-this"], {"edited": change.new or b""}, item_key=item.key)
         self.report.edits.append(item.key)
 
     def _verify_render(self, module: Module, item: Item, change: LocalChange, new_files: Dict[str, Optional[bytes]]) -> None:
@@ -525,7 +538,7 @@ class Engine:
         if change.kind in ("section-edit", "section-delete"):
             return self.index.blocks[change.copy_key]["source_rel"]
         if change.kind == "added":
-            return change.copy_key.split("|", 2)[2]
+            return change.source
         return self.index.copies[change.copy_key]["source_rel"]
 
     def _deletes_whole_item(self, item: Item, deletes: List[LocalChange], edits: List[LocalChange]) -> bool:
@@ -1256,11 +1269,11 @@ class Engine:
         for name in {m.name for m in effective} - set(plan.failed):
             self.alerts.close(f"module:{name}")
         previous_hooks = [h for h in self.index.hooks if h["module"] in self.failed_modules]
-        self.index.hooks = previous_hooks + [
+        hooks = previous_hooks + [
             {"module": h.module, "name": h.name, "path": str(h.path), "events": h.events, "tools": h.tools, "protocol": h.protocol,
              "args": h.args, "runtime": h.runtime, "timeout": h.timeout, "on_failure": h.on_failure, "apps": h.apps, "order": h.order}
             for h in plan.hooks]
-        self._write_copies(plan)
+        self._write_copies(plan, hooks)
         self._write_sections(plan)
         self.index.save()
         self.write_cursor_rules(plan)
@@ -1296,7 +1309,7 @@ class Engine:
                 del self.index.items[item_key]
         self.index.save()
 
-    def _write_copies(self, plan: Plan) -> None:
+    def _write_copies(self, plan: Plan, hooks: Optional[List[dict]] = None) -> None:
         wanted: Dict[str, Copy] = {}
         for copy in plan.copies:
             if self.frozen(f"{copy.module}/{copy.item}"):
@@ -1308,6 +1321,8 @@ class Engine:
                 del wanted[copy_key]
         seen_targets: Dict[Path, str] = {}
         journal = []
+        checked: Dict[str, Optional[str]] = {}   # copy key: the hash of the file when it was checked
+        rebased = False
         for copy in wanted.values():
             target = real(copy.path)
             if target in seen_targets:
@@ -1320,32 +1335,75 @@ class Engine:
                 expected = self.carried[copy.key]
             if self.forced(f"{copy.module}/{copy.item}") and current is not None:
                 expected = sha256(current)
-            if entry is not None and current is not None and sha256(current) != expected:
-                continue  # Edited since this run started; the next run carries it back.
+            breaks_only = entry is not None and current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy.key, entry, current)
+            if breaks_only and copy.data == self.index.rendered(copy.key):
+                continue  # Saved again with other line breaks, and nothing to update: leave it as saved.
+            known = entry is not None or copy.key in self.carried
+            if known and current is not None and sha256(current) != expected and not breaks_only:
+                # Edited since this run started; the next run carries it back.
+                if self.carried_text.get(copy.key) == sha256(copy.data):
+                    # This run carried an earlier edit to this copy back, and the config repo now
+                    # renders to that edit. Record it as the copy written here, so the next run
+                    # compares the newer edit with the earlier one and not with the copy before both.
+                    self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
+                    self._settled(copy.key)
+                    rebased = True
+                continue
             if current == copy.data:
-                if entry is None:
+                if entry is None and copy.key not in self.carried:
                     # The file was already here, written by someone else: keep a copy so uninstall leaves it.
                     self._backup_unmanaged(copy, current, None)
                 if entry is None or entry["hash"] != sha256(copy.data):
                     self.index.put_copy(copy.key, self._copy_entry(copy), copy.data)
+                self._settled(copy.key)
                 continue
+            checked[copy.key] = sha256(current) if current is not None else None
             journal.append({"path": str(target), "hash": sha256(copy.data), "copy_key": copy.key, "index": self._copy_entry(copy), "rendered": True})
+        if rebased:
+            self.index.save()  # Rebased entries do not depend on a write, so a crash below must not lose them.
         self.journal.begin(journal)
         for record in journal:
             copy = wanted[record["copy_key"]]
             entry = self.index.copies.get(copy.key)
             current = read_or_none(copy.path)
-            self._backup_unmanaged(copy, current, entry)
-            self.record.file(real(copy.path), current)
+            if (sha256(current) if current is not None else None) != checked[copy.key]:
+                continue  # Changed since it was checked; the next run sees the change.
+            backup = None if copy.key in self.carried else self._backup_unmanaged(copy, current, entry)
             try:
-                atomic_write(copy.path, copy.data, executable=copy.executable, expect=sha256(current) if current is not None else None)
+                atomic_write(copy.path, copy.data, executable=copy.executable, expect=checked[copy.key])
             except ChangedUnderneath:
+                if backup is not None:
+                    backup.unlink()  # Nothing was replaced, so there is nothing to put back.
                 continue
+            self.record.file(real(copy.path), current)
             self.index.put_copy(copy.key, record["index"], copy.data)
+            self._settled(copy.key)
             self.report.installed.append(copy.key)
+        if hooks is not None:
+            # After the hook files are written and before removals, listing only hooks whose file is
+            # here, so a saved index never names a missing hook.
+            self.index.hooks = [h for h in hooks if Path(h["path"]).is_file()]
         self.index.save()
         self.journal.finish()
         self._remove_stale(set(wanted), plan)
+
+    def _settled(self, key: str) -> None:
+        """Forget that this run carried `key` back, once the index records what is on disk for it or
+        what it was rebased to. A run installs twice, before and after it merges the remote, and the
+        second install must compare the file with what the first one wrote."""
+        self.carried.pop(key, None)
+        self.carried_text.pop(key, None)
+
+    def _line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
+        """True when an installed copy differs from the one written only in its line breaks, which
+        find_local_changes does not count as an edit."""
+        if entry.get("render_kind", "copy") == "copy":
+            return False
+        return sha256(same_line_breaks(current, self.index.rendered(copy_key))) == entry["hash"]
+
+    def _copy_line_breaks_only(self, copy_key: str, entry: dict, current: bytes) -> bool:
+        """The same, for a copy this run did not carry back, so it can be replaced or removed."""
+        return copy_key not in self.carried and self._line_breaks_only(copy_key, entry, current)
 
     def _copy_entry(self, copy: Copy) -> dict:
         return {"path": str(copy.path), "app": copy.app, "item_key": f"{copy.module}/{copy.item}", "kind": copy.kind,
@@ -1357,7 +1415,7 @@ class Engine:
         found: Set[str] = set()
         for copy in wanted.values():
             group = f"{copy.app}|{copy.module}/{copy.item}"
-            if copy.key in self.index.copies or group in self.replace_existing or self.index.approvals.get("replace:" + group) or copy.app == "kit":
+            if copy.key in self.index.copies or copy.key in self.carried or group in self.replace_existing or self.index.approvals.get("replace:" + group) or copy.app == "kit":
                 continue
             current = read_or_none(copy.path)
             if current is not None and current != copy.data:
@@ -1370,17 +1428,20 @@ class Engine:
             self.alerts.raise_(f"collision:{group}", f"agent-kit-sync did not overwrite {item_key} in {self._app_label(app)}, because a different one is already there.", "agent-kit-sync held")
         return found
 
-    def _backup_unmanaged(self, copy: Copy, current: Optional[bytes], entry: Optional[dict]) -> None:
+    def _backup_unmanaged(self, copy: Copy, current: Optional[bytes], entry: Optional[dict]) -> Optional[Path]:
+        """Keep a file the tool did not write before replacing it. Returns the backup when this call made it."""
         if entry is not None or current is None:
-            return
+            return None
         target = real(copy.path)
         try:
             rel = target.relative_to(real(Path.home()))
         except ValueError:
             rel = Path(*target.parts[1:])
         backup = self.layout.state / "backups" / rel
-        if not backup.exists():
-            atomic_write(backup, current)
+        if backup.exists():
+            return None
+        atomic_write(backup, current)
+        return backup
 
     def _remove_stale(self, wanted: Set[str], plan: Plan) -> None:
         failed = set(plan.failed)
@@ -1391,14 +1452,16 @@ class Engine:
             path = Path(entry["path"])
             current = read_or_none(path)
             expected = self.carried.get(copy_key, entry["hash"]) if copy_key in self.carried else entry["hash"]
-            if current is not None and sha256(current) != expected:
+            breaks_only = current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy_key, entry, current)
+            if current is not None and sha256(current) != expected and not breaks_only:
                 continue  # Edited by someone; leave it for the next run to carry back.
-            self.record.file(real(path), current, kind="remove")
             if current is not None:
                 try:
-                    remove_file(path, expect=entry["hash"])
+                    remove_file(path, expect=sha256(current) if breaks_only else entry["hash"])
                 except ChangedUnderneath:
                     continue
+            self.record.file(real(path), current, kind="remove")
+            if current is not None:
                 if entry.get("kind") == "skill":
                     prune_empty_dirs(path.parent, path.parent.parent.parent)
                 else:
@@ -1445,6 +1508,8 @@ class Engine:
                 if key in present:
                     desired.setdefault(key, present[key])
             skip = set()
+            # Blocks edited again after this run carried an earlier edit back; see _write_copies.
+            rebase = {block.key for block in by_app.get(app, []) if self.carried_text.get(f"{app}|{block.key}") == sha256(block.content.encode("utf-8"))}
             for block_key, entry in self.index.blocks.items():
                 if entry["app"] != app or entry["key"] not in present:
                     continue
@@ -1452,9 +1517,22 @@ class Engine:
                 expected = self.carried.get(block_key, entry["hash"]) if block_key in self.carried else entry["hash"]
                 if self.forced(entry["item_key"]):
                     expected = found
+                if block_key not in self.carried and found != expected:
+                    # A block saved with Windows line breaks is not an edit; see find_local_changes.
+                    same = same_line_breaks(present[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))
+                    if sha256(same) == expected:
+                        expected = found
+                        if desired.get(entry["key"]) == entry.get("content"):
+                            desired[entry["key"]] = present[entry["key"]]  # Nothing to update: leave it as saved.
                 if found != expected:
                     desired[entry["key"]] = present[entry["key"]]
                     skip.add(entry["key"])
+            early = [block for block in by_app.get(app, []) if block.key in rebase and block.key in skip]
+            for block in early:
+                self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
+                self._settled(f"{app}|{block.key}")
+            if early:
+                self.index.save()  # These do not depend on the write below, so a failed write or a crash must not lose them.
             managed = [entry["key"] for entry in self.index.blocks.values() if entry["app"] == app] + list(desired)
             unwrap = []
             if self.restoring:
@@ -1464,7 +1542,6 @@ class Engine:
                         unwrap.append(entry["key"])
             new_text = sections.apply(text, desired, managed, unwrap)
             if new_text != text:
-                self.record.file(real(path), raw, kind="instructions")
                 # Record what is about to be written, so a crash between the write and the index save
                 # is finished by the next run instead of being read as an edit.
                 pending = {f"{app}|{block.key}": sha256(block.content.encode("utf-8")) for block in by_app.get(app, [])}
@@ -1474,13 +1551,15 @@ class Engine:
                 except ChangedUnderneath:
                     self.journal.finish()
                     continue
+                self.record.file(real(path), raw, kind="instructions")
             for key in list(self.index.blocks):
                 if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired:
                     del self.index.blocks[key]
             for block in by_app.get(app, []):
-                if block.key in skip:
+                if block.key in skip and block.key not in rebase:
                     continue
                 self.index.blocks[f"{app}|{block.key}"] = {"app": app, "key": block.key, "item_key": f"{block.module}/{block.item}", "source_rel": block.source_rel, "hash": sha256(block.content.encode("utf-8")), "content": block.content, "local": block.local}
+                self._settled(f"{app}|{block.key}")
             self.index.save()
             self.journal.finish()
 
