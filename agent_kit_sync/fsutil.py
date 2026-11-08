@@ -120,15 +120,30 @@ def atomic_write(path, data: bytes, *, executable: Optional[bool] = None, expect
     return target
 
 
-def remove_file(path, *, expect=ANY) -> bool:
+def remove_file(path, *, expect=ANY, seconds: float = 2.0) -> bool:
+    """Delete a file through any symbolic link to its target.
+
+    `expect` is the SHA-256 the file must have; the removal raises ChangedUnderneath otherwise. A
+    file another program holds open on Windows is retried for `seconds`, then raises
+    ChangedUnderneath, so the caller leaves it for the next run instead of stopping this one.
+    """
     target = real(path)
     current = read_or_none(target)
     if current is None:
         return False
     if expect is not ANY and sha256(current) != expect:
         raise ChangedUnderneath(str(target))
-    target.unlink()
-    return True
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            target.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except PermissionError as error:
+            if time.monotonic() > deadline:
+                raise ChangedUnderneath(f"{target} is open in another program: {error}") from None
+            time.sleep(0.1)
 
 
 def prune_empty_dirs(start: Path, stop: Path) -> None:

@@ -209,9 +209,13 @@ class Engine:
     def refresh_signatures(self) -> None:
         """Save each installed copy's size and modification time, which the dispatcher compares cheaply."""
         for copy_key, entry in self.index.copies.items():
+            before = stat_signature(entry["path"])
             current = read_or_none(Path(entry["path"]))
             same = current is not None and (sha256(current) == entry["hash"] or self._line_breaks_only(copy_key, entry, current))
-            entry["sig"] = stat_signature(entry["path"]) if same else None
+            # A save between the read and the stat would give the edited file the signature of the one
+            # read, and the dispatcher would not start a sync for it.
+            after = stat_signature(entry["path"]) if same else None
+            entry["sig"] = after if after is not None and after == before else None
 
     # ------------------------------------------------------------ crash recovery
 
@@ -221,6 +225,9 @@ class Engine:
             return
         for entry in pending.get("entries", []):
             current = read_or_none(Path(entry["path"]))
+            if entry.get("remove"):
+                self._recover_removal(entry, current)
+                continue
             if current is not None and sha256(current) == entry["hash"] and entry.get("blocks") is not None:
                 # An instruction file was written but the index was not: adopt the written blocks.
                 try:
@@ -229,9 +236,23 @@ class Engine:
                     present = {}
                 for block_key, block_hash in entry["blocks"].items():
                     key = block_key.split("|", 1)[1]
-                    if key in present and block_key in self.index.blocks and sha256(present[key].encode("utf-8")) == block_hash:
+                    if key not in present or block_key not in self.index.blocks:
+                        continue
+                    # A file saved with Windows line breaks gets its blocks written the same way; see _write_sections.
+                    content = same_line_breaks(present[key].encode("utf-8"), b"").decode("utf-8")
+                    if sha256(content.encode("utf-8")) == block_hash:
                         self.index.blocks[block_key]["hash"] = block_hash
-                        self.index.blocks[block_key]["content"] = present[key]
+                        self.index.blocks[block_key]["content"] = content
+            if entry.get("blocks") is not None:
+                # Blocks the run was removing from this machine: once they are gone from the file, the
+                # index must not keep them, or the next run reads them as deletions for every machine.
+                try:
+                    present = sections.extract(current.decode("utf-8")) if current is not None else {}
+                except (sections.MarkerError, UnicodeDecodeError):
+                    present = None
+                for block_key in entry.get("removed", []) if present is not None else []:
+                    if block_key.split("|", 1)[1] not in present:
+                        self.index.blocks.pop(block_key, None)
                 continue
             if current is not None and sha256(current) == entry["hash"] and entry.get("copy_key"):
                 index_entry = entry["index"]
@@ -240,6 +261,25 @@ class Engine:
                     atomic_write(self.index.rendered_path(entry["copy_key"]), current)
         self.index.save()
         self.journal.finish()
+
+    def _recover_removal(self, entry: dict, current: Optional[bytes]) -> None:
+        """Finish a removal a run had started: drop the copy from the index once its file is gone,
+        and put back the user's own file that the copy had replaced."""
+        copy_key = entry["copy_key"]
+        if copy_key not in self.index.copies:
+            return
+        backup = Path(entry["backup"]) if entry.get("backup") else None
+        if current is None:
+            if backup is not None and backup.exists():
+                atomic_write(Path(entry["path"]), backup.read_bytes())
+                backup.unlink()
+            self.index.drop_copy(copy_key)
+        elif backup is not None and not backup.exists():
+            self.index.drop_copy(copy_key)  # The user's file was put back and its backup deleted, the removal's last step.
+        elif backup is not None and sha256(current) == entry["restored"]:
+            # The file holds what the backup does, whether or not the copy was removed first: finish the removal.
+            backup.unlink()
+            self.index.drop_copy(copy_key)
 
     # ------------------------------------------------------------ finding local edits
 
@@ -1349,6 +1389,8 @@ class Engine:
                     self._settled(copy.key)
                     rebased = True
                 continue
+            if current is None and self._deleted_since_found(copy.key, entry, target, f"{copy.module}/{copy.item}", copy.data, self.index.rendered(copy.key)):
+                continue  # Deleted since this run found it; the next run carries the deletion.
             if current == copy.data:
                 if entry is None and copy.key not in self.carried:
                     # The file was already here, written by someone else: keep a copy so uninstall leaves it.
@@ -1386,6 +1428,26 @@ class Engine:
         self.index.save()
         self.journal.finish()
         self._remove_stale(set(wanted), plan)
+
+    def _deleted_since_found(self, key: str, entry: Optional[dict], target: Optional[Path], item_key: str, planned: bytes, written: Optional[bytes]) -> bool:
+        """Whether a copy or block that is missing now was there when this run found the local changes,
+        or was written by this run's first install. Writing it again would undo a deletion the user
+        made during the run; left missing, the next run finds the deletion and carries it.
+
+        `planned` is what this install would write, and `written` what the index says was there. A
+        change to the item from another machine or another app's copy wins over the deletion, as it
+        does when a merge meets a deletion, and the item stays."""
+        if entry is None or self.forced(item_key):
+            return False
+        if target is not None and real(Path(entry["path"])) != target:
+            return False  # The copy moves to a new place this run; nothing was deleted.
+        if key in self.carried and self.carried[key] is None:
+            return False  # Already missing when the run found it.
+        if planned == written or self.carried_text.get(key) == sha256(planned):
+            return True  # Nothing new, or only the user's own edit, which the user then deleted.
+        name = entry.get("path") or f"the {entry['key']} block in {self._app_label(entry['app'])}'s instructions"
+        self.alerts.raise_(f"kept:{key}", f"{name} was deleted while agent-kit-sync was syncing, and a change to {item_key} arrived in the same sync. The change was kept, and the item stays. Delete it again to delete it everywhere.", "agent-kit-sync status")
+        return False
 
     def _settled(self, key: str) -> None:
         """Forget that this run carried `key` back, once the index records what is on disk for it or
@@ -1447,6 +1509,7 @@ class Engine:
         failed = set(plan.failed)
         stale = [key for key in self.index.copies if key not in wanted and not self.frozen(self.index.copies[key]["item_key"])
                  and self.index.copies[key]["item_key"].split("/", 1)[0] not in failed]
+        removals = []
         for copy_key in stale:
             entry = self.index.copies[copy_key]
             path = Path(entry["path"])
@@ -1455,33 +1518,58 @@ class Engine:
             breaks_only = current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy_key, entry, current)
             if current is not None and sha256(current) != expected and not breaks_only:
                 continue  # Edited by someone; leave it for the next run to carry back.
+            # The user's own file comes back when the copy that replaced it is retired. When the copy is
+            # already gone, someone deleted it, and bringing the older file back would undo that.
+            backup = self._backup_path(path)
+            if current is None and backup is not None and backup.exists():
+                self._set_aside(backup)
+            saved = read_or_none(backup) if backup is not None and current is not None else None
+            removals.append((copy_key, entry, path, current, breaks_only, backup if saved is not None else None,
+                             {"path": str(path), "copy_key": copy_key, "remove": True,
+                              "backup": str(backup) if saved is not None else None, "restored": sha256(saved) if saved is not None else None}))
+        if not removals:
+            return
+        # Record the removals first, so a run that stops halfway is finished by the next run instead of
+        # its missing copies being read as deletions to carry to every machine.
+        self.journal.begin([removal[-1] for removal in removals])
+        for copy_key, entry, path, current, breaks_only, backup, _journal in removals:
             if current is not None:
                 try:
                     remove_file(path, expect=sha256(current) if breaks_only else entry["hash"])
                 except ChangedUnderneath:
                     continue
-            self.record.file(real(path), current, kind="remove")
-            if current is not None:
                 if entry.get("kind") == "skill":
                     prune_empty_dirs(path.parent, path.parent.parent.parent)
                 else:
                     prune_empty_dirs(path.parent, self.layout.installed if entry["app"] == "kit" else path.parent.parent)
-            backup = self._restore_backup(path)
+            restored = self._restore_backup(path, backup)
+            self.record.file(real(path), current, kind="remove", backup=restored)
             self.index.drop_copy(copy_key)
             self.report.removed.append(copy_key)
         self.index.save()
+        self.journal.finish()
 
-    def _restore_backup(self, path: Path) -> bool:
+    def _backup_path(self, path: Path) -> Optional[Path]:
+        """Where `_backup_unmanaged` keeps the file the user had at `path` before agent-kit-sync."""
         try:
             rel = real(path).relative_to(real(Path.home()))
         except ValueError:
-            return False
-        backup = self.layout.state / "backups" / rel
-        if backup.exists():
-            atomic_write(path, backup.read_bytes())
-            backup.unlink()
-            return True
-        return False
+            return None
+        return self.layout.state / "backups" / rel
+
+    def _set_aside(self, backup: Path) -> None:
+        """Keep a backup under another name, where no later removal at the same path restores it."""
+        target = backup.with_name(f"{backup.name}.deleted-{self.record.run_id}")
+        atomic_write(target, backup.read_bytes())
+        backup.unlink()
+
+    def _restore_backup(self, path: Path, backup: Optional[Path]) -> Optional[Path]:
+        """Put the user's own file back at `path`. Returns the backup it came from, now deleted."""
+        if backup is None or not backup.exists():
+            return None
+        atomic_write(path, backup.read_bytes())
+        backup.unlink()
+        return backup
 
     def _write_sections(self, plan: Plan) -> None:
         by_app: Dict[str, List[SectionBlock]] = {}
@@ -1508,6 +1596,14 @@ class Engine:
                 if key in present:
                     desired.setdefault(key, present[key])
             skip = set()
+            vanished = set()
+            if raw is not None:
+                for block_key, entry in self.index.blocks.items():
+                    if (entry["app"] == app and entry["key"] in desired and entry["key"] not in present and not self.frozen(entry["item_key"])
+                            and self._deleted_since_found(block_key, entry, None, entry["item_key"], desired[entry["key"]].encode("utf-8"), entry.get("content", "").encode("utf-8"))):
+                        vanished.add(entry["key"])  # Deleted during this run; keep its record so the next run carries the deletion.
+                        desired.pop(entry["key"], None)
+            skip |= vanished
             # Blocks edited again after this run carried an earlier edit back; see _write_copies.
             rebase = {block.key for block in by_app.get(app, []) if self.carried_text.get(f"{app}|{block.key}") == sha256(block.content.encode("utf-8"))}
             for block_key, entry in self.index.blocks.items():
@@ -1541,11 +1637,16 @@ class Engine:
                     if entry["app"] == app and str(real(path)) in adopted:
                         unwrap.append(entry["key"])
             new_text = sections.apply(text, desired, managed, unwrap)
+            if raw is not None and b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""):
+                # Saved with Windows line breaks throughout: write the blocks the same way, so the file does not
+                # end up with LF lines inside a CRLF file. Blocks are compared with their line breaks restored.
+                new_text = new_text.replace("\r\n", "\n").replace("\n", "\r\n")
             if new_text != text:
                 # Record what is about to be written, so a crash between the write and the index save
                 # is finished by the next run instead of being read as an edit.
                 pending = {f"{app}|{block.key}": sha256(block.content.encode("utf-8")) for block in by_app.get(app, [])}
-                self.journal.begin([{"path": str(real(path)), "hash": sha256(new_text.encode("utf-8")), "blocks": pending, "app": app}])
+                removed = [key for key, entry in self.index.blocks.items() if entry["app"] == app and entry["key"] not in desired and entry["key"] not in vanished]
+                self.journal.begin([{"path": str(real(path)), "hash": sha256(new_text.encode("utf-8")), "blocks": pending, "removed": removed, "app": app}])
                 try:
                     atomic_write(path, new_text.encode("utf-8"), expect=sha256(raw) if raw is not None else None)
                 except ChangedUnderneath:
@@ -1553,7 +1654,7 @@ class Engine:
                     continue
                 self.record.file(real(path), raw, kind="instructions")
             for key in list(self.index.blocks):
-                if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired:
+                if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired and self.index.blocks[key]["key"] not in vanished:
                     del self.index.blocks[key]
             for block in by_app.get(app, []):
                 if block.key in skip and block.key not in rebase:

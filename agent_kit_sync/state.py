@@ -144,7 +144,9 @@ class RunRecord:
         self.dir = self.root / self.run_id
         self.data = {"run": self.run_id, "time": time.time(), "files": [], "commits": [], "pushed": False, "incoming": {}}
 
-    def file(self, path: Path, old: Optional[bytes], kind: str = "copy") -> None:
+    def file(self, path: Path, old: Optional[bytes], kind: str = "copy", backup: Optional[Path] = None) -> None:
+        """Note a file this run changed and its bytes before. `backup` is the backup of a file the
+        user had before agent-kit-sync, which this run put back at `path` after removing the copy."""
         for entry in self.data["files"]:
             if entry["path"] == str(path):
                 return
@@ -152,7 +154,10 @@ class RunRecord:
         if old is not None:
             saved = str(self.dir / "files" / str(len(self.data["files"])))
             atomic_write(Path(saved), old)
-        self.data["files"].append({"path": str(path), "saved": saved, "kind": kind})
+        entry = {"path": str(path), "saved": saved, "kind": kind}
+        if backup is not None:
+            entry["backup"] = str(backup)
+        self.data["files"].append(entry)
 
     @property
     def changed(self) -> bool:

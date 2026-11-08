@@ -291,6 +291,21 @@ class DispatchUnitTests(unittest.TestCase):
         self.assertNotIn("hookSpecificOutput", json.loads(out))
         self.assertIn("failed", json.loads(out)["systemMessage"])
 
+    def test_missing_hook_file_is_a_failure_not_a_block(self):
+        import tempfile
+        folder = Path(tempfile.mkdtemp(prefix="aks-missing-"))
+        try:
+            hook = {"module": "m", "name": "h", "protocol": "native", "path": str(folder / "gone.py"), "runtime": "python"}
+            result = dispatch.run_one(hook, "claude", "pre_tool_use", b"{}", {}, dict(os.environ))
+            self.assertTrue(dispatch.failed(result))
+            combined = dispatch.combine("claude", "pre_tool_use", [result])
+            self.assertFalse(combined.blocked)
+            _code, out = dispatch.emit("claude", "pre_tool_use", combined, {}, False)
+            self.assertNotIn("hookSpecificOutput", json.loads(out))
+            self.assertIn("is missing", json.loads(out)["systemMessage"])
+        finally:
+            remove_tree(folder)
+
     def test_deny_wins_and_reasons_are_kept(self):
         a = {"hook": {"module": "m", "name": "a", "protocol": "kit"}, "code": 0, "stdout": json.dumps({"decision": "ask", "reason": "check"}).encode(), "stderr": b""}
         b = {"hook": {"module": "m", "name": "b", "protocol": "native"}, "code": 2, "stdout": b"", "stderr": b"no"}
