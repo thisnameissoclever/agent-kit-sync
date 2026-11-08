@@ -46,6 +46,7 @@ class LocalChange:
     path: Optional[Path] = None
     new: Optional[bytes] = None
     found: Optional[str] = None   # SHA-256 of the copy or block as it was on disk when the change was found
+    source: Optional[str] = None  # an added file's path in the module
 
 
 def same_line_breaks(edited: bytes, written: Optional[bytes]) -> bytes:
@@ -349,7 +350,9 @@ class Engine:
                 if real(path) not in indexed:
                     data = read_or_none(path)
                     if data is not None:
-                        found.append(LocalChange("added", item_key, module_name, item_key.split("/", 1)[1], app, f"{app}|{item_key}|{base}/{rel}", path, data))
+                        # The key the planner gives this file's copy, so the write step finds what was carried back.
+                        found.append(LocalChange("added", item_key, module_name, item_key.split("/", 1)[1], app, f"{app}|{item_key}|{rel}", path, data,
+                                                 sha256(data), f"{base}/{rel}"))
         return found
 
     def _guard_deletions(self, changes: List[LocalChange]) -> List[LocalChange]:
@@ -535,7 +538,7 @@ class Engine:
         if change.kind in ("section-edit", "section-delete"):
             return self.index.blocks[change.copy_key]["source_rel"]
         if change.kind == "added":
-            return change.copy_key.split("|", 2)[2]
+            return change.source
         return self.index.copies[change.copy_key]["source_rel"]
 
     def _deletes_whole_item(self, item: Item, deletes: List[LocalChange], edits: List[LocalChange]) -> bool:
@@ -1266,11 +1269,12 @@ class Engine:
         for name in {m.name for m in effective} - set(plan.failed):
             self.alerts.close(f"module:{name}")
         previous_hooks = [h for h in self.index.hooks if h["module"] in self.failed_modules]
-        self.index.hooks = previous_hooks + [
+        hooks = previous_hooks + [
             {"module": h.module, "name": h.name, "path": str(h.path), "events": h.events, "tools": h.tools, "protocol": h.protocol,
              "args": h.args, "runtime": h.runtime, "timeout": h.timeout, "on_failure": h.on_failure, "apps": h.apps, "order": h.order}
             for h in plan.hooks]
         self._write_copies(plan)
+        self.index.hooks = hooks  # After the hook files are written, so a saved index never names a missing one.
         self._write_sections(plan)
         self.index.save()
         self.write_cursor_rules(plan)
@@ -1335,7 +1339,8 @@ class Engine:
             breaks_only = entry is not None and current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy.key, entry, current)
             if breaks_only and copy.data == self.index.rendered(copy.key):
                 continue  # Saved again with other line breaks, and nothing to update: leave it as saved.
-            if entry is not None and current is not None and sha256(current) != expected and not breaks_only:
+            known = entry is not None or copy.key in self.carried
+            if known and current is not None and sha256(current) != expected and not breaks_only:
                 # Edited since this run started; the next run carries it back.
                 if self.carried_text.get(copy.key) == sha256(copy.data):
                     # This run carried an earlier edit to this copy back, and the config repo now
@@ -1346,7 +1351,7 @@ class Engine:
                     rebased = True
                 continue
             if current == copy.data:
-                if entry is None:
+                if entry is None and copy.key not in self.carried:
                     # The file was already here, written by someone else: keep a copy so uninstall leaves it.
                     self._backup_unmanaged(copy, current, None)
                 if entry is None or entry["hash"] != sha256(copy.data):
@@ -1364,12 +1369,14 @@ class Engine:
             current = read_or_none(copy.path)
             if (sha256(current) if current is not None else None) != checked[copy.key]:
                 continue  # Changed since it was checked; the next run sees the change.
-            self._backup_unmanaged(copy, current, entry)
-            self.record.file(real(copy.path), current)
+            backup = None if copy.key in self.carried else self._backup_unmanaged(copy, current, entry)
             try:
                 atomic_write(copy.path, copy.data, executable=copy.executable, expect=checked[copy.key])
             except ChangedUnderneath:
+                if backup is not None:
+                    backup.unlink()  # Nothing was replaced, so there is nothing to put back.
                 continue
+            self.record.file(real(copy.path), current)
             self.index.put_copy(copy.key, record["index"], copy.data)
             self._settled(copy.key)
             self.report.installed.append(copy.key)
@@ -1405,7 +1412,7 @@ class Engine:
         found: Set[str] = set()
         for copy in wanted.values():
             group = f"{copy.app}|{copy.module}/{copy.item}"
-            if copy.key in self.index.copies or group in self.replace_existing or self.index.approvals.get("replace:" + group) or copy.app == "kit":
+            if copy.key in self.index.copies or copy.key in self.carried or group in self.replace_existing or self.index.approvals.get("replace:" + group) or copy.app == "kit":
                 continue
             current = read_or_none(copy.path)
             if current is not None and current != copy.data:
@@ -1418,17 +1425,20 @@ class Engine:
             self.alerts.raise_(f"collision:{group}", f"agent-kit-sync did not overwrite {item_key} in {self._app_label(app)}, because a different one is already there.", "agent-kit-sync held")
         return found
 
-    def _backup_unmanaged(self, copy: Copy, current: Optional[bytes], entry: Optional[dict]) -> None:
+    def _backup_unmanaged(self, copy: Copy, current: Optional[bytes], entry: Optional[dict]) -> Optional[Path]:
+        """Keep a file the tool did not write before replacing it. Returns the backup when this call made it."""
         if entry is not None or current is None:
-            return
+            return None
         target = real(copy.path)
         try:
             rel = target.relative_to(real(Path.home()))
         except ValueError:
             rel = Path(*target.parts[1:])
         backup = self.layout.state / "backups" / rel
-        if not backup.exists():
-            atomic_write(backup, current)
+        if backup.exists():
+            return None
+        atomic_write(backup, current)
+        return backup
 
     def _remove_stale(self, wanted: Set[str], plan: Plan) -> None:
         failed = set(plan.failed)
@@ -1442,12 +1452,13 @@ class Engine:
             breaks_only = current is not None and sha256(current) != expected and self._copy_line_breaks_only(copy_key, entry, current)
             if current is not None and sha256(current) != expected and not breaks_only:
                 continue  # Edited by someone; leave it for the next run to carry back.
-            self.record.file(real(path), current, kind="remove")
             if current is not None:
                 try:
                     remove_file(path, expect=sha256(current) if breaks_only else entry["hash"])
                 except ChangedUnderneath:
                     continue
+            self.record.file(real(path), current, kind="remove")
+            if current is not None:
                 if entry.get("kind") == "skill":
                     prune_empty_dirs(path.parent, path.parent.parent.parent)
                 else:
@@ -1528,7 +1539,6 @@ class Engine:
                         unwrap.append(entry["key"])
             new_text = sections.apply(text, desired, managed, unwrap)
             if new_text != text:
-                self.record.file(real(path), raw, kind="instructions")
                 # Record what is about to be written, so a crash between the write and the index save
                 # is finished by the next run instead of being read as an edit.
                 pending = {f"{app}|{block.key}": sha256(block.content.encode("utf-8")) for block in by_app.get(app, [])}
@@ -1538,6 +1548,7 @@ class Engine:
                 except ChangedUnderneath:
                     self.journal.finish()
                     continue
+                self.record.file(real(path), raw, kind="instructions")
             for key in list(self.index.blocks):
                 if self.index.blocks[key]["app"] == app and self.index.blocks[key]["key"] not in desired:
                     del self.index.blocks[key]

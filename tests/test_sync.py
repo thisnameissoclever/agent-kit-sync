@@ -1231,6 +1231,92 @@ class EditDuringRunTests(TwoMachines):
         source = (a.layout.config / "modules/writing/skills/review/SKILL.md").read_text()
         self.assertIn("Read the whole draft and report every problem.", source)
 
+    def test_file_added_to_a_skill_and_edited_during_the_run_is_kept(self):
+        self.standard_config()
+        a = self.machine("a")
+        a.sync()
+        notes = a.path(".claude", "skills", "review", "notes.md")
+        a.write(notes, "First notes.\n")
+        _engine, report = self.sync_with_edit_during_run(a, notes, "First notes.", "Second notes.")
+        self.assertEqual(report.edits, ["writing/review"])
+        self.assertEqual(a.read(".claude", "skills", "review", "notes.md"), "Second notes.\n")
+        self.assertTrue(a.path(".claude", "skills", "review", "SKILL.md").is_file())
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertEqual((a.layout.config / "modules/writing/skills/review/notes.md").read_text(), "Second notes.\n")
+        self.assertEqual(a.read(".agents", "skills", "review", "notes.md"), "Second notes.\n")
+        self.assertFalse((a.layout.state / "backups" / ".claude" / "skills" / "review" / "notes.md").exists())
+
+    def test_copy_edited_after_it_was_checked_is_not_overwritten(self):
+        self.standard_config()
+        a, b = self.machine("a"), self.machine("b")
+        a.sync()
+        b.sync()
+        other = b.path(".claude", "agents", "helper.md")
+        b.write(other, other.read_text().replace("Help with the task.", "Help carefully."))
+        b.sync()
+        path = a.path(".claude", "agents", "helper.md")
+        from agent_kit_sync.engine import Engine
+        with a.env():
+            engine = Engine(a.layout)
+            begin = engine.journal.begin
+
+            def edit_then_begin(entries):
+                if any(e.get("copy_key") == "claude|writing/helper|agents/helper.md" for e in entries):
+                    a.write(path, path.read_text(encoding="utf-8").replace("Help with the task.", "Help with the whole task."))
+                return begin(entries)
+
+            engine.journal.begin = edit_then_begin
+            engine.run()
+            record = engine.record.data["files"]
+        self.assertIn("Help with the whole task.", a.read(".claude", "agents", "helper.md"))
+        self.assertNotIn(str(path), [entry["path"] for entry in record])
+
+    def test_rebase_survives_a_write_that_fails(self):
+        self.standard_config()
+        manifest = self.seed / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[sections]]\nname = "other"\nfile = "sections/other.md"\n', encoding="utf-8")
+        (self.seed / "modules/writing/sections/other.md").write_text("Other rule.\n", encoding="utf-8")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "-qm", "second section")
+        git(self.seed, "push", "-q")
+        a = self.machine("a")
+        a.sync()
+        path = a.path(".claude", "CLAUDE.md")
+        a.write(path, path.read_text().replace("Write plainly.", "Write plainly and briefly."))
+        # A change to the other section's source makes this run rewrite CLAUDE.md, and that write fails.
+        (a.layout.config / "modules/writing/sections/other.md").write_text("Other rule, changed.\n", encoding="utf-8")
+        from agent_kit_sync.engine import Engine
+        from agent_kit_sync.fsutil import ChangedUnderneath
+        import agent_kit_sync.engine as engine_module
+        with a.env():
+            engine = Engine(a.layout)
+            commit_local = engine.commit_local
+            real_write = engine_module.atomic_write
+
+            def commit_then_edit(message):
+                commit_local(message)
+                a.write(path, path.read_text(encoding="utf-8").replace("Keep projects", "Always keep projects"))
+
+            def failing_write(target, data, **kwargs):
+                if Path(target).name == "CLAUDE.md":
+                    raise ChangedUnderneath(str(target))
+                return real_write(target, data, **kwargs)
+
+            engine.commit_local = commit_then_edit
+            engine_module.atomic_write = failing_write
+            try:
+                engine.run()
+            finally:
+                engine_module.atomic_write = real_write
+        self.assertNotIn("Other rule, changed.", a.read(".claude", "CLAUDE.md"))  # The write did fail.
+        engine, report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        source = (a.layout.config / "modules/writing/sections/plain.md").read_text()
+        self.assertIn("Write plainly and briefly.", source)
+        self.assertIn("Always keep projects", source)
+        self.assertIn("Other rule, changed.", a.read(".claude", "CLAUDE.md"))
+
     def test_edit_during_a_run_that_carried_nothing_back_stays_an_edit(self):
         self.standard_config()
         a = self.machine("a")
