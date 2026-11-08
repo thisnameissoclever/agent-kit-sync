@@ -7,6 +7,8 @@ description: Set up agent-kit-sync on this machine for the first time, or add th
 
 Run each step below in order. Steps that run a command print JSON; read it before the next step. The user answers every question before anything in an agent app's folders changes. Ask each question with your app's question tool, one decision per question, and give a recommendation for each.
 
+Make each question understandable on its own. Explain what each skill, agent, hook, or instruction does, which apps it affects, what the machine does today, and what the proposed change would do. For a replacement, describe the meaningful differences and any local behavior or support files it would remove. For a merge, describe which parts of each version survive and show the merged text before asking to apply it. Put this information in the question; a list of names, a diff, or a linked report alone is insufficient. Keep an unanswered or unclear item pending while continuing independent approved work.
+
 The command is `{{kit.cli}}`. On a machine without agent-kit-sync, the README's setup prompt has you clone the tool repo first. Until step 2 finishes, run each command as `python3 -I -S CLONE/bootstrap.py setup ...`, where CLONE is that clone's folder; on Windows use `py -3` in place of `python3`.
 
 ## 1. Check prerequisites
@@ -46,6 +48,10 @@ The projects folder is where the user keeps code repositories. Run `{{kit.cli}} 
 
 Recommend the worktrees folder inside the projects folder, named by `defaults.worktrees_folder_name` for this operating system, or `_worktrees` on macOS and Linux and `.worktrees` on Windows when the config repo sets none.
 
+Show the projects folder and its subdirectories separately. For example, a Windows projects folder `D:\Projects` with the default worktrees name resolves to `D:\Projects\.worktrees`. Build that path by joining the parent folder and child name, preserving the directory separator. Reuse the directory when it already exists.
+
+After the folder choice is approved, create missing required subdirectories during step 8. Inspect the chosen modules for paths under the projects folder, including paths rendered from `{{kit.projects}}`. If a module uses `{{kit.projects}}/_status/state/commitments.md`, create the `_status` subdirectory and its `state` child under the approved projects folder. The missing directories are setup work, not a reason to disable the module or ask for another location. Preserve existing contents. Initialize a referenced data file only through its documented format or initializer; otherwise leave its contents absent and report any actual feature limitation separately. Directory creation alone does not restore commitments or other data from another machine.
+
 ## 5. Suggest blocklist terms
 
 The blocklist, `~/.agent-kit-sync/blocklist.txt`, holds terms that must never be pushed to the config repo, one per line. Suggest the user's employer name, taken from the domain of their work email address, and internal host names you saw in their instruction files. Ask the user to add or remove terms. Write the file.
@@ -54,7 +60,7 @@ The blocklist, `~/.agent-kit-sync/blocklist.txt`, holds terms that must never be
 
 Run `{{kit.cli}} setup report` and read the report it writes. For each pair under "Possible duplicates", read both versions and decide whether they do the same job. Names and wording may differ; two items are duplicates when an agent following either one would act the same way. Also compare every local skill, subagent definition, hook, and instruction-file heading that the report did not pair against the config repo's modules, because the tool's signals miss duplicates with different names and little shared text.
 
-For each duplicate, show the user a short excerpt of each version that shows the difference, and recommend one outcome:
+For each duplicate, explain its purpose and the practical difference between the versions in the question. Show a short excerpt of each version that demonstrates the difference, and recommend one outcome:
 
 - **The config repo's version replaces the local one**, when the local copy is an older version of the same item.
 - **The local version replaces the config repo's**, when this machine has the newer or better version.
@@ -70,11 +76,13 @@ For each local skill, subagent definition, hook, and instruction section that is
 
 For each hook to add, follow the portable-scripts skill before adding it.
 
+Explain when each hook runs, what it can block or change, which apps run it, and what happens if it fails. Explain that adding a skill makes its instructions available; any dependency installation, command execution, or external action the skill later proposes still follows that action's approval requirements.
+
 ## 8. Apply the answers
 
 1. For a new config repo, create it now. With the GitHub CLI: `gh repo create NAME --private --source ~/.agent-kit-sync/config --push`.
 2. Add each chosen item with `{{kit.cli}} add PATH --module MODULE` (add `--local` for a local module, `--heading "HEADING"` for an instruction section).
-3. Write the answers file, `~/.agent-kit-sync/state/setup-answers.toml`, with the machine values from steps 3 and 4 and these lists:
+3. Create the approved folders from step 4, including required module subdirectories, and verify their resolved paths. Write the answers file, `~/.agent-kit-sync/state/setup-answers.toml`, with the machine values from steps 3 and 4 and these lists:
     - `approve`: each `module/item` the user approved to install.
     - `replace_existing`: each `app|module/item` where the config repo's version replaces a local file.
     - `remove_registrations`: one table per existing hook entry that was adopted into a module, with `file`, `event`, and `command` from the scan, so the hook does not run twice.

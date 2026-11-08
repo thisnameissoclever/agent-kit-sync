@@ -88,6 +88,8 @@ Use the same prompt. The agent compares what the machine already has with your c
 
 It also lists the machine's other skills, hooks, and instruction sections, and recommends which to add to the config repo, which to keep on this machine only, and which to leave alone. Nothing is replaced or removed without your answer, and each replaced file is backed up first.
 
+Each approval question explains what the item does, which apps it affects, and how the proposed version changes the machine's current behavior. For a merge, the agent explains which parts of each version it will keep and shows the merged text before applying it. Reports and diffs provide supporting detail.
+
 ## How syncing works
 
 A sync runs in the background when a session starts, after an agent writes a file, and at the end of a turn when an installed copy changed. You can also run `agent-kit-sync sync`. A sync that succeeds prints nothing and adds nothing to any agent's context.
@@ -256,6 +258,8 @@ When another program changes a synced setting, agent-kit-sync holds the change a
 Code means anything that can run or change what agents may do without asking: hooks, scripts, non-Markdown files in skills, tests, hooks inside subagent definitions, and settings under `hooks`, `permissions`, `env`, and keys agent-kit-sync does not recognize. With the recommended values, text spreads by itself, and code moves between machines only after you approve it where it was written and where it arrives. With `approval = "terminal"`, approving a held change needs `yes` typed in an interactive terminal outside an agent session. An agent that can run commands in a terminal of its own could still type it, so treat this setting as a guard against mistakes, not against a determined agent.
 
 The machine file also sets this machine's projects folder and worktrees folder. When it sets no projects folder, agent-kit-sync uses a folder in the home folder named by `defaults.projects_folder_name` in `kit.toml`, or `Projects` when that is not set. When it sets no worktrees folder, agent-kit-sync uses a folder inside the projects folder named by `defaults.worktrees_folder_name`, or `_worktrees` when that is not set (`.worktrees` on Windows). `agent-kit-sync doctor` shows each folder it uses this way.
+
+The worktrees name is a child directory: with projects in `D:\Projects`, the Windows default is `D:\Projects\.worktrees`. Setup reuses existing directories and creates missing required subdirectories after you approve the parent folder. For example, a module that refers to `{{kit.projects}}/_status/state/commitments.md` needs an `_status` directory under the projects folder, with a `state` child. Setup creates those directories; their absence is not a reason to disable the module. Existing contents are preserved. Creating directories does not restore the referenced data files; setup uses a documented initializer where one exists and reports any actual feature limitation separately.
 
 An override changes one module or item on this machine only:
 
