@@ -149,6 +149,9 @@ class RunRecord:
         user had before agent-kit-sync, which this run put back at `path` after removing the copy."""
         for entry in self.data["files"]:
             if entry["path"] == str(path):
+                # Recorded already, with its bytes from before the run, when this run wrote the path first.
+                if backup is not None:
+                    entry["backup"] = str(backup)
                 return
         saved = None
         if old is not None:

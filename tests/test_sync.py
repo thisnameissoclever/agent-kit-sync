@@ -1616,6 +1616,16 @@ class RemovalSafetyTests(TwoMachines):
         backup = a.layout.state / "backups" / ".claude" / "agents" / "helper.md"
         self.assertEqual(backup.read_text(encoding="utf-8"), "my own helper, edited\n")
 
+    def test_run_that_writes_and_then_retires_a_copy_records_the_restored_file(self):
+        from agent_kit_sync.state import RunRecord
+        a = self.machine("a")
+        path, backup = a.path(".claude", "agents", "helper.md"), a.layout.state / "backups" / "helper.md"
+        record = RunRecord(a.layout)
+        record.file(path, b"my own helper\n")
+        record.file(path, b"the config repo's helper\n", kind="remove", backup=backup)
+        self.assertEqual([(e["path"], e["kind"], e.get("backup")) for e in record.data["files"]], [(str(path), "copy", str(backup))])
+        self.assertEqual(Path(record.data["files"][0]["saved"]).read_bytes(), b"my own helper\n")
+
     def test_deleting_a_copy_does_not_bring_back_the_file_it_replaced(self):
         self.standard_config()
         a = self.machine("a")
