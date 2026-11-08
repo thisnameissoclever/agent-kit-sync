@@ -255,6 +255,8 @@ When another program changes a synced setting, agent-kit-sync holds the change a
 
 Code means anything that can run or change what agents may do without asking: hooks, scripts, non-Markdown files in skills, tests, hooks inside subagent definitions, and settings under `hooks`, `permissions`, `env`, and keys agent-kit-sync does not recognize. With the recommended values, text spreads by itself, and code moves between machines only after you approve it where it was written and where it arrives. With `approval = "terminal"`, approving a held change needs `yes` typed in an interactive terminal outside an agent session. An agent that can run commands in a terminal of its own could still type it, so treat this setting as a guard against mistakes, not against a determined agent.
 
+When the machine file sets no projects folder, agent-kit-sync uses the folder named by `defaults.projects_folder_name` in `kit.toml` inside the home folder, or `Projects` when that is not set, and the worktrees folder inside it; `agent-kit-sync doctor` says so.
+
 An override changes one module or item on this machine only:
 
 | Command | Effect |
@@ -295,7 +297,7 @@ Two examples of held changes:
 
 ## Cloud sessions
 
-Claude Code's cloud sessions ignore your home folder's skills and hooks. Its cloud environments run a setup script before environment variables are set, and reuse its result for about a week. Cloud support is not tested yet. Until it is, use `agent-kit-sync install --cloud --config-url URL` from a session-start hook in the repository the session works on. In a cloud session, agent-kit-sync installs but never pushes. A machine whose machine file sets no projects folder, such as a cloud session, uses the folder named by `defaults.projects_folder_name` in `kit.toml` inside the home folder, or `Projects` when that is not set, and the worktrees folder inside it; `agent-kit-sync doctor` says so.
+agent-kit-sync does not support cloud sessions, such as Claude Code on the web. A cloud session starts from a fresh copy of the repository it works on and does not read your home folder's skills, subagent definitions, hooks, or instructions, so nothing agent-kit-sync installs on your machines reaches it. To use a skill or subagent definition in a cloud session, commit it to that repository's `.claude` folder.
 
 ## Commands
 
