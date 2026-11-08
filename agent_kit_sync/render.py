@@ -70,8 +70,35 @@ class Values:
         return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
 
 
-def substitute(text: str, values: Values) -> str:
-    return PLACEHOLDER.sub(lambda match: values.lookup(match.group(1), match.group(2)), text)
+def substitute(text: str, values: Values, header: bool = False) -> str:
+    """Replace each placeholder in `text`. With `header`, `text` is a line of a --- header block."""
+    def value(match) -> str:
+        found = values.lookup(match.group(1), match.group(2))
+        if header and match.group(1) == "hook" and in_double_quotes(text, match.start()):
+            # A hook command in a JSON or YAML double-quoted string, as in a subagent's hooks field: a quote
+            # or backslash in it, from a path quoted for the shell, would end the string or start an escape.
+            found = escape_double_quoted(found)
+        return found
+
+    return PLACEHOLDER.sub(value, text)
+
+
+def in_double_quotes(text: str, at: int) -> bool:
+    """Whether position `at` is inside a double-quoted string, counting quotes not escaped by a backslash."""
+    inside = False
+    escaped = False
+    for char in text[:at]:
+        if escaped:
+            escaped = False
+        elif char == "\\" and inside:
+            escaped = True
+        elif char == '"':
+            inside = not inside
+    return inside
+
+
+def escape_double_quoted(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def placeholders_in(text: str) -> List[str]:
@@ -127,12 +154,15 @@ def shown_line(comment: str, source_line: str) -> str:
     return comment + source_line[len(body):]
 
 
-def reverse_paths(line: str, values: Values) -> str:
-    """Turn hook commands and this machine's own folder paths back into placeholders, on whole path prefixes."""
-    for key, command in sorted(values.hooks.items(), key=lambda pair: len(pair[1]), reverse=True):
-        if command:
-            pattern = re.compile(r"(?<![\w./\\-])" + re.escape(command) + r"(?=$|[\s\"'`;|&<>)\]]|[.,:](?:\s|$))")
-            line = pattern.sub(lambda _match, key=key: "{{kit.hook " + key + "}}", line)
+def reverse_paths(line: str, values: Values, header: bool = False) -> str:
+    """Turn hook commands and this machine's own folder paths back into placeholders, on whole path prefixes.
+    With `header`, `line` is a line of a --- header block, where substitute escapes a command in double quotes."""
+    forms = [(command, key) for key, command in values.hooks.items() if command]
+    if header:
+        forms += [(escape_double_quoted(command), key) for command, key in list(forms) if escape_double_quoted(command) != command]
+    for command, key in sorted(forms, key=lambda pair: len(pair[0]), reverse=True):
+        pattern = re.compile(r"(?<![\w./\\-])" + re.escape(command) + r"(?=$|[\s\"'`;|&<>)\]]|[.,:](?:\s|$))")
+        line = pattern.sub(lambda _match, key=key: "{{kit.hook " + key + "}}", line)
     for value, token in values.path_pairs():
         pattern = re.compile(r"(?<![\w.\-/\\~])" + re.escape(value) + r"(?=$|[/\\\s\"'`),;:\]>}]|\.(?:\s|$))")
         line = pattern.sub(lambda _match: token, line)
@@ -386,11 +416,12 @@ def _md_rule(app: str, values: Values, lines: Sequence[str]) -> Tuple[LineRule, 
             return None
         if number in shown:
             return shown_line(shown[number], line)
-        if start >= 0 and start < number < end:
+        in_header = start >= 0 and start < number < end
+        if in_header:
             match = FRONT_KEY.match(line)
             if match and match.group(1).startswith(own):
                 line = match.group(1)[len(own):] + ":" + match.group(2) + line[match.end():]
-        return substitute(line, values)
+        return substitute(line, values, header=in_header)
 
     return rule, renamed, shown, blocks
 
@@ -415,7 +446,7 @@ def carry_back_agent_md(source: str, app: str, old_render: str, edited: str, val
     _, e_start, e_end = split_frontmatter(edited)
 
     def reverse(j: int, line: str) -> str:
-        line = reverse_paths(line, values)
+        line = reverse_paths(line, values, header=e_start >= 0 and e_start < j < e_end)
         if e_start >= 0 and e_start < j < e_end:
             match = FRONT_KEY.match(line)
             if match:
@@ -471,7 +502,7 @@ def codex_fields(source: str, values: Values) -> Tuple[Dict[str, object], str]:
                 if any(lines[k].strip() for k in range(first + 1, after)):
                     raise RenderError(f"field {key} must fit on one line to reach Codex")
                 name = key[len("codex."):] if key.startswith("codex.") else key
-                value = yaml_scalar(substitute(FRONT_KEY.match(lines[first]).group(2), values))
+                value = yaml_scalar(substitute(FRONT_KEY.match(lines[first]).group(2), values, header=True))
                 fields[name] = value
         body = "".join(lines[end + 1:])
     else:

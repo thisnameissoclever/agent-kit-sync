@@ -306,6 +306,34 @@ class WindowsHookCommandTests(unittest.TestCase):
         header = '{"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "' + command + '"}]}]}'
         self.assertEqual(json.loads(header)["PreToolUse"][0]["hooks"][0]["command"], command)
 
+    def values(self, command):
+        from agent_kit_sync import render
+        return render.Values(home="C:/Users/Pat", projects="", worktrees="", module="", app="claude", os="windows", cli="", hooks={"m/guard": command})
+
+    def test_command_with_an_apostrophe_survives_a_subagent_header_and_carries_back(self):
+        from agent_kit_sync import render
+        command = self.command(r"C:\Users\O'Brien\py\python.exe", r"C:\Users\O'Brien\.agent-kit-sync\launcher.py")
+        self.assertIn('"', command)
+        source = ('---\nname: reviewer\nclaude.hooks: {"PreToolUse": [{"hooks": [{"type": "command", "command": "{{kit.hook m/guard}}"}]}]}\n---\n'
+                  'Run "{{kit.hook m/guard}}" by hand.\n')
+        values = self.values(command)
+        copy = render.render_agent_md(source, "claude", values).text
+        header = copy.split("\n")[2]
+        self.assertEqual(json.loads(header.split(": ", 1)[1])["PreToolUse"][0]["hooks"][0]["command"], command)
+        self.assertIn(f'Run "{command}" by hand.', copy)
+        edited = copy.replace("by hand.", "by hand when needed.")
+        self.assertEqual(render.carry_back_agent_md(source, "claude", copy, edited, values), source.replace("by hand.", "by hand when needed."))
+
+    def test_check_finds_a_literal_hook_command_with_quoted_paths(self):
+        from agent_kit_sync.checks import HOOK_COMMAND
+        for python, launcher in ((self.PYTHON, self.LAUNCHER), (r"C:\Users\O'Brien\py\python.exe", r"C:\Users\O'Brien\.agent-kit-sync\launcher.py")):
+            command = self.command(python, launcher)
+            for line in (command, json.dumps({"command": command})):
+                with self.subTest(line=line):
+                    self.assertTrue(HOOK_COMMAND.search(" " + line), line)
+        self.assertTrue(HOOK_COMMAND.search("x /usr/bin/python3 -I -S '/Users/Pat Doe/.agent-kit-sync/launcher.py' run-hook m/g"))
+        self.assertTrue(HOOK_COMMAND.search('x "C:\\Users\\Pat Doe\\py\\python.exe" -I -S "C:\\Users\\Pat Doe\\.agent-kit-sync\\launcher.py" run-hook m/g'))
+
     @unittest.skipUnless(bash_program(), "Bash is not installed")
     def test_bash_passes_each_part_unchanged(self):
         import tempfile

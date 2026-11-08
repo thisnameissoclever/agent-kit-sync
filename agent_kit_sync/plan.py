@@ -155,14 +155,16 @@ PLAIN_WORD = re.compile(r"[\w./:-]+")
 
 
 def windows_cli(parts: List[str]) -> str:
-    """A command for Windows that Git Bash, PowerShell, and a JSON or YAML string in a subagent header all
-    keep intact.
+    """A command for Windows that Git Bash and PowerShell both run as written.
 
     Paths use forward slashes, which Windows programs accept: Git Bash removes a backslash from an
     unquoted word, and a backslash in a JSON or YAML double-quoted string starts an escape. A part
     with a space or another character a shell reads is quoted for Bash and PowerShell alike. When
     the program itself is quoted, PowerShell needs its call operator in front, which Bash refuses,
     so it is added only where Claude Code runs hooks in PowerShell, on a machine without Git Bash.
+    A part no quoting suits for both shells, a path holding both ' and $, gets Command Prompt
+    quoting, which Git Bash runs and PowerShell does not. A command inside a double-quoted string is
+    escaped where it is placed; see render.substitute.
     """
     from .register import git_bash, windows_hook_quote
     parts = [part.replace("\\", "/") for part in parts]
