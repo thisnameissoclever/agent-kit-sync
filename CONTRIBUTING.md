@@ -1,6 +1,8 @@
 # Contributing to agent-kit-sync
 
-Every change arrives through a pull request. The main branch is protected: a pull request merges only after the tests pass on Linux, macOS, and Windows, and pull requests from anyone other than the repository owner also need the owner's approval.
+Every change arrives through a pull request. The main branch is protected, and pull requests from anyone other than the repository owner need the owner's approval. Hosted tests are optional and are not required to merge. Other branch protections still apply.
+
+Before merging, default to running relevant checks locally and obtaining independent review with fresh context. Record the checked commit, base, commands, results, and any platform limits. Record any deliberate verification or review exception and its remaining risk.
 
 ## Run the tests
 
@@ -11,6 +13,8 @@ python3 -m unittest -v
 ```
 
 The tests build fake home folders and a local bare Git repository, and use no network.
+
+The **Tests** workflow is available on demand through **Actions > Tests > Run workflow**. It runs nine combinations across Linux, macOS, Windows, and Python 3.9, 3.10, and 3.13. It does not run automatically on pushes or pull requests. Run it only when explicitly requested; opening, updating, or merging a pull request does not authorize hosted test runs.
 
 ## Keep personal and employer terms out of this repository
 

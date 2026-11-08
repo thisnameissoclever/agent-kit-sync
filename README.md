@@ -334,7 +334,7 @@ Code reaches your machines in four ways:
 
 - Anyone who can push to your config repo can change what runs on every machine that syncs from it.
 - An agent on any of your machines can edit a hook, including an agent misled by text it read, such as a web page.
-- This repository's main branch reaches every machine with `tool_updates = "apply"`. Pull requests from anyone but the owner need the owner's approval, and every pull request needs passing tests on Linux, macOS, and Windows. The owner's own pull requests merge on passing tests alone.
+- This repository's main branch reaches every machine with `tool_updates = "apply"`. Changes go through pull requests, and pull requests from anyone but the owner need the owner's approval. Relevant local checks and independent review with fresh context are the default before merging. Hosted tests run only when explicitly requested and are not required to merge; other branch protections still apply. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - A plugin enabled by a synced setting is installed and updated by its agent app, outside agent-kit-sync's checks.
 
 Your protections are the checks, the policy settings `code_changes`, `outgoing`, `tool_updates`, and `approval`, the blocklist, and the public repository warning. Each app's own hooks screen shows only the dispatcher, so it does not show synced hook code. agent-kit-sync stores no token or password; Git uses your machine's own credentials.
@@ -343,7 +343,7 @@ Your protections are the checks, the policy settings `code_changes`, `outgoing`,
 
 - Cursor's settings, and Antigravity, are not supported yet.
 - Skills from other repositories, such as public skill collections, cannot be added as sources yet.
-- agent-kit-sync itself is tested on Windows by the hosted tests only. Your own hooks are tested on Windows only when a Windows machine installs them.
+- Test results cover only the systems on which the tests actually ran. The optional **Tests** workflow can test agent-kit-sync on Linux, macOS, and Windows on demand. Your own hooks are tested on Windows only when a Windows machine installs them.
 
 ## Contributing
 
