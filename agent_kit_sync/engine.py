@@ -1191,12 +1191,16 @@ class Engine:
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
         result = []
         present = set()
+        for held in self.held.all():
+            if held.get("kind") in ("new-item", "incoming", "removal") and held.get("item_key"):
+                self._disabled_incoming(held["item_key"])
         for module in modules:
             kept = []
             tree = Tree(module.root)
             for item in module.items:
                 present.add(item.key)
                 if self._disabled_incoming(item.key):
+                    kept.append(item)  # Retain hook names for rendering other enabled items.
                     continue
                 info = self.index.items.get(item.key)
                 if module.local or head is None:
@@ -1339,6 +1343,8 @@ class Engine:
             if module.name in self.failed_modules:
                 continue
             for item in module.items:
+                if self._disabled_incoming(item.key):
+                    continue  # A disabled source version has not been approved or installed.
                 tree = tree_for(module, item)
                 info = self.index.items.setdefault(item.key, {})
                 if item.key in trees and not module.local:

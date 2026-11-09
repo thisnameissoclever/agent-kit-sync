@@ -4,8 +4,8 @@
 
 1. **What happened:** Declining a new item disabled installation, but the next sync raised the same incoming approval request again.
 2. **Root cause:** Incoming policy evaluated every manifest item before the planner applied machine-local disable overrides.
-3. **Prevention:** Check both module and item disable overrides before creating incoming requests, running incoming tests, or recording a source version as installed. Close only the obsolete incoming request and preserve saved local edits.
-4. **How to verify:** Decline an item, sync repeatedly, and check that it stays absent without another incoming alert. Disable a whole module with existing requests and confirm its incoming requests close while an outgoing saved edit survives. Enable a previously declined item under review-all policy and confirm first installation still needs approval.
+3. **Prevention:** Check both module and item disable overrides before creating incoming requests, running incoming tests, or recording a source version as installed. Close only the obsolete incoming request and preserve saved local edits. Keep hook names available for rendering other enabled items, and clear disabled incoming requests even when their sources have left the inventory.
+4. **How to verify:** Decline an item, sync repeatedly, and check that it stays absent without another incoming alert. Disable a whole module with existing requests and confirm its incoming requests close while an outgoing saved edit survives. Enable a previously declined item under review-all policy and confirm first installation still needs approval. Disable a referenced hook and confirm other items still render while that hook is removed; disable an item with an old request after its manifest entry disappears and confirm the request closes.
 
 ## 2026-11-08: Explain setup decisions and create required subdirectories
 
