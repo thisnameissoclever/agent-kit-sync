@@ -20,6 +20,7 @@ MAX_ENTRIES = 512
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
+NATIVE_WINDOWS_COPY = os.name == "nt"
 
 
 class PendingMigration(Exception):
@@ -84,10 +85,18 @@ def _unique(paths):
         key = str(path.absolute())
         if key not in seen:
             seen.add(key)
-            if path.exists() and not _linked(path) and any(p.exists() and not _linked(p) and os.path.samefile(path, p) for p in result):
+            if _present(path) and not _linked(path) and any(_present(p) and not _linked(p) and os.path.samefile(path, p) for p in result):
                 continue
             result.append(path)
     return result
+
+
+def _present(path):
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def _snapshot(root):
@@ -132,6 +141,8 @@ def _access(info, path):
 
 
 def _exclusive_copy(source, target, digest):
+    if not NATIVE_WINDOWS_COPY:
+        raise PendingMigration("POSIX byte copying is disabled; use the metadata-preserving directory move or native reconciliation.")
     data = _read(source)
     if sha256(data) != digest:
         raise PendingMigration(f"Source changed before copying: {source}")
@@ -420,11 +431,32 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
             try:
                 if not projects.is_dir():
                     raise PendingMigration(f"Configured projects directory is unavailable: {projects}")
+                if not NATIVE_WINDOWS_COPY:
+                    proposed = list(dict.fromkeys(record["explicit_sources"] + [str(p) for p in explicit_sources]))
+                    if len(proposed) > 16:
+                        raise PendingMigration("Too many explicit historical sources for one bounded migration.")
+                    record["explicit_sources"] = proposed
+                    posix_sources = [p for p in _unique(legacy_directories(projects) + [Path(p) for p in proposed]) if _present(p)]
+                    if posix_sources or "posix_move" in record:
+                        from .status_posix import run as run_posix
+                        if len(posix_sources) == 1 and not posix_sources[0].is_symlink() and posix_sources[0].is_dir():
+                            _snapshot(posix_sources[0])  # Bounded topology check: no repositories, links, or special files.
+                        def save_posix(current):
+                            current["checked_at"] = time.time()
+                            _save_receipt(receipt_path, current)
+                        moved = run_posix(record, projects, layout, posix_sources, finalize=finalize,
+                                          plan_id=record.get("plan_id") if use_prepared_plan else plan_id,
+                                          active_paths=active_paths, save=save_posix)
+                        if moved["state"] in ("prepared", "complete") and not finalize:
+                            (canonical / "state").mkdir(mode=0o700, exist_ok=True)
+                        return moved
                 _contained(canonical, canonical)
                 if canonical.exists() and not canonical.is_dir():
                     raise PendingMigration(f"Canonical status path is not a directory: {canonical}")
                 record["canonical"] = str(canonical)
                 proposed_sources = list(dict.fromkeys(record["explicit_sources"] + [str(p) for p in explicit_sources]))
+                if len(proposed_sources) > 16:
+                    raise PendingMigration("Too many explicit historical sources for one bounded migration.")
                 _validate_sources(layout, canonical, [Path(p) for p in proposed_sources])
                 record["explicit_sources"] = proposed_sources
                 _recover_retirements(record)
@@ -432,7 +464,7 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                     if not Path(explicit).exists() and not any(e["source"] == explicit for e in record["retired"]):
                         raise PendingMigration(f"Explicit historical source is unavailable: {explicit}")
                 candidates = _unique(legacy_directories(projects) + [Path(p) for p in proposed_sources])
-                sources = [p for p in candidates if p.exists() or p.is_symlink()]
+                sources = [p for p in candidates if _present(p)]
                 _validate_sources(layout, canonical, sources)
                 snapshots = {str(p): _snapshot(p) for p in sources}
                 proposed_id = sha256(json.dumps({"canonical": str(canonical), "sources": snapshots}, sort_keys=True).encode())

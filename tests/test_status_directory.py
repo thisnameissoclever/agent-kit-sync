@@ -19,6 +19,7 @@ from agent_kit_sync.paths import Layout
 from agent_kit_sync.state import run_lock
 
 
+@unittest.skipUnless(os.name == "nt", "Windows copy-and-retain backend")
 class StatusDirectoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aks-status-")
@@ -331,10 +332,36 @@ class DirectoryPrivacyTests(unittest.TestCase):
                     migration._directory_privacy(source, target)
 
 
+class PosixDispatchTests(unittest.TestCase):
+    def test_owned_prepared_link_is_dispatched_before_generic_link_rejection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            projects = root / "Projects"
+            old = projects / "_status"
+            old.mkdir(parents=True)
+            canonical = projects / "status"
+            try:
+                canonical.symlink_to(old, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(str(error))
+            layout = Layout(root / "kit")
+            layout.state.mkdir(parents=True)
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({"version":2,"staged":{},"retired":[],"explicit_sources":[],"posix_move":{}}),encoding="utf-8")
+            def prepared(record, *args, **kwargs):
+                record.update(state="prepared", pending=[], plan_id="fixture")
+                return record
+            from agent_kit_sync import status_posix
+            with mock.patch.object(migration, "NATIVE_WINDOWS_COPY", False), mock.patch.object(status_posix, "run", side_effect=prepared) as run, mock.patch.object(migration, "_exclusive_copy", side_effect=AssertionError("POSIX byte copying")):
+                result = migration.migrate_status(layout, projects, required=True)
+            self.assertEqual(result["state"], "prepared")
+            run.assert_called_once()
+            self.assertTrue((old / "state").is_dir())
+
+
 class EngineStatusMigrationTests(unittest.TestCase):
     def test_install_switches_references_before_whole_directory_retirement(self):
         with tempfile.TemporaryDirectory(prefix="aks-status-engine-") as folder:
-            home = Path(folder)
+            home = Path(folder).resolve()
             projects = home / "Projects"
             old = projects / "_status"
             old.mkdir(parents=True)
