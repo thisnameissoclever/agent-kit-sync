@@ -1286,8 +1286,9 @@ class HookStagingTests(TwoMachines):
         self.assertTrue(self.installed(a, "helper.py").exists())
         self.assertIn("from helper", self.installed(a, "guard.py").read_text())
         self.assertFalse([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards/guard"])
-        import subprocess, sys
-        self.assertEqual(subprocess.run([sys.executable, str(self.installed(a, "guard.py"))]).returncode, 0)
+        import sys
+        from agent_kit_sync import processes
+        self.assertEqual(processes.run([sys.executable, str(self.installed(a, "guard.py"))]).returncode, 0)
 
     def test_new_hook_waits_while_the_file_it_imports_is_held(self):
         self.seed_files({"kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n'})
@@ -1495,6 +1496,112 @@ class HookStagingTests(TwoMachines):
         engine, _report = a.sync()
         self.assertIn("from helper", self.installed(a, "guard.py").read_text())
         self.assertFalse([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards/guard"])
+
+
+    def installed_with_helper(self):
+        self.seed_files({"kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n', "modules/guards/hooks/test_guard.py": self.TEST})
+        self.add_helper()
+        a = self.machine("a")
+        engine, _report = a.sync()
+        self.assertFalse([alert for alert in engine.alerts.open() if alert["key"].startswith("tests:")])
+        self.assertIn("from helper", self.installed(a, "guard.py").read_text())
+        return a
+
+    def test_change_to_a_file_an_unchanged_hook_imports_is_held_back(self):
+        a = self.installed_with_helper()
+        self.seed_files({"modules/guards/hooks/helper.py": "def renamed():\n    return True\n"}, "break the helper")
+        engine, _report = a.sync()
+        self.assertIn("def ok", self.installed(a, "helper.py").read_text())
+        messages = [alert["message"] for alert in engine.alerts.open() if alert["key"] == "tests:guards"]
+        self.assertTrue(messages and "kept module guards" in messages[0], messages)
+        # A compatible change installs and clears the alert.
+        self.seed_files({"modules/guards/hooks/helper.py": "def ok():\n    return 1 == 1\n"}, "fix the helper")
+        engine, _report = a.sync()
+        self.assertIn("1 == 1", self.installed(a, "helper.py").read_text())
+        self.assertFalse([alert for alert in engine.alerts.open() if alert["key"].startswith("tests:")])
+
+    def test_removing_a_file_an_unchanged_hook_imports_is_held_back(self):
+        a = self.installed_with_helper()
+        self.seed_files({"modules/guards/module.toml": '[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\ntests = ["hooks/test_guard.py"]\n'}, "drop the helper item")
+        engine, _report = a.sync()
+        self.assertTrue(self.installed(a, "helper.py").exists())
+        self.assertTrue([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards"])
+        import sys
+        from agent_kit_sync import processes
+        self.assertEqual(processes.run([sys.executable, str(self.installed(a, "guard.py"))]).returncode, 0)
+
+
+    def test_hook_failing_with_its_installed_files_does_not_hold_back_its_module(self):
+        a = self.installed_with_helper()
+        # The installed test now fails for a reason unrelated to the module's files.
+        a.write(a.layout.installed / "guards" / "hooks" / "test_guard.py", "import sys\nsys.exit(1)\n")
+        self.seed_files({"modules/guards/hooks/helper.py": "def ok():\n    return 2 > 1\n"}, "compatible helper change")
+        engine, _report = a.sync()
+        self.assertFalse([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards"])
+
+    def test_held_back_module_keeps_a_section_edited_here(self):
+        a = self.installed_with_helper()
+        self.seed_files({"modules/guards/hooks/helper.py": "def renamed():\n    return True\n"}, "break the helper")
+        engine, _report = a.sync()
+        self.assertTrue([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards"])
+        # The installed copies stay, the index keeps its entries, and a later good version installs.
+        self.assertIn("def ok", self.installed(a, "helper.py").read_text())
+        self.assertIn("guards/helper", engine.index.items)
+        self.seed_files({"modules/guards/hooks/helper.py": "def ok():\n    return True\n\ndef renamed():\n    return True\n"}, "compatible again")
+        engine, _report = a.sync()
+        self.assertIn("def renamed", self.installed(a, "helper.py").read_text())
+        self.assertFalse([alert for alert in engine.alerts.open() if alert["key"].startswith(("tests:", "module:"))])
+
+
+    def test_disabling_a_file_an_installed_hook_imports_holds_the_module(self):
+        a = self.installed_with_helper()
+        data = a.machine_data()
+        data.setdefault("overrides", {})["guards/helper"] = {"kind": "disable"}
+        a.write_machine(data)
+        engine, _report = a.sync()
+        self.assertTrue(self.installed(a, "helper.py").exists())
+        self.assertTrue([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards"])
+
+    def test_a_failing_changed_hook_does_not_hold_back_an_unchanged_one(self):
+        # guard imports helper.py, which is itself a hook ("base") with its own test.
+        # guard is listed first, so it is tested before base has been set back.
+        manifest = ('[[hooks]]\nname = "guard"\nfile = "hooks/guard.py"\nevents = ["stop"]\ntests = ["hooks/test_guard.py"]\n'
+                    '\n[[hooks]]\nname = "base"\nfile = "hooks/helper.py"\nevents = ["stop"]\ntests = ["hooks/test_base.py"]\n')
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guards"\n',
+            "modules/guards/module.toml": manifest,
+            "modules/guards/hooks/guard.py": self.HOOK,
+            "modules/guards/hooks/test_guard.py": self.TEST,
+            "modules/guards/hooks/helper.py": "def ok():\n    return True\n",
+            "modules/guards/hooks/test_base.py": "import sys\nsys.exit(0)\n",
+        })
+        a = self.machine("a")
+        engine, _report = a.sync()
+        self.assertFalse([alert for alert in engine.alerts.open() if alert["key"].startswith("tests:")])
+        # base changes so that it breaks guard and fails its own test. base alone stays back; guard keeps working.
+        self.seed_files({"modules/guards/hooks/helper.py": "def renamed():\n    return True\n",
+                         "modules/guards/hooks/test_base.py": "import sys\nsys.exit(1)\n"}, "break base")
+        engine, _report = a.sync()
+        keys = {alert["key"] for alert in engine.alerts.open()}
+        self.assertIn("tests:guards/base", keys)
+        self.assertNotIn("tests:guards", keys)
+        self.assertIn("def ok", self.installed(a, "helper.py").read_text())
+
+
+    def test_hook_set_back_to_its_earlier_version_is_tested_with_the_new_files(self):
+        a = self.installed_with_helper()
+        # The helper changes incompatibly with the installed hook, and the hook's new version fails its own test.
+        self.seed_files({
+            "modules/guards/hooks/helper.py": "def renamed():\n    return True\n",
+            "modules/guards/hooks/guard.py": "import sys\nfrom helper import renamed\nsys.exit(1)\n",
+        }, "new helper, broken new hook")
+        engine, _report = a.sync()
+        self.assertIn("def ok", self.installed(a, "helper.py").read_text())
+        self.assertIn("from helper import ok", self.installed(a, "guard.py").read_text())
+        self.assertTrue([alert for alert in engine.alerts.open() if alert["key"] == "tests:guards"])
+        import sys
+        from agent_kit_sync import processes
+        self.assertEqual(processes.run([sys.executable, str(self.installed(a, "guard.py"))]).returncode, 0)
 
 
 class EditDuringRunTests(TwoMachines):

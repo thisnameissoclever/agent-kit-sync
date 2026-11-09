@@ -93,6 +93,16 @@ class Plan:
     def instruction_files(self, machine: Machine) -> Dict[str, Path]:
         return {app: machine.app_homes[app] / name for app, name in INSTRUCTION_FILES.items() if app in machine.apps}
 
+    def drop_module(self, name: str) -> None:
+        """Treat a module as one that could not be planned, so this machine keeps what it installed for it."""
+        self.copies = [c for c in self.copies if c.module != name]
+        self.sections = [s for s in self.sections if s.key.split("/", 1)[0] != name]
+        self.settings = [s for s in self.settings if s.item_key.split("/", 1)[0] != name]
+        self.hooks = [h for h in self.hooks if h.module != name]
+        self.cursor_blocks = [b for b in self.cursor_blocks if b[0] != name]
+        if name not in self.failed:
+            self.failed.append(name)
+
 
 def runtimes_available() -> Dict[str, bool]:
     return {"python": True, "node": shutil.which("node") is not None, "bash": shutil.which("bash") is not None, "powershell": shutil.which("pwsh") is not None or shutil.which("powershell") is not None}

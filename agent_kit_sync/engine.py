@@ -117,6 +117,9 @@ class Engine:
         self.record = RunRecord(layout)
         self.report = Report()
         self.failed_modules: Set[str] = set()   # modules that could not be rendered this run
+        self._retest: Set[str] = set()           # unchanged hooks tested again because their module changed
+        self._touched: Set[str] = set()          # modules whose installed files change in this sync
+        self.held_back: Dict[str, str] = {}       # modules kept as installed because a new version breaks a hook
         self.throttle_fetch = False             # set for runs started after a file write
         self.approve_new: Set[str] = set()      # item keys approved during setup
         self.carry_modules: List[Module] = []   # the modules edits are carried back to, for {{kit.hook}} commands
@@ -1269,8 +1272,58 @@ class Engine:
             clone = Module(module.name, module.root, module.local, module.description, module.apps, module.requires, module.ignore, kept, module.source)
             result.append(clone)
         self._incoming_removals(modules, present, head, result, trees)
+        self._retest_unchanged_hooks(pending, result, trees)
         self._test_incoming_hooks(pending, result, trees)
         return result, trees
+
+    def _retest_unchanged_hooks(self, pending, result: List[Module], trees: Dict[str, Tree]) -> None:
+        """Add the installed hooks of every module whose installed files change in this sync.
+
+        A hook can import a support file, a template, or another hook's file. When any item of its
+        module is new, changed, removed, or left out here, the unchanged hook is tested again with the
+        files this machine will install, and keeps running only if its tests still pass.
+        """
+        self._retest = set()
+        self._touched: Set[str] = set()
+        queued = {item.key for _module, item, _old in pending}
+        touched = {module.name for module, item, _old in pending if not (self.index.items.get(item.key) or {}).get("untested")}
+        for item_key, info in self.index.items.items():
+            module_name = item_key.split("/", 1)[0]
+            effective = next((m for m in result if m.name == module_name), None)
+            if effective is None or info.get("local"):
+                continue
+            if not any(i.key == item_key for i in effective.items):
+                touched.add(module_name)  # Removed, held, or left out here: its files will be gone.
+        for module in result:
+            if module.local:
+                continue
+            current = Tree(module.root)
+            installed_items = {entry.get("item_key") for entry in self.index.copies.values()}
+            for item in module.items:
+                if self._disabled_incoming(item.key):
+                    if item.key in installed_items:
+                        touched.add(module.name)  # Newly disabled: its installed files are about to go.
+                        break
+                    continue
+                if item.key in trees:
+                    continue  # Kept at a pinned or held version: its files do not change.
+                info = self.index.items.get(item.key) or {}
+                if "fp" not in info or info.get("fp") != item_fingerprint(module, item, current):
+                    touched.add(module.name)
+                    break
+        self._touched = set(touched)
+        for module in result:
+            if module.name not in touched or module.local:
+                continue
+            for item in module.items:
+                if item.kind != "hook" or item.key in queued or self._disabled_incoming(item.key):
+                    continue
+                info = self.index.items.get(item.key) or {}
+                if "fp" not in info or item.key in trees:
+                    continue  # Not installed yet, or kept at a pinned or held version tested with it.
+                pending.append((module, item, info.get("commit")))
+                queued.add(item.key)
+                self._retest.add(item.key)
 
     def _disabled_incoming(self, item_key: str) -> bool:
         module_name = item_key.split("/", 1)[0]
@@ -1281,6 +1334,7 @@ class Engine:
         if held is not None:
             self.held.remove(held["id"])
         self.alerts.close(key)
+        self.alerts.close(f"tests:{item_key}")  # A disabled hook does not run here, so its test result no longer applies.
         return True
 
     def _test_incoming_hooks(self, pending, result: List[Module], trees: Dict[str, Tree]) -> None:
@@ -1294,6 +1348,8 @@ class Engine:
         from .testing import SKIPPED, UNPLANNED, run_staged_tests
         by_name = {module.name: module for module in result}
         failures: Dict[str, str] = {}
+        held_back: Dict[str, str] = {}  # Module name -> why it stays at the installed version this sync.
+        self.held_back = held_back
         self.untested: Set[str] = set()
 
         def tree_for(module: Module, item: Item) -> Tree:
@@ -1304,13 +1360,14 @@ class Engine:
             changed = False
             for module, item, old_commit in pending:
                 effective = by_name.get(module.name)
-                if item.key in failures or effective is None or item not in effective.items:
-                    continue
+                if item.key in self._retest or item.key in failures or effective is None or item not in effective.items:
+                    continue  # Unchanged hooks are tested after the changed ones have settled, below.
                 failure = run_staged_tests(self.layout, self.machine, effective, result, item, tree_for)
                 if failure == UNPLANNED:
                     continue  # The install fails the whole module, reports why, and keeps its previous copies.
                 if failure == SKIPPED:
-                    self.untested.add(item.key)  # Tested again once it runs on this machine.
+                    if item.key not in self._retest:
+                        self.untested.add(item.key)  # Tested again once it runs on this machine.
                     continue
                 if failure is None:
                     self.untested.discard(item.key)
@@ -1324,13 +1381,48 @@ class Engine:
                 else:
                     del effective.items[position]
                 changed = True
+        # Every hook that will run in a module whose files change must pass with the files this machine will
+        # install: an unchanged hook, a changed hook set back to its earlier version, and a pinned or held
+        # hook. Changed hooks still at their new version passed in the last round above. A hook that fails
+        # here but passes with the files installed now is broken by the module's new version, so the whole
+        # module stays as this machine installed it.
+        settled = {item.key for _m, item, _o in pending if item.key not in self._retest and item.key not in failures}
+        originals = {module.name: module for module, _i, _o in pending}
+        for name in sorted(self._touched | set(originals)):
+            effective = by_name.get(name)
+            if effective is None or effective.local or name in held_back:
+                continue
+            module = originals.get(name) or effective
+            for item in [i for i in effective.items if i.kind == "hook"]:
+                if item.key in settled:
+                    continue
+                failure = run_staged_tests(self.layout, self.machine, effective, result, item, tree_for)
+                if failure in (None, SKIPPED, UNPLANNED):
+                    continue
+                if self._installed_tests_pass(module, item):
+                    held_back[name] = f"{item.key}: {failure}"
+                    break
+                if item.key in self._retest:
+                    failures[item.key] = failure
+        for name, failure in held_back.items():
+            self.alerts.raise_(f"tests:{name}", f"agent-kit-sync kept module {name} at the version this machine has, because with the new version of the module an installed hook of it fails its tests here. The next sync tries again. {failure[:300]}", "agent-kit-sync test")
+        for alert in self.alerts.open():
+            key = alert.get("key", "")
+            if key.startswith("tests:") and "/" not in key and key[len("tests:"):] not in held_back:
+                self.alerts.close(key)
         for module, item, old_commit in pending:
             effective = by_name.get(module.name)
             failure = failures.get(item.key)
             if effective is None:
                 continue
-            if failure is None:
-                self.alerts.close(f"tests:{item.key}")
+            if failure is None or (module.name in held_back and item.key not in self._retest):
+                self.alerts.close(f"tests:{item.key}")  # Passed, or the module alert says why nothing changed.
+                continue
+            if item.key in self._retest:
+                if module.name in held_back:
+                    self.alerts.close(f"tests:{item.key}")  # The module alert says why.
+                else:
+                    self.alerts.raise_(f"tests:{item.key}", f"The installed hook {item.key} fails its tests on this machine with the files it has now. {failure[:300]}", "agent-kit-sync test")
                 continue
             left_out = sorted(i.key for i in module.items if i.key != item.key and not any(k.key == i.key for k in effective.items))
             note = f" This machine does not install these items from its module yet: {', '.join(left_out)}." if left_out else ""
@@ -1339,6 +1431,18 @@ class Engine:
             else:
                 message = f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version.{note} {failure[:300]}"
             self.alerts.raise_(f"tests:{item.key}", message, "agent-kit-sync test")
+
+    def _installed_tests_pass(self, module: Module, item: Item) -> bool:
+        """Whether a hook's tests pass with the files installed for its module on this machine now."""
+        import tempfile
+        from .testing import run_test
+        installed = self.layout.installed_module(module.name)
+        if not item.data.get("tests") or not installed.is_dir():
+            return False
+        with tempfile.TemporaryDirectory(prefix="aks-installed-") as tmp:
+            stage = Path(tmp) / module.name
+            shutil.copytree(installed, stage, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            return all(run_test(stage, rel)[0] == "passed" for rel in item.data.get("tests", []))
 
     def _incoming_removals(self, modules, present, head, result, trees) -> None:
         for item_key, info in list(self.index.items.items()):
@@ -1392,10 +1496,16 @@ class Engine:
             return trees.get(item.key) or Tree(module.root)
 
         plan = Planner(self.layout, self.machine, effective, tree_for).build()
+        for name in self.held_back:
+            if name not in plan.failed:
+                # Keep everything this machine installed for the module, exactly as a module that cannot be planned keeps it.
+                plan.drop_module(name)
         self.failed_modules = set(plan.failed)
         for error in plan.errors:
             self.report.errors.append(error)
         for name in plan.failed:
+            if name in self.held_back:
+                continue  # Its tests alert says why.
             reason = next((e for e in plan.errors if e.startswith(f"module {name}:")), "")
             self.alerts.raise_(f"module:{name}", f"agent-kit-sync could not install module {name}, so this machine keeps its previous version. {reason}", "agent-kit-sync status")
         for name in {m.name for m in effective} - set(plan.failed):
