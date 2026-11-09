@@ -1,6 +1,7 @@
 """Small filesystem fixtures for data-preserving status-directory migration."""
 
 import json
+import os
 import tempfile
 import sys
 import unittest
@@ -148,6 +149,28 @@ class StatusDirectoryTests(unittest.TestCase):
         self.assertEqual(result["state"], "complete")
         self.assertEqual(result["explicit_sources"], [str(old_location)])
         self.assertFalse(old_location.exists())
+
+    @unittest.skipUnless(os.environ.get("AKS_STATUS_TEST_VOLUME"), "requires an explicitly authorized second-volume test root")
+    def test_native_cross_volume_copy_and_same_volume_retention(self):
+        base = Path(os.environ["AKS_STATUS_TEST_VOLUME"]).resolve()
+        self.assertTrue(base.is_absolute() and base.is_dir())
+        with tempfile.TemporaryDirectory(prefix=".agent-kit-sync-status-test-", dir=base) as folder:
+            owned = Path(folder)
+            self.assertEqual(owned.resolve().parent, base)
+            projects = owned / "Projects"
+            projects.mkdir()
+            if projects.stat().st_dev == self.root.stat().st_dev:
+                self.skipTest("the selected root is not a different filesystem device")
+            old_location = self.root / "previous/Old_status"
+            self.write(old_location / "notes.md", b"cross-volume fixture")
+            prepared = migration.migrate_status(self.layout, projects, required=True, explicit_sources=[old_location])
+            self.assertEqual(prepared["state"], "prepared")
+            result = migration.migrate_status(self.layout, projects, required=True, finalize=True, plan_id=prepared["plan_id"])
+            self.assertEqual(result["state"], "complete")
+            self.assertEqual((projects / "status/notes.md").read_bytes(), b"cross-volume fixture")
+            retained = Path(result["retired"][0]["retained"])
+            self.assertEqual(retained.parent, old_location.parent)
+            self.assertEqual((retained / "notes.md").read_bytes(), b"cross-volume fixture")
 
     def test_missing_explicit_location_is_not_reported_complete(self):
         result = self.prepare(explicit_sources=[self.root / "unmounted/Old_status"])
