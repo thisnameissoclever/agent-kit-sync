@@ -1,5 +1,12 @@
 # Lessons learned
 
+## 2026-11-09: Correct the original status path on every configured machine
+
+1. **What happened:** Setup and shared instructions used `_status` and a concatenated projects-name variant. Those paths were incorrect from the beginning; the intended directory is the `status` child of each machine's configured projects folder.
+2. **Root cause:** An incorrect name was repeated in templates, setup guidance, and approval questions. Directory creation was clarified without correcting that original name.
+3. **Prevention:** Use `{{kit.projects}}/status`, explicitly enable migration in format 2 of the shared config, and correct older rendered templates. Windows prepares verified copies without overwriting canonical data, switches references, then retains whole legacy trees. POSIX moves one original directory through an identity-bound link and atomic exchange, preserving its existing ACLs and metadata instead of reconstructing permissions. Do not use mode bits alone to authorize POSIX copying; inherited ACLs can grant access those bits do not reveal. Unsupported layouts stay pending. Never delete individual source files after a check; a writer can change them between checking and deletion. Keep receipts locked and local, preserve late writes, and report conflicts for reconciliation.
+4. **How to verify:** Cover all-alias conflict preflight, actual installed-reference checks, source identity, late writes, failed renames, receipt recovery and corruption, explicit old locations, and bounded resource use. Verify cross-volume copying with a small fixture. Confirm the source paths are gone only after references switch and the retained trees still contain every source version. Publish globally and verify each connected machine; an offline machine stays pending its approved update.
+
 ## 2026-11-08: Test hooks with the files the machine installs
 
 1. **What happened:** A config commit changed a synced hook to import a new support file and added that file as a new item. On a machine whose policy asks before new items, the support file was held for approval while the changed hook installed. Every hook call in Claude Code, Codex, and Cursor then failed with `ModuleNotFoundError` until the support file was approved.
@@ -26,7 +33,7 @@
 1. **What happened:** Setup asked for approval using skill names and linked comparisons without enough explanation in the questions. It also treated missing module directories as a reason to disable the module.
 2. **Root cause:** The setup instructions did not require a self-contained explanation of each proposed change or distinguish a missing directory from missing user data.
 3. **Prevention:** Explain each item's purpose, affected apps, current behavior, proposed differences, and merge strategy in the approval question. Join child directory names to the approved parent, reuse existing directories, and create required missing subdirectories. Preserve existing contents and distinguish directory creation from restoring data.
-4. **How to verify:** Review a setup question without opening its links and confirm that the reader can understand the decision. Walk through setup with an existing worktrees folder and an absent `_status/state` directory: reuse the former, create the latter under the approved projects folder, and preserve any existing files. A missing data file must receive its own functional assessment.
+4. **How to verify:** Review a setup question without opening its links and confirm that the reader can understand the decision. Walk through setup with an existing worktrees folder and an absent `status/state` directory: reuse the former, create the latter under the approved projects folder, and preserve existing files. The earlier revision of this entry used the original incorrect status name; the correction and migration above supersede it. A missing data file must receive its own functional assessment.
 
 ## 2026-11-08: Keep hosted tests optional and available on demand
 

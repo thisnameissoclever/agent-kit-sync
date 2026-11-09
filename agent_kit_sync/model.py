@@ -191,6 +191,13 @@ def load_inventory(root: Path) -> Inventory:
     fmt = int(data.get("format", 1))
     if fmt > FORMAT:
         raise ConfigError(f"kit.toml uses format {fmt}; this agent-kit-sync reads format {FORMAT} and must update first")
+    migrations = data.get("migrations", {})
+    if not isinstance(migrations, dict):
+        raise ConfigError("kit.toml migrations must be a table")
+    if migrations.get("project_status_directory") not in (None, 0, 1):
+        raise ConfigError("Unsupported project status-directory migration version; update the tool before applying this config")
+    if migrations.get("project_status_directory") == 1 and fmt < 2:
+        raise ConfigError("Project status-directory migration requires kit.toml format = 2 so older clients update before applying corrected paths")
     modules = []
     names = set()
     for entry in data.get("modules", []):
