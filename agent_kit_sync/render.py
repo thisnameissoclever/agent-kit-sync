@@ -42,6 +42,7 @@ class Values:
     cli: str
     hooks: Dict[str, str]
     reverse_skip: Tuple[str, ...] = ()
+    canonical_status: bool = False
 
     def lookup(self, name: str, arg: Optional[str]) -> str:
         if name == "literal":
@@ -72,6 +73,11 @@ class Values:
 
 def substitute(text: str, values: Values, header: bool = False) -> str:
     """Replace each placeholder in `text`. With `header`, `text` is a line of a --- header block."""
+    if values.canonical_status:
+        text = re.sub(r"\{\{kit\.projects\}\}(?:[/\\]_status|_status)(?=$|[/\\\s`\"'.,;:)])", "{{kit.projects}}/status", text)
+        basename = re.split(r"[/\\]", values.projects.rstrip("/\\"))[-1]
+        if basename:
+            text = re.sub(r"\{\{kit\.projects\}\}[/\\]" + re.escape(basename) + r"_status(?=$|[/\\\s`\"'.,;:)])", "{{kit.projects}}/status", text, flags=re.I)
     def value(match) -> str:
         found = values.lookup(match.group(1), match.group(2))
         if header and match.group(1) == "hook" and in_double_quotes(text, match.start()):

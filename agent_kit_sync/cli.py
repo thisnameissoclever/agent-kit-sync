@@ -369,6 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("hook")
     p.add_argument("rest", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="Show the last run, alerts, held changes, and unsynced items")
+    p = sub.add_parser("migrate-status", help="Prepare historical status data; sync finalizes after references change")
+    p.add_argument("--from", dest="legacy_sources", action="append", default=[], type=Path, help="Explicit old status directory, including another drive")
+    p.add_argument("--finalize", action="store_true", help="Retain prepared old directories after checking installed references")
     p = sub.add_parser("held", help="List held changes, or resolve one")
     p.add_argument("action", nargs="?", choices=["list", "resolve"], default="list")
     p.add_argument("id", nargs="?")
@@ -435,6 +438,20 @@ def main(argv: Optional[List[str]] = None, launcher: Optional[Path] = None) -> i
         return cmd_sync(args, layout)
     if args.command == "status":
         return cmd_status(args, layout)
+    if args.command == "migrate-status":
+        from .model import load_machine
+        from .status_directory import installed_paths, migrate_status
+        from .state import Index
+        machine = load_machine(layout)
+        receipt = layout.state / "status-directory-migration.json"
+        try:
+            plan_id = json.loads(receipt.read_text(encoding="utf-8")).get("plan_id") if receipt.exists() else None
+        except (ValueError, AttributeError):
+            plan_id = None
+        result = migrate_status(layout, machine.projects, required=True, explicit_sources=args.legacy_sources,
+                                finalize=args.finalize, active_paths=installed_paths(layout, machine, Index(layout)), plan_id=plan_id)
+        print(json.dumps(result, indent=2))
+        return 1 if result["state"] in ("pending", "not-configured") else 0
     if args.command == "held":
         return cmd_held(args, layout)
     if args.command in ("disable", "enable"):
