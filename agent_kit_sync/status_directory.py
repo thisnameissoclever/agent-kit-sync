@@ -94,7 +94,7 @@ def _snapshot(root):
     if _linked(root) or not root.is_dir():
         raise PendingMigration(f"Historical status path is not an ordinary directory: {root}")
     identity = root.stat()
-    pending, directories, files = [root], [], {}
+    pending, directories, files, directory_access = [root], [], {}, {}
     total = count = 0
     while pending:
         for path in pending.pop().iterdir():
@@ -108,16 +108,27 @@ def _snapshot(root):
             relative = path.relative_to(root).as_posix()
             if stat.S_ISDIR(info.st_mode):
                 directories.append(relative)
+                directory_access[relative] = _access(info, path)
                 pending.append(path)
             elif stat.S_ISREG(info.st_mode):
+                if getattr(info, "st_file_attributes", 0) & 0x4000:
+                    raise PendingMigration(f"Encrypted file needs a migration method that preserves encryption: {path}")
                 total += info.st_size
                 if total > MAX_TOTAL_BYTES:
                     raise PendingMigration(f"Directory exceeds the bounded migration byte limit: {root}")
                 data = _read(path)
-                files[relative] = {"hash": sha256(data), "size": len(data), "modified": info.st_mtime_ns, "identity": [info.st_dev, info.st_ino]}
+                files[relative] = {"hash": sha256(data), "size": len(data), "modified": info.st_mtime_ns, "identity": [info.st_dev, info.st_ino], "access": _access(info, path)}
             else:
                 raise PendingMigration(f"Special file needs manual review: {path}")
-    return {"identity": [identity.st_dev, identity.st_ino], "directories": sorted(directories), "files": files}
+    return {"identity": [identity.st_dev, identity.st_ino], "access": _access(identity, root), "directory_access": directory_access, "directories": sorted(directories), "files": files}
+
+
+def _access(info, path):
+    result = {"mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+    if os.name == "nt":
+        acl = _windows_acl(path)
+        result["acl"] = None if acl is None else sha256(acl)
+    return result
 
 
 def _exclusive_copy(source, target, digest):
@@ -140,8 +151,25 @@ def _exclusive_copy(source, target, digest):
 
 def _copy_permissions(source, target):
     if os.name != "nt":
+        original, copied = source.stat(), target.stat()
+        if (original.st_uid, original.st_gid) != (copied.st_uid, copied.st_gid):
+            os.chown(target, original.st_uid, original.st_gid)
         os.chmod(target, stat.S_IMODE(source.stat().st_mode))
         return
+    descriptor = _windows_security(source)
+    if descriptor is None:
+        return
+    import ctypes
+    from ctypes import wintypes
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    set_security = api.SetFileSecurityW
+    set_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    set_security.restype = wintypes.BOOL
+    if not set_security(str(target), 4 | 0x80000000, descriptor):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_security(source):
     import ctypes
     from ctypes import wintypes
     api = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -153,16 +181,78 @@ def _copy_permissions(source, target):
     if not size.value:
         error = ctypes.get_last_error()
         if error in (1, 50):
-            return  # The source filesystem has no persistent access-control list to preserve.
+            return None  # The source filesystem has no persistent access-control list to preserve.
         raise ctypes.WinError(error)
     descriptor = ctypes.create_string_buffer(size.value)
     if not get(str(source), 4, descriptor, size.value, ctypes.byref(size)):
         raise ctypes.WinError(ctypes.get_last_error())
-    set_security = api.SetFileSecurityW
-    set_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
-    set_security.restype = wintypes.BOOL
-    if not set_security(str(target), 4 | 0x80000000, descriptor):
+    return descriptor
+
+
+def _windows_acl(path):
+    descriptor = _windows_security(path)
+    if descriptor is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    get = ctypes.WinDLL("advapi32", use_last_error=True).GetSecurityDescriptorDacl
+    get.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+    get.restype = wintypes.BOOL
+    present, defaulted, pointer = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+    if not get(descriptor, ctypes.byref(present), ctypes.byref(pointer), ctypes.byref(defaulted)):
         raise ctypes.WinError(ctypes.get_last_error())
+    if not present.value or not pointer.value:
+        return None
+    header = ctypes.string_at(pointer, 8)
+    raw = ctypes.string_at(pointer, int.from_bytes(header[2:4], "little"))
+    end = 8
+    for _ in range(int.from_bytes(header[4:6], "little")):
+        size = int.from_bytes(raw[end + 2:end + 4], "little")
+        if size < 4 or end + size > len(raw):
+            raise PendingMigration(f"Invalid access-control list needs review: {path}")
+        end += size
+    return raw[:2] + raw[4:end]  # Ignore allocation padding and descriptor inheritance-control flags.
+
+
+def _posix_access_at_most(source, target, actor):
+    old, new = stat.S_IMODE(source.st_mode), stat.S_IMODE(target.st_mode)
+    old_owner, old_group, old_other = (old >> 6) & 7, (old >> 3) & 7, old & 7
+    new_owner, new_group, new_other = (new >> 6) & 7, (new >> 3) & 7, new & 7
+    floor = old_owner & old_group & old_other
+    if target.st_uid != actor:
+        owner_limit = old_owner if target.st_uid == source.st_uid else floor
+        if new_owner & ~owner_limit:
+            return False
+    group_limit = old_group if target.st_gid == source.st_gid and target.st_uid == source.st_uid else floor
+    other_limit = old_other if (target.st_uid, target.st_gid) == (source.st_uid, source.st_gid) else floor
+    return not (new_group & ~group_limit or new_other & ~other_limit)
+
+
+def _directory_privacy(source, target):
+    if not target.exists():
+        return
+    if os.name == "nt":
+        original = _windows_acl(source)
+        if original is not None and original != _windows_acl(target):
+            raise PendingMigration(f"Existing directory access differs and needs reconciliation: {target}")
+        return
+    source_chain = [source.resolve()] + list(source.resolve().parents)
+    target_chain = [target.resolve()] + list(target.resolve().parents)
+    destinations = [p.stat() for p in target_chain]
+    if not _posix_chain_private([parent.stat() for parent in source_chain], destinations, os.geteuid()):
+        raise PendingMigration(f"Existing destination access needs reconciliation before copying private data: {target}")
+
+
+def _posix_chain_private(sources, targets, actor):
+    return all(any(_posix_access_at_most(source, target, actor) for target in targets) for source in sources)
+
+
+def _create_directory(source, target):
+    created = not target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+    if created:
+        _copy_permissions(source, target)
+    _directory_privacy(source, target)
 
 
 def _validate_sources(layout, canonical, sources):
@@ -187,11 +277,14 @@ def _verify_canonical(canonical, snapshot):
 def _preflight(canonical, snapshots):
     virtual = {"state": ("directory", None)}
     for source, snapshot in snapshots.items():
+        _directory_privacy(Path(source), canonical)
         entries = [(p, "directory", None) for p in snapshot["directories"]]
         entries += [(p, "file", e["hash"]) for p, e in snapshot["files"].items()]
         for relative, kind, digest in entries:
             target = canonical / relative
             _contained(target, canonical)
+            if kind == "directory":
+                _directory_privacy(Path(source) / relative, target)
             key = unicodedata.normalize("NFC", relative).casefold()
             if key in virtual and virtual[key] != (kind, digest):
                 raise PendingMigration(f"Historical sources contain conflicting data: {target}")
@@ -262,7 +355,7 @@ def _load_receipt(path, layout):
             if source.parent != retained.parent or not retained.name.startswith("." + source.name + ".agent-kit-sync-backup-"):
                 raise ValueError("unsafe retained-directory path")
         return data
-    except (ValueError, TypeError, KeyError, AttributeError) as error:
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as error:
         raise PendingMigration(f"Existing receipt is preserved and needs review: {path}: {error}") from None
 
 
@@ -281,13 +374,16 @@ def _recover_retirements(record):
 
 
 def _save_receipt(path, record):
-    raw = json.dumps(record, indent=2).encode()
+    try:
+        raw = json.dumps(record, indent=2).encode()
+    except (ValueError, TypeError, RecursionError) as error:
+        raise PendingMigration(f"Migration receipt cannot be safely encoded: {error}") from None
     if len(raw) > MAX_RECEIPT_BYTES:
         raise PendingMigration("Migration receipt exceeds its bounded size; existing data and receipt are preserved.")
     atomic_write(path, raw)
 
 
-def migrate_status(layout, projects, required=False, explicit_sources=(), finalize=False, active_paths=(), plan_id=None):
+def migrate_status(layout, projects, required=False, explicit_sources=(), finalize=False, active_paths=(), plan_id=None, use_prepared_plan=False):
     """Prepare copies first. Finalization retains whole source trees; it never deletes files."""
     if projects is None:
         return {"state": "not-configured", "pending": [], "staged": {}, "retired": []}
@@ -318,6 +414,8 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                 snapshots = {str(p): _snapshot(p) for p in sources}
                 proposed_id = sha256(json.dumps({"canonical": str(canonical), "sources": snapshots}, sort_keys=True).encode())
                 if finalize:
+                    if use_prepared_plan:
+                        plan_id = record.get("plan_id")
                     if plan_id is None or plan_id != record.get("plan_id") or proposed_id != plan_id:
                         raise PendingMigration("Prepared plan changed; prepare and verify again before finalization.")
                     _old_references(active_paths, candidates)
@@ -326,6 +424,7 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                         if prepared is None or prepared["snapshot"] != snapshots[str(source)]:
                             raise PendingMigration(f"Historical data changed after preparation: {source}")
                         _verify_canonical(canonical, prepared["snapshot"])
+                        _verify_canonical(Path(prepared["backup"]), prepared["snapshot"])
                     for source in sources:
                         prepared = record["staged"][str(source)]
                         if _snapshot(source) != prepared["snapshot"]:
@@ -350,8 +449,18 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                         canonical.mkdir(exist_ok=True)
                         if created:
                             private_dir(canonical)
+                            if os.name == "nt" and sources:
+                                _copy_permissions(sources[0], canonical)
+                        for source in sources:
+                            _directory_privacy(source, canonical)
                         _contained(canonical / "state", canonical)
+                        state_created = not (canonical / "state").exists()
                         (canonical / "state").mkdir(exist_ok=True)
+                        if state_created:
+                            for source in sources:
+                                if (source / "state").is_dir():
+                                    _copy_permissions(source / "state", canonical / "state")
+                                    break
                     for source in sources:
                         snapshot = snapshots[str(source)]
                         prepared = record["staged"].get(str(source))
@@ -367,8 +476,8 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                         for relative in snapshot["directories"]:
                             _contained(canonical / relative, canonical)
                             _contained(Path(prepared["backup"]) / relative, layout.state / "backups/status-directory-migration")
-                            (canonical / relative).mkdir(parents=True, exist_ok=True)
-                            (Path(prepared["backup"]) / relative).mkdir(parents=True, exist_ok=True)
+                            _create_directory(source / relative, canonical / relative)
+                            _create_directory(source / relative, Path(prepared["backup"]) / relative)
                         for relative, entry in snapshot["files"].items():
                             _contained(Path(prepared["backup"]) / relative, layout.state / "backups/status-directory-migration")
                             _exclusive_copy(source / relative, Path(prepared["backup"]) / relative, entry["hash"])

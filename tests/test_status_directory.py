@@ -4,12 +4,16 @@ import json
 import os
 import tempfile
 import sys
+import io
+import contextlib
+import stat
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from support import ROOT, as_home
-from agent_kit_sync import model, render, status_directory as migration, toml
+from agent_kit_sync import cli, model, render, status_directory as migration, toml
 from agent_kit_sync.engine import Engine
 from agent_kit_sync.paths import Layout
 from agent_kit_sync.state import run_lock
@@ -192,6 +196,26 @@ class StatusDirectoryTests(unittest.TestCase):
         self.assertTrue(self.old.exists())
         self.assertFalse(self.canonical.exists())
 
+    def test_cli_receipt_is_read_only_through_the_bounded_loader(self):
+        self.write(self.old / "notes.md")
+        receipt = self.layout.state / "status-directory-migration.json"
+        self.write(receipt, b" " * 17)
+        machine = SimpleNamespace(projects=self.projects, app_homes={})
+        for args in (["migrate-status"], ["migrate-status", "--finalize"]):
+            output = io.StringIO()
+            with mock.patch.object(cli, "layout_from_env", return_value=self.layout), mock.patch.object(model, "load_machine", return_value=machine), mock.patch.object(migration, "MAX_RECEIPT_BYTES", 16), mock.patch.object(Path, "read_text", side_effect=AssertionError("Unbounded receipt reader")), contextlib.redirect_stdout(output):
+                self.assertEqual(cli.main(args), 1)
+            self.assertEqual(json.loads(output.getvalue())["state"], "pending")
+        self.assertEqual(receipt.read_bytes(), b" " * 17)
+        self.assertTrue(self.old.exists())
+
+    def test_deeply_nested_malformed_receipt_is_pending(self):
+        receipt = self.layout.state / "status-directory-migration.json"
+        raw = b"[" * 1100 + b"0" + b"]" * 1100
+        self.write(receipt, raw)
+        self.assertEqual(self.prepare()["state"], "pending")
+        self.assertEqual(receipt.read_bytes(), raw)
+
     def test_lock_loser_does_not_write_the_receipt(self):
         self.write(self.old / "notes.md")
         self.prepare()
@@ -259,6 +283,34 @@ class FormatGateTests(unittest.TestCase):
             config.write_bytes(b'format = 1\n[migrations]\nproject_status_directory = 1\n')
             with self.assertRaisesRegex(model.ConfigError, "requires kit.toml format = 2"):
                 model.load_inventory(root)
+
+
+class DirectoryPrivacyTests(unittest.TestCase):
+    def info(self, mode, uid=10, gid=20):
+        return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid, st_gid=gid)
+
+    def test_existing_public_destination_cannot_replace_private_directory(self):
+        self.assertFalse(migration._posix_access_at_most(self.info(0o700), self.info(0o755), 10))
+        self.assertTrue(migration._posix_access_at_most(self.info(0o700), self.info(0o700), 10))
+
+    def test_private_ancestor_is_part_of_effective_access(self):
+        sources = [self.info(0o755), self.info(0o700)]
+        self.assertFalse(migration._posix_chain_private(sources, [self.info(0o755)], 10))
+        self.assertTrue(migration._posix_chain_private(sources, [self.info(0o755), self.info(0o700)], 10))
+
+    def test_unrelated_destination_group_cannot_gain_access(self):
+        self.assertFalse(migration._posix_access_at_most(self.info(0o750, gid=20), self.info(0o750, gid=30), 10))
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory access-control contract")
+    def test_windows_directory_acl_difference_requires_reconciliation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, target = root / "source", root / "target"
+            source.mkdir()
+            target.mkdir()
+            with mock.patch.object(migration, "_windows_acl", side_effect=lambda path: b"private" if path == source else b"public"):
+                with self.assertRaises(migration.PendingMigration):
+                    migration._directory_privacy(source, target)
 
 
 class EngineStatusMigrationTests(unittest.TestCase):

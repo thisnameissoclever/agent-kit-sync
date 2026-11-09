@@ -443,13 +443,10 @@ def main(argv: Optional[List[str]] = None, launcher: Optional[Path] = None) -> i
         from .status_directory import installed_paths, migrate_status
         from .state import Index
         machine = load_machine(layout)
-        receipt = layout.state / "status-directory-migration.json"
-        try:
-            plan_id = json.loads(receipt.read_text(encoding="utf-8")).get("plan_id") if receipt.exists() else None
-        except (ValueError, AttributeError):
-            plan_id = None
         result = migrate_status(layout, machine.projects, required=True, explicit_sources=args.legacy_sources,
-                                finalize=args.finalize, active_paths=installed_paths(layout, machine, Index(layout)), plan_id=plan_id)
+                                finalize=args.finalize,
+                                active_paths=installed_paths(layout, machine, Index(layout)) if args.finalize else (),
+                                use_prepared_plan=args.finalize)
         print(json.dumps(result, indent=2))
         return 1 if result["state"] in ("pending", "not-configured") else 0
     if args.command == "held":
