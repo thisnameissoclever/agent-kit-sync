@@ -145,6 +145,7 @@ def _exclusive_copy(source, target, digest):
     except FileExistsError:
         if not target.is_file() or sha256(_read(target)) != digest:
             raise PendingMigration(f"Destination changed or conflicts: {target}") from None
+        _file_privacy(source, target)
     if sha256(_read(target)) != digest:
         raise PendingMigration(f"Copy verification failed: {target}")
 
@@ -158,6 +159,7 @@ def _copy_permissions(source, target):
         return
     descriptor = _windows_security(source)
     if descriptor is None:
+        os.chmod(target, stat.S_IMODE(source.stat().st_mode))
         return
     import ctypes
     from ctypes import wintypes
@@ -167,6 +169,7 @@ def _copy_permissions(source, target):
     set_security.restype = wintypes.BOOL
     if not set_security(str(target), 4 | 0x80000000, descriptor):
         raise ctypes.WinError(ctypes.get_last_error())
+    os.chmod(target, stat.S_IMODE(source.stat().st_mode))
 
 
 def _windows_security(source):
@@ -244,6 +247,17 @@ def _directory_privacy(source, target):
         raise PendingMigration(f"Existing destination access needs reconciliation before copying private data: {target}")
 
 
+def _file_privacy(source, target):
+    if os.name == "nt":
+        original = _windows_acl(source)
+        if original is not None and original != _windows_acl(target):
+            raise PendingMigration(f"Existing file access differs and needs reconciliation: {target}")
+        if not source.stat().st_mode & stat.S_IWRITE and target.stat().st_mode & stat.S_IWRITE:
+            raise PendingMigration(f"Existing file does not preserve read-only access: {target}")
+    elif not _posix_access_at_most(source.stat(), target.stat(), os.geteuid()):
+        raise PendingMigration(f"Existing file access needs reconciliation: {target}")
+
+
 def _posix_chain_private(sources, targets, actor):
     return all(any(_posix_access_at_most(source, target, actor) for target in targets) for source in sources)
 
@@ -295,6 +309,8 @@ def _preflight(canonical, snapshots):
                     raise PendingMigration(f"Directory conflicts with a file: {target}")
                 if kind == "file" and (not target.is_file() or sha256(_read(target)) != digest):
                     raise PendingMigration(f"Different destination data is preserved: {target}")
+                if kind == "file":
+                    _file_privacy(Path(source) / relative, target)
 
 
 def installed_paths(layout, machine, index):
@@ -432,6 +448,10 @@ def migrate_status(layout, projects, required=False, explicit_sources=(), finali
                             raise PendingMigration(f"Historical data changed after preparation: {source}")
                         _verify_canonical(canonical, prepared["snapshot"])
                         _verify_canonical(Path(prepared["backup"]), prepared["snapshot"])
+                        _directory_privacy(source, canonical)
+                        for relative in prepared["snapshot"]["files"]:
+                            _file_privacy(source / relative, canonical / relative)
+                            _file_privacy(source / relative, Path(prepared["backup"]) / relative)
                     for source in sources:
                         prepared = record["staged"][str(source)]
                         if _snapshot(source) != prepared["snapshot"]:

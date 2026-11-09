@@ -232,6 +232,14 @@ class StatusDirectoryTests(unittest.TestCase):
         self.assertTrue(self.old.exists())
         self.assertFalse(self.canonical.exists())
 
+    def test_read_only_file_permission_is_preserved(self):
+        self.write(self.old / "notes.md")
+        (self.old / "notes.md").chmod(0o400)
+        prepared = self.prepare()
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertFalse((self.canonical / "notes.md").stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(self.finish(prepared)["state"], "complete")
+
     def test_repository_and_links_are_not_followed(self):
         self.write(self.old / ".git/config")
         self.assertEqual(self.prepare()["state"], "pending")
@@ -240,7 +248,8 @@ class StatusDirectoryTests(unittest.TestCase):
 
 class StatusRenderingTests(unittest.TestCase):
     def values(self, projects, enabled):
-        return render.Values(home="/h", projects=projects, worktrees="/w", module="/m", app="codex", os="linux", cli="aks", hooks={}, canonical_status=enabled)
+        system = "windows" if ":" in projects or projects.startswith("\\\\") else "linux"
+        return render.Values(home="/h", projects=projects, worktrees="/w", module="/m", app="codex", os=system, cli="aks", hooks={}, canonical_status=enabled)
 
     def test_opt_in_corrects_old_and_concatenated_templates(self):
         for root in ("/mnt/projects", "D:\\Projects", "/Volumes/Data/Projects"):
