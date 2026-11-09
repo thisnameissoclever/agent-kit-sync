@@ -692,14 +692,13 @@ class Engine:
         return problems
 
     def _run_hook_tests(self, module: Module, item: Item, new_files: Dict[str, Optional[bytes]]) -> List[checks.Finding]:
-        """Run a hook's tests against the edited files, in a copy of the module, with the user's folders redirected."""
+        """Run a hook's tests against the files this machine would install with the edit applied."""
         import tempfile
-        from .testing import missing_tests, run_test
+        from .testing import SKIPPED, UNPLANNED, missing_tests, run_staged_tests
         missing = missing_tests(module, item)
         if missing:
             return [checks.Finding("module-tests", item.data.get("file", item.key), 0, missing)]
-        tests = list(item.data.get("tests", []))
-        if not tests:
+        if not item.data.get("tests"):
             return []
         with tempfile.TemporaryDirectory(prefix="aks-module-") as tmp:
             copy_root = Path(tmp) / module.name
@@ -711,29 +710,51 @@ class Engine:
                         target.unlink()
                 else:
                     atomic_write(target, data)
-            findings = []
-            for rel in tests:
-                result, detail = run_test(copy_root, rel)
-                if result == "failed":
-                    findings.append(checks.Finding("module-tests", rel, 0, detail.strip().splitlines()[-1] if detail.strip() else "failed"))
-            return findings
+            try:
+                edited = load_module(copy_root, module.name, module.local, module.source)
+            except ConfigError as error:
+                return [checks.Finding("module-tests", "module.toml", 0, str(error))]
+            edited_item = next((i for i in edited.items if i.key == item.key), None)
+            if edited_item is None:
+                return []  # The edit removes the hook, so there is nothing left to test.
+            # Test against what this machine installs: an item held for approval here is left out, or kept
+            # at the version this machine has, so a hook that needs it cannot be pushed to other machines.
+            held = {e.get("item_key"): e["kind"] for e in self.held.all() if e["kind"] in ("new-item", "incoming")}
+            items: List[Item] = []
+            trees: Dict[str, Tree] = {}
+            for other in edited.items:
+                pin = self.machine.overrides.get(other.key) or self.machine.overrides.get(module.name)
+                if other.key != item.key and pin and pin.get("kind") == "pin" and pin.get("commit"):
+                    pinned = self._item_at(module, other.name, pin["commit"])
+                    if pinned is not None:
+                        items.append(pinned[0])
+                        trees[other.key] = pinned[1]
+                    continue
+                kind = held.get(other.key) if other.key != item.key else None
+                if kind is None:
+                    items.append(other)
+                    continue
+                info = self.index.items.get(other.key) or {}
+                old = self._item_at(module, other.name, info["commit"]) if kind == "incoming" and info.get("commit") else None
+                if old is not None:
+                    items.append(old[0])
+                    trees[other.key] = old[1]
+            staged = Module(edited.name, edited.root, edited.local, edited.description, edited.apps, edited.requires, edited.ignore, items, edited.source)
+            others = [m for m in (getattr(self, "carry_modules", None) or []) if m.name != module.name]
+            failure = run_staged_tests(self.layout, self.machine, staged, others + [staged], edited_item,
+                                       lambda m, i: trees.get(i.key) or Tree(m.root))
+            if failure == SKIPPED:
+                failure = None  # The hook does not run here; each machine that installs it tests it first.
+            elif failure == UNPLANNED:
+                failure = "agent-kit-sync could not plan this module with the edit applied; run agent-kit-sync status"
+            return [checks.Finding("module-tests", edited_item.data.get("file", item.key), 0, failure)] if failure else []
 
-    def _incoming_tests_fail(self, module: Module, item: Item, tree: Tree) -> Optional[str]:
-        """Why a new or changed hook from the config repo must not be installed here, or None.
+    def _needs_incoming_tests(self, module: Module, item: Item, tree: Tree) -> bool:
+        """Whether a new or changed hook from the config repo must pass its tests here before it installs.
 
         A hook with no tests is refused, and so is one whose tests fail or cannot run on this machine.
         """
-        from .testing import missing_tests, run_test
-        if item.kind != "hook" or module.local or getattr(tree, "commit", None) is not None:
-            return None
-        missing = missing_tests(module, item)
-        if missing:
-            return missing
-        for rel in item.data["tests"]:
-            result, detail = run_test(module.root, rel)
-            if result == "failed":
-                return f"{rel}: {detail.strip().splitlines()[-1] if detail.strip() else 'failed'}"
-        return None
+        return item.kind == "hook" and not module.local and getattr(tree, "commit", None) is None
 
     def _outgoing_held(self, module: Module, item: Item, tree: Tree, new_files: Dict[str, Optional[bytes]]) -> bool:
         policy = self.machine.policy.get("outgoing", "push")
@@ -1194,6 +1215,7 @@ class Engine:
         for held in self.held.all():
             if held.get("kind") in ("new-item", "incoming", "removal") and held.get("item_key"):
                 self._disabled_incoming(held["item_key"])
+        pending: List[Tuple[Module, Item, Optional[str]]] = []  # Hooks to test once every item is decided.
         for module in modules:
             kept = []
             tree = Tree(module.root)
@@ -1220,31 +1242,24 @@ class Engine:
                 approved = self.index.approvals.get(item.key) == fingerprint
                 if info is None or "fp" not in info:
                     if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new or approved:
-                        failure = self._incoming_tests_fail(module, item, tree)
-                        if failure is None:
-                            self.alerts.close(f"tests:{item.key}")
-                            kept.append(item)
-                            continue
-                        self.alerts.raise_(f"tests:{item.key}", f"agent-kit-sync did not install the new hook {item.key} on this machine, because it failed its tests here. {failure[:300]}", "agent-kit-sync test")
+                        kept.append(item)
+                        if self._needs_incoming_tests(module, item, tree):
+                            pending.append((module, item, None))
                         continue
                     self._hold_incoming(item, "new-item", f"{item.key} is new from the config repo.", head, item_is_code(module, item, tree))
                     continue
                 if info["fp"] == fingerprint:
                     kept.append(item)
+                    if info.get("untested") and self._needs_incoming_tests(module, item, tree):
+                        # Never tested here, so no earlier version has run here either: treat it as new.
+                        pending.append((module, item, None))
                     continue
                 code = item_is_code(module, item, tree)
                 policy = self.machine.policy["code_changes" if code else "other_changes"]
                 if policy == "apply" or approved:
-                    failure = self._incoming_tests_fail(module, item, tree)
-                    if failure is None:
-                        self.alerts.close(f"tests:{item.key}")
-                        kept.append(item)
-                        continue
-                    self.alerts.raise_(f"tests:{item.key}", f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version. {failure[:300]}", "agent-kit-sync test")
-                    old = self._item_at(module, item.name, info["commit"])
-                    if old is not None:
-                        kept.append(old[0])
-                        trees[item.key] = old[1]
+                    kept.append(item)
+                    if self._needs_incoming_tests(module, item, tree):
+                        pending.append((module, item, info["commit"]))
                     continue
                 old = self._item_at(module, item.name, info["commit"])
                 self._hold_incoming(item, "incoming", f"{item.key} changed in the config repo.", head, code)
@@ -1254,6 +1269,7 @@ class Engine:
             clone = Module(module.name, module.root, module.local, module.description, module.apps, module.requires, module.ignore, kept, module.source)
             result.append(clone)
         self._incoming_removals(modules, present, head, result, trees)
+        self._test_incoming_hooks(pending, result, trees)
         return result, trees
 
     def _disabled_incoming(self, item_key: str) -> bool:
@@ -1266,6 +1282,63 @@ class Engine:
             self.held.remove(held["id"])
         self.alerts.close(key)
         return True
+
+    def _test_incoming_hooks(self, pending, result: List[Module], trees: Dict[str, Tree]) -> None:
+        """Run each new or changed hook's tests against the files this machine is about to install.
+
+        The tests run in a folder holding the files this machine installs into the module's folder,
+        as the planner renders them: an item held for approval, disabled, or failing its own tests is
+        left out, and a pinned or held item has its earlier version. A hook that imports a file this
+        machine does not install therefore fails here instead of failing in every agent app.
+        """
+        from .testing import SKIPPED, UNPLANNED, run_staged_tests
+        by_name = {module.name: module for module in result}
+        failures: Dict[str, str] = {}
+        self.untested: Set[str] = set()
+
+        def tree_for(module: Module, item: Item) -> Tree:
+            return trees.get(item.key) or Tree(module.root)
+        changed = True
+        while changed:
+            # Leaving out a failing hook changes what the others are tested with, so test again until nothing changes.
+            changed = False
+            for module, item, old_commit in pending:
+                effective = by_name.get(module.name)
+                if item.key in failures or effective is None or item not in effective.items:
+                    continue
+                failure = run_staged_tests(self.layout, self.machine, effective, result, item, tree_for)
+                if failure == UNPLANNED:
+                    continue  # The install fails the whole module, reports why, and keeps its previous copies.
+                if failure == SKIPPED:
+                    self.untested.add(item.key)  # Tested again once it runs on this machine.
+                    continue
+                if failure is None:
+                    self.untested.discard(item.key)
+                    continue
+                failures[item.key] = failure
+                position = effective.items.index(item)
+                old = self._item_at(module, item.name, old_commit) if old_commit else None
+                if old is not None:
+                    effective.items[position] = old[0]  # This machine keeps the version it has, in its place.
+                    trees[item.key] = old[1]
+                else:
+                    del effective.items[position]
+                changed = True
+        for module, item, old_commit in pending:
+            effective = by_name.get(module.name)
+            failure = failures.get(item.key)
+            if effective is None:
+                continue
+            if failure is None:
+                self.alerts.close(f"tests:{item.key}")
+                continue
+            left_out = sorted(i.key for i in module.items if i.key != item.key and not any(k.key == i.key for k in effective.items))
+            note = f" This machine does not install these items from its module yet: {', '.join(left_out)}." if left_out else ""
+            if old_commit is None:
+                message = f"agent-kit-sync did not install the new hook {item.key} on this machine, because it failed its tests here.{note} {failure[:300]}"
+            else:
+                message = f"An incoming change to {item.key} failed its tests on this machine, so this machine keeps the earlier version.{note} {failure[:300]}"
+            self.alerts.raise_(f"tests:{item.key}", message, "agent-kit-sync test")
 
     def _incoming_removals(self, modules, present, head, result, trees) -> None:
         for item_key, info in list(self.index.items.items()):
@@ -1356,6 +1429,10 @@ class Engine:
                 info["commit"] = head
                 info["local"] = module.local
                 info.pop("approved", None)
+                if item.key in getattr(self, "untested", ()):
+                    info["untested"] = True
+                else:
+                    info.pop("untested", None)
         if incoming:
             for key in list(self.index.items):
                 if self.index.items[key].get("force"):

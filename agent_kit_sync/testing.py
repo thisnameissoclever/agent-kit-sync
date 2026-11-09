@@ -57,6 +57,90 @@ def run_test(module_root: Path, rel: str) -> Tuple[str, str]:
     return ("passed" if result.returncode == 0 else "failed"), out[-1500:]
 
 
+class Stage:
+    """The files one machine installs into its folder for one module, written to a temporary folder."""
+
+    def __init__(self, skipped: Optional[str] = None, error: Optional[str] = None, disabled=()):
+        self.skipped = skipped      # why this machine does not install the module, or None
+        self.error = error          # why the module could not be planned, or None
+        self.disabled = set(disabled)  # names of the module's items disabled on this machine
+
+
+def stage_module(layout, machine, module, modules, stage: Path, tree_for) -> Stage:
+    """Write into `stage` the files this machine installs into its folder for `module`, as it installs them.
+
+    The planner decides which items install and renders their files, so a hook test sees what the hook
+    sees in an agent app: an item disabled, held, or left out is absent, a templated or overridden file
+    has this machine's bytes, and a file in the module folder that no item lists is never there.
+    `modules` is every module of the sync, so placeholders naming another module's hook resolve.
+    `tree_for(module, item)` gives the tree to read an item's files from.
+    """
+    from .fsutil import atomic_write
+    from .plan import Planner, hook_commands
+    planner = Planner(layout, machine, [module], tree_for)
+    planner.hook_commands = hook_commands(layout, machine, modules)
+    plan = planner.build()
+    disabled = [item.name for item in module.items if planner.disabled(module.name, item.name)]
+    if module.name in plan.failed:
+        reason = plan.skipped.get(module.name, "")
+        return Stage(error=reason[len("error: "):] if reason.startswith("error: ") else reason or "it could not be planned")
+    if module.name in plan.skipped:
+        return Stage(skipped=plan.skipped[module.name])
+    base = layout.installed_module(module.name)
+    stage.mkdir(parents=True, exist_ok=True)
+    for copy in plan.copies:
+        if copy.app != "kit" or copy.module != module.name:
+            continue
+        try:
+            rel = copy.path.relative_to(base)
+        except ValueError:
+            continue
+        atomic_write(stage / rel, copy.data, executable=copy.executable)
+    return Stage(disabled=disabled)
+
+
+def _stage_own_tests(stage: Path, module, item, tree_for) -> None:
+    """Write a hook's own test files when the planner left them out, as it does for a missing runtime,
+    so the test reports the real reason it cannot run."""
+    from .fsutil import atomic_write
+    from pathlib import PurePosixPath
+    tree = tree_for(module, item)
+    for rel in item.data.get("tests", []):
+        target = stage / Path(*PurePosixPath(rel).parts)
+        data = tree.read(rel)
+        if data is not None and not target.exists():
+            atomic_write(target, data)
+
+
+SKIPPED = "skipped"
+UNPLANNED = "unplanned"
+
+
+def run_staged_tests(layout, machine, module, modules, item, tree_for, prefix="aks-staged-") -> Optional[str]:
+    """Why `item`'s tests fail against the files this machine installs, None when they pass, SKIPPED, or UNPLANNED.
+
+    SKIPPED means there is nothing to test here, because the module is not installed on this machine or
+    the hook is disabled on it, so the hook never runs here. UNPLANNED means the planner cannot plan the
+    module at all, so nothing in it installs and the install reports the planner's error itself.
+    """
+    missing = missing_tests(module, item)
+    if missing:
+        return missing
+    with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+        stage = Path(tmp) / module.name
+        staged = stage_module(layout, machine, module, modules, stage, tree_for)
+        if staged.error is not None:
+            return UNPLANNED
+        if staged.skipped is not None or item.name in staged.disabled:
+            return SKIPPED
+        _stage_own_tests(stage, module, item, tree_for)
+        for rel in item.data.get("tests", []):
+            result, detail = run_test(stage, rel)
+            if result == "failed":
+                return f"{rel}: {detail.strip().splitlines()[-1] if detail.strip() else 'failed'}"
+    return None
+
+
 def missing_tests(module, item) -> Optional[str]:
     """Why a synced hook cannot be installed for want of tests, or None."""
     if item.kind != "hook" or module.local or item.data.get("tests"):
@@ -101,13 +185,28 @@ def run_module_tests(layout, only: Optional[str] = None) -> int:
                         sys.stdout.write(f"failed: {finding}\n")
                     for mark in marks:
                         sys.stdout.write(f"accepted: {mark}\n")
-        for item in module.of("hook"):
-            for rel in item.data.get("tests", []):
-                result, detail = run_test(module.root, rel)
-                sys.stdout.write(f"{result}: {module.name}/{rel}\n")
-                if result == "failed":
-                    failures += 1
-                    sys.stdout.write("  " + detail.strip().replace("\n", "\n  ") + "\n")
+        with tempfile.TemporaryDirectory(prefix="aks-test-stage-") as tmp:
+            stage = Path(tmp) / module.name
+            tree_for = lambda m, i: Tree(m.root)  # noqa: E731
+            staged = stage_module(layout, engine.machine, module, modules, stage, tree_for)
+            if staged.error is not None:
+                failures += 1
+                sys.stdout.write(f"failed: agent-kit-sync could not plan module {module.name} on this machine: {staged.error}\n")
+                continue
+            if staged.skipped is not None:
+                sys.stdout.write(f"skipped: module {module.name} is not installed on this machine: {staged.skipped}\n")
+                continue
+            for item in module.of("hook"):
+                if item.name in staged.disabled:
+                    sys.stdout.write(f"skipped: {item.key} is disabled on this machine\n")
+                    continue
+                _stage_own_tests(stage, module, item, tree_for)
+                for rel in item.data.get("tests", []):
+                    result, detail = run_test(stage, rel)
+                    sys.stdout.write(f"{result}: {module.name}/{rel}\n")
+                    if result == "failed":
+                        failures += 1
+                        sys.stdout.write("  " + detail.strip().replace("\n", "\n  ") + "\n")
     label = checks.SYSTEM_LABELS.get(os_name(), os_name())
     sys.stdout.write(f"Tests ran on {label} only. Every other machine runs a hook's tests again before it installs a new or changed version, and keeps the hook off with an alert if they fail there.\n")
     return 1 if failures else 0
