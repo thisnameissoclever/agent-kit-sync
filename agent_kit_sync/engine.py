@@ -1196,6 +1196,8 @@ class Engine:
             tree = Tree(module.root)
             for item in module.items:
                 present.add(item.key)
+                if self._disabled_incoming(item.key):
+                    continue
                 info = self.index.items.get(item.key)
                 if module.local or head is None:
                     kept.append(item)
@@ -1250,9 +1252,22 @@ class Engine:
         self._incoming_removals(modules, present, head, result, trees)
         return result, trees
 
+    def _disabled_incoming(self, item_key: str) -> bool:
+        module_name = item_key.split("/", 1)[0]
+        if not any(self.machine.overrides.get(key, {}).get("kind") == "disable" for key in (module_name, item_key)):
+            return False
+        key = f"incoming:{item_key}"
+        held = self.held.by_key(key)
+        if held is not None:
+            self.held.remove(held["id"])
+        self.alerts.close(key)
+        return True
+
     def _incoming_removals(self, modules, present, head, result, trees) -> None:
         for item_key, info in list(self.index.items.items()):
             if item_key in present or "commit" not in info or info.get("local") or item_key in self.report.deletions:
+                continue
+            if self._disabled_incoming(item_key):
                 continue
             module_name, item_name = item_key.split("/", 1)
             pin = self.machine.overrides.get(item_key) or self.machine.overrides.get(module_name)

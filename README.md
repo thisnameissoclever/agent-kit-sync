@@ -263,6 +263,8 @@ The worktrees name is a child directory: with projects in `D:\Projects`, the Win
 
 An override changes one module or item on this machine only:
 
+Declining a new item disables it on this machine. Later syncs leave disabled modules and items out of incoming approval requests and close any earlier incoming request for them. Saved local edits still wait for their own decision. Enabling a previously declined item asks for approval again before its first installation when `new_items = "ask"`.
+
 | Command | Effect |
 |---|---|
 | `agent-kit-sync disable MODULE/ITEM` | Not installed here |
