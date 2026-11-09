@@ -275,6 +275,15 @@ class StatusRenderingTests(unittest.TestCase):
 
 
 class FormatGateTests(unittest.TestCase):
+    def test_future_schema_does_not_start_migration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            layout = Layout(Path(folder))
+            layout.config.mkdir(parents=True)
+            (layout.config / "kit.toml").write_bytes(b'format = 3\n[migrations]\nproject_status_directory = 1\n')
+            self.assertFalse(migration.migration_enabled(layout))
+            with self.assertRaisesRegex(model.ConfigError, "must update first"):
+                model.load_inventory(layout.config)
+
     def test_older_client_gate_requires_update_before_loading_modules(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

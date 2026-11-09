@@ -11,7 +11,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from . import toml
+from . import FORMAT, toml
 from .fsutil import atomic_write, private_dir, sha256
 from .paths import Layout
 from .state import LockBusy, run_lock
@@ -31,7 +31,7 @@ def migration_enabled(layout):
     if not path.is_file():
         return False
     data = toml.load_file(path)
-    return data.get("format", 1) >= 2 and data.get("migrations", {}).get("project_status_directory") == 1
+    return 2 <= int(data.get("format", 1)) <= FORMAT and data.get("migrations", {}).get("project_status_directory") == 1
 
 
 def _linked(path):
