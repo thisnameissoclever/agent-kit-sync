@@ -1,5 +1,12 @@
 # Lessons learned
 
+## 2026-11-08: Test hooks with the files the machine installs
+
+1. **What happened:** A config commit changed a synced hook to import a new support file and added that file as a new item. On a machine whose policy asks before new items, the support file was held for approval while the changed hook installed. Every hook call in Claude Code, Codex, and Cursor then failed with `ModuleNotFoundError` until the support file was approved.
+2. **Root cause:** Hook tests ran in the whole config checkout, where every file of the module existed, so they could not see that this machine would install the hook without one of its files. The check decided each item on its own and never compared a hook with the rest of its module as installed.
+3. **Prevention:** Test every hook in a folder built from the planner's copies for its module, after every item of the sync is decided, in the incoming install, in `agent-kit-sync test`, and before a local edit is pushed. Retest every hook that will run in a module whose installed files change. When a new version of a module breaks a hook that works with the installed files, keep the whole module as installed and raise an alert.
+4. **How to verify:** Run `tests/test_sync.py` class `HookStagingTests`. Each case reproduces one way a hook could install without a file it needs: a held, disabled, undeclared, removed, or changed support file, a templated file, a hook set back to its earlier version, and a push of an edit that needs a file held on the pushing machine.
+
 ## 2026-11-08: Hide native child launches and reserve workers before spawning
 
 1. **What happened:** During Windows setup and verification, the owner reported extensive terminal-window creation and exhausted memory. The windows were closed before a complete process-parent record could be preserved, so every window's origin was not established.
