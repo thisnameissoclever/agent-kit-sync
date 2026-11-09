@@ -214,6 +214,82 @@ class DeletionTests(TwoMachines):
 
 
 class PolicyTests(TwoMachines):
+    def test_disabled_item_removed_from_manifest_closes_its_old_request(self):
+        self.standard_config()
+        machine = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "ask"})
+        engine, _ = machine.sync()
+        self.assertTrue([e for e in engine.held.all() if e.get("item_key") == "writing/review"])
+        manifest = self.seed / "modules/writing/module.toml"
+        text = manifest.read_text(encoding="utf-8")
+        self.seed_files({"modules/writing/module.toml": text.replace('[[skills]]\nname = "review"\ndir = "skills/review"\n', '')}, "Remove review from inventory")
+        engine, _ = machine.sync()
+        self.assertTrue([e for e in engine.held.all() if e.get("item_key") == "writing/review"])
+        self.assertNotIn('name = "review"', (machine.layout.config / "modules/writing/module.toml").read_text(encoding="utf-8"))
+        data = machine.machine_data()
+        data["overrides"] = {"writing/review": {"kind": "disable"}}
+        machine.write_machine(data)
+        engine, report = machine.sync()
+        self.assertFalse(report.errors)
+        self.assertFalse([e for e in engine.held.all() if e.get("item_key") == "writing/review"])
+        self.assertFalse([a for a in engine.alerts.open() if a.get("key") == "incoming:writing/review"])
+
+    def test_disabled_referenced_hook_keeps_render_inventory_and_is_removed(self):
+        self.seed_files({
+            "kit.toml": 'format = 1\n\n[[modules]]\nname = "guarded"\n',
+            "modules/guarded/module.toml": 'description = "Referenced hook"\n\n[[sections]]\nname = "rule"\nfile = "rule.md"\n\n[[hooks]]\nname = "guard"\nfile = "guard.py"\nevents = ["pre_tool_use"]\ntests = ["test_guard.py"]\n',
+            "modules/guarded/rule.md": 'Hook command: {{kit.hook guarded/guard}}.\n',
+            "modules/guarded/guard.py": 'import sys\nsys.exit(0)\n',
+            "modules/guarded/test_guard.py": 'import sys\nsys.exit(0)\n',
+        })
+        machine = self.machine("a")
+        engine, report = machine.sync()
+        self.assertFalse(report.errors)
+        self.assertTrue(engine.index.hooks)
+        data = machine.machine_data()
+        data["overrides"] = {"guarded/guard": {"kind": "disable"}}
+        machine.write_machine(data)
+        engine, report = machine.sync()
+        self.assertFalse(report.errors)
+        self.assertEqual(engine.index.hooks, [])
+        self.assertFalse((machine.layout.installed / "guarded/guard.py").exists())
+        self.assertIn("run-hook guarded/guard", machine.read(".claude", "CLAUDE.md"))
+
+    def test_declined_new_item_stays_quiet_until_enabled(self):
+        self.standard_config()
+        machine = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "ask"})
+        engine, _ = machine.sync()
+        entry = next(e for e in engine.held.all() if e.get("item_key") == "writing/review")
+        from agent_kit_sync.resolve import resolve
+        with machine.env():
+            self.assertEqual(resolve(machine.layout, entry["id"], "decline"), 0)
+        for _ in range(2):
+            engine, report = machine.sync()
+            self.assertFalse(report.errors)
+            self.assertFalse([e for e in engine.held.all() if e.get("item_key") == "writing/review"])
+            self.assertFalse([a for a in engine.alerts.open() if a.get("key") == "incoming:writing/review"])
+            self.assertFalse(machine.path(".agents", "skills", "review").exists())
+        data = machine.machine_data()
+        del data["overrides"]["writing/review"]
+        machine.write_machine(data)
+        engine, _ = machine.sync()
+        self.assertTrue([e for e in engine.held.all() if e.get("item_key") == "writing/review"])
+        self.assertFalse(machine.path(".agents", "skills", "review").exists())
+
+    def test_disabling_module_clears_only_its_incoming_holds(self):
+        self.standard_config()
+        machine = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "ask"})
+        engine, _ = machine.sync()
+        engine.held.add("edit:writing/review", "outgoing", "Saved local edit", ["approve", "discard"], {"0": b"saved"}, item_key="writing/review")
+        data = machine.machine_data()
+        (machine.layout.root / "unused.md").write_text("Local addition.\n", encoding="utf-8")
+        data["overrides"] = {"writing": {"kind": "disable"}, "writing/review": {"kind": "append", "file": "unused.md"}}
+        machine.write_machine(data)
+        engine, report = machine.sync()
+        self.assertFalse(report.errors)
+        self.assertEqual([e["kind"] for e in engine.held.all()], ["outgoing"])
+        self.assertFalse([a for a in engine.alerts.open() if a.get("key", "").startswith("incoming:writing/")])
+        self.assertFalse(machine.path(".agents", "skills", "review").exists())
+
     def test_new_item_waits_for_approval(self):
         self.standard_config()
         a = self.machine("a")
