@@ -1,6 +1,7 @@
 """The agent-kit-sync command."""
 
 from __future__ import annotations
+from . import processes
 
 import argparse
 import json
@@ -26,21 +27,27 @@ def say(text: str = "") -> None:
 
 
 def cmd_sync(args, layout: Layout) -> int:
+    from .background import retain_worker_lease
     from .engine import Engine, QUIET_SECONDS
     from .model import ConfigError
     from .notify import notify
     from .state import LockBusy, request_rerun, run_lock, take_rerun
+    if args.background and not retain_worker_lease(layout.root):
+        request_rerun(layout)
+        return 0
     if args.quiet_wait:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and _recent_edit(layout, QUIET_SECONDS):
             time.sleep(2)
     try:
         with run_lock(layout, wait=0 if args.background else 30):
-            for _ in range(3):
+            for attempt in range(3):
                 take_rerun(layout)
                 code = _one_run(args, layout)
                 if not take_rerun(layout):
                     return code
+                if attempt == 2:
+                    request_rerun(layout)  # Preserve work deferred beyond the bounded loop.
             return code
     except LockBusy:
         request_rerun(layout)
@@ -185,7 +192,7 @@ def cmd_run_hook(args, layout: Layout) -> int:
             payload = {}
         # Claude Code runs the hook a subagent definition names, and Cursor runs Claude Code's.
         calling = os.environ.get("AGENT_KIT_SYNC_APP") or caller("claude", payload if isinstance(payload, dict) else {})
-        result = subprocess.run(runtime + [hook["path"]] + hook_args(hook, calling) + list(args.rest), input=data, timeout=hook.get("timeout", 10))
+        result = processes.run(runtime + [hook["path"]] + hook_args(hook, calling) + list(args.rest), input=data, timeout=hook.get("timeout", 10))
     except subprocess.TimeoutExpired:
         sys.stderr.write(f"agent-kit-sync: the {args.hook} hook timed out.\n")
         return 2 if hook.get("on_failure") == "closed" else 1

@@ -263,6 +263,8 @@ The worktrees name is a child directory: with projects in `D:\Projects`, the Win
 
 An override changes one module or item on this machine only:
 
+Automated child commands use the shared hidden-process launcher on Windows, and hooks execute one at a time. Automatic sync reserves a single background worker before spawning; busy triggers record pending work instead of creating waiting processes. The worker keeps that ownership through edit debouncing and sync. Pending changes are handled by its bounded loop or the next trigger or explicit sync. Tests and self-tests disable automatic sync. These bounds cover the tool's own launchers; hook programs must also hide and bound their nested children.
+
 Declining a new item disables it on this machine. Later syncs leave disabled modules and items out of incoming approval requests and close any earlier incoming request for them. Saved local edits still wait for their own decision. Enabling a previously declined item asks for approval again before its first installation when `new_items = "ask"`.
 
 | Command | Effect |

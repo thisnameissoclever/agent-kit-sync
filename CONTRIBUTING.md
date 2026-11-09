@@ -6,6 +6,8 @@ Before merging, default to running relevant checks locally and obtaining indepen
 
 ## Run the tests
 
+Run local checks sequentially and select them by the affected behavior. Inspect available memory and active workloads before heavy execution, and bound runtime and output. Automated Windows child launches must use `agent_kit_sync.processes`, including calls in test helpers; the source contract test rejects direct subprocess launch bypasses. Use mocked startup checks before a native process check. Never reproduce a window or memory incident with visible terminal launches or a process stress loop. Open a visible interactive terminal only when the user expressly requests it. Tests and self-tests explicitly disable automatic sync.
+
 Run the tests with Python 3.9 or later and Git, from the `tests` folder:
 
 ```sh

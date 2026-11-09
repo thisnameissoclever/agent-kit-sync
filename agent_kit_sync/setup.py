@@ -9,6 +9,7 @@ register  registers the dispatcher in each app
 """
 
 from __future__ import annotations
+from . import processes
 
 import difflib
 import json
@@ -48,7 +49,7 @@ def check(args, layout: Layout) -> int:
     git = shutil.which("git")
     git_version = None
     if git:
-        git_version = subprocess.run([git, "--version"], stdout=subprocess.PIPE, timeout=10).stdout.decode().strip()
+        git_version = processes.run([git, "--version"], stdout=subprocess.PIPE, timeout=10).stdout.decode().strip()
     install = {
         "macos": {"git": "xcode-select --install", "python": "brew install python (or xcode-select --install)"},
         "windows": {"git": "winget install --id Git.Git -e", "python": "winget install --id Python.Python.3.13 -e"},

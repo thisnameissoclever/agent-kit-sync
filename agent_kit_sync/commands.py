@@ -1,6 +1,7 @@
 """Commands other than sync: setup, install, add, shared memory, doctor, repair, undo, uninstall, and update."""
 
 from __future__ import annotations
+from . import processes
 
 import json
 import os
@@ -513,7 +514,7 @@ def _dry_dispatch(layout: Layout, app: str, event: str):
         payload.update({"tool_name": "Read", "tool_input": {"file_path": str(Path.home() / "x")}})
     env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
     try:
-        result = subprocess.run([sys.executable, "-I", "-S", str(layout.launcher), "hook", app, event], input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=env)
+        result = processes.run([sys.executable, "-I", "-S", str(layout.launcher), "hook", app, event], input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=env)
     except (OSError, subprocess.TimeoutExpired) as error:
         return 1, str(error)
     return result.returncode, result.stdout.decode("utf-8", "replace")

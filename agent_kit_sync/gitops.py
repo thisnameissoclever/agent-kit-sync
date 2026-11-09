@@ -1,6 +1,7 @@
 """Git commands with time limits and without prompts nobody could answer."""
 
 from __future__ import annotations
+from . import processes
 
 import os
 import subprocess
@@ -43,12 +44,12 @@ def run(repo: Optional[Path], *args: str, timeout: int = LOCAL_TIMEOUT, check: b
     if args and args[0] in ("fetch", "push", "clone", "ls-remote", "pull") and "GIT_SSH_COMMAND" not in os.environ and "GIT_SSH_COMMAND" not in (env or {}):
         configured = None
         if repo is not None:
-            found = subprocess.run(["git", "-C", str(repo), "config", "--get", "core.sshCommand"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            found = processes.run(["git", "-C", str(repo), "config", "--get", "core.sshCommand"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=LOCAL_TIMEOUT)
             configured = found.stdout.decode().strip() or None
         env = dict(env or {})
         env["GIT_SSH_COMMAND"] = (configured or "ssh") + " -o BatchMode=yes"
     try:
-        result = subprocess.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if input_bytes is None else subprocess.PIPE, timeout=timeout, env=git_env(env), stdin=None if input_bytes is not None else subprocess.DEVNULL)
+        result = processes.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if input_bytes is None else subprocess.PIPE, timeout=timeout, env=git_env(env), stdin=None if input_bytes is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         raise GitError(args, -1, f"timed out after {timeout} seconds") from None
     except FileNotFoundError:

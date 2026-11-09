@@ -5,6 +5,7 @@ the index directly. Everything slow, such as a sync run, happens in a detached p
 """
 
 from __future__ import annotations
+from . import processes
 
 import json
 import os
@@ -101,7 +102,7 @@ def run_one(hook: dict, app: str, event: str, raw: bytes, payload: dict, env: di
         # Python exits 2 when its script is missing, which would read as the hook blocking the action.
         return {"hook": hook, "code": None, "stdout": b"", "stderr": f"its file {path} is missing".encode("utf-8"), "seconds": 0.0}
     try:
-        result = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=hook.get("timeout", 10), env=env, cwd=payload.get("cwd") or None)
+        result = processes.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=hook.get("timeout", 10), env=env, cwd=payload.get("cwd") or None)
         return {"hook": hook, "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr, "seconds": time.monotonic() - started}
     except subprocess.TimeoutExpired:
         return {"hook": hook, "code": None, "stdout": b"", "stderr": b"timed out", "timeout": True, "seconds": time.monotonic() - started}
@@ -263,18 +264,9 @@ def emit(app: str, event: str, combined: Combined, payload: dict, cursor_ask_is_
 
 
 def detach(argv, layout_root: str) -> None:
-    """Start a sync run in the background, with no link to the session's pipes."""
-    import subprocess
-    logs = os.path.join(layout_root, "logs")
-    os.makedirs(logs, exist_ok=True)
-    log = open(os.path.join(logs, "sync-background.log"), "ab")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log, "close_fds": True, "cwd": str(layout_root)}
-    if sys.platform.startswith("win"):
-        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(argv, **kwargs)
-    log.close()
+    """Reserve one worker before launch; busy triggers only record pending work."""
+    from .background import start
+    start(argv, layout_root)
 
 
 def copies_changed(index: dict) -> bool:
@@ -451,11 +443,9 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         raw = json.dumps(payload).encode("utf-8")
     results = []
     if hooks:
-        from concurrent.futures import ThreadPoolExecutor
         env = dict(os.environ)
         env["AGENT_KIT_SYNC_APP"] = calling
-        with ThreadPoolExecutor(max_workers=min(8, len(hooks))) as pool:
-            results = list(pool.map(lambda h: run_one(h, app, event, raw, payload, env), hooks))
+        results = [run_one(h, app, event, raw, payload, env) for h in hooks]
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
     fresh = []
@@ -477,11 +467,11 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         want_sync = True
     if event == "stop" and copies_changed(index):
         want_sync = True
-    if want_sync and not os.environ.get("AGENT_KIT_SYNC_NO_BACKGROUND"):
+    if want_sync and not os.environ.get("AGENT_KIT_SYNC_NO_BACKGROUND") and os.environ.get("AGENT_KIT_SYNC_TEST") != "1":
         try:
             detach([sys.executable, "-I", "-S", str(launcher), "sync", "--background", "--quiet-wait" if event == "post_tool_use" else "--now"], layout_root)
-        except OSError:
-            pass
+        except OSError as error:
+            sys.stderr.write(f"agent-kit-sync could not start its background worker: {error}\n")
     if passed is None:
         code, out = emit(app, event, combined, payload, cursor_ask_is_deny)
         # A lone native hook that succeeded keeps its own error text even when its answer is combined.
