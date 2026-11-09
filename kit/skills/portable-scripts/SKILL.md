@@ -11,6 +11,8 @@ This check is required. Do it before you add a hook or script to agent-kit-sync,
 
 ## Check
 
+Keep process checks bounded. Inspect launch paths and use mocked subprocess controls first. Run local checks sequentially, inspect host memory before heavy work, and obtain explicit approval for resource-intensive process tests. Never use a real-process stress loop to reproduce unexpected windows or process accumulation. A native check must have a small fixed process count, deadline, bounded output, and cleanup limited to its own authorized processes.
+
 1. Run `{{kit.cli}} test MODULE` for a hook already in a module. It reports every line that matches a known way to fail on macOS, Windows, or Linux, and it runs the hook's tests. For a script not in a module yet, read it yourself against the table below.
 2. Read the script and its tests yourself as well. The automatic check knows only some patterns; the table lists more.
 3. Check every file the hook runs or reads: its tests, the scripts it starts, and the fake programs its tests create.
@@ -28,6 +30,8 @@ This check is required. Do it before you add a hook or script to agent-kit-sync,
 | Path separators | `"dir/" + name` | `Path("dir") / name` |
 | System-only modules and calls | `fcntl`, `pwd`, `os.getuid`, `signal.SIGALRM`, `winreg` | A standard-library call that exists everywhere, or a branch on `sys.platform` with a working path for each system |
 | System-only programs | `osascript`, `launchctl`, `xdg-open`, `powershell` | A branch on `sys.platform` for each system, or `requires.os` in the module when it truly belongs to one system |
+| Visible Windows child windows | `subprocess.run(...)` without hidden flags, nested launchers, or `DETACHED_PROCESS` combined with `CREATE_NO_WINDOW` | Use the repository's hidden-process helper, Python `CREATE_NO_WINDOW` alone with compatible flags, Node `windowsHide: true`, or PowerShell `-WindowStyle Hidden`; cover nested test and hook children too |
+| Unbounded background startup | Starting a process before checking a worker or repository lock | Reserve one worker before spawning; coalesce later requests without starting waiting processes |
 | Line endings and encodings | Reading without an encoding | `read_text(encoding="utf-8")`; compare with `.splitlines()` |
 | App folders | Assuming `~/.claude` | `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when set |
 | Folders that may be missing | Assuming the projects folder is mounted | Check it exists and do nothing when it does not |

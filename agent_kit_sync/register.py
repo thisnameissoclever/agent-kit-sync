@@ -5,6 +5,7 @@ tool recognizes its own entries later. Entries written by anything else are neve
 """
 
 from __future__ import annotations
+from . import processes
 
 import json
 import os
@@ -27,7 +28,7 @@ POWERSHELL_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 def claude_version() -> Optional[Tuple[int, ...]]:
     try:
-        out = subprocess.run(["claude", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode()
+        out = processes.run(["claude", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode()
     except (OSError, subprocess.TimeoutExpired):
         return None
     import re
@@ -48,6 +49,7 @@ def needed(hooks: List[dict], app: str) -> Dict[str, dict]:
             if event not in APP_EVENTS.get(app, {}):
                 continue
             entry = events.setdefault(event, {"matcher": None, "closed": False, "names": set()})
+            entry["seconds"] = entry.get("seconds", 0) + hook.get("timeout", 10)
             if event in ("pre_tool_use", "post_tool_use"):
                 match = matcher_for(app, hook.get("tools"))
                 if match == "*" or entry["matcher"] == "*":
@@ -239,6 +241,7 @@ def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict
             handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
             if os_name() == "windows":
                 handler["commandWindows"] = subprocess.list2cmdline(parts)
+        handler["timeout"] = max(60, spec.get("seconds", 0) + 5)
         matcher = spec["matcher"] if event in ("pre_tool_use", "post_tool_use") else ("" if app == "claude" else None)
         result[native] = {"matcher": matcher, "handler": handler}
     return result

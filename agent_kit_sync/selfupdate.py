@@ -1,6 +1,7 @@
 """Installing tool versions side by side and switching between them."""
 
 from __future__ import annotations
+from . import processes
 
 import os
 import shutil
@@ -56,10 +57,10 @@ def install_version(layout: Layout, commit: str) -> Path:
 def self_test(layout: Layout, version: Path) -> Tuple[bool, str]:
     with tempfile.TemporaryDirectory(prefix="aks-selftest-") as home:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_", "CODEX_", "AGENT_KIT_SYNC"))}
-        env.update({"HOME": home, "USERPROFILE": home, "AGENT_KIT_SYNC_HOME": str(Path(home) / ".agent-kit-sync")})
+        env.update({"HOME": home, "USERPROFILE": home, "AGENT_KIT_SYNC_HOME": str(Path(home) / ".agent-kit-sync"), "AGENT_KIT_SYNC_TEST": "1", "AGENT_KIT_SYNC_NO_BACKGROUND": "1"})
         try:
             code = "import sys; sys.path.insert(0, sys.argv[1]); from agent_kit_sync.selftest import main; sys.exit(main())"
-            result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(version)], cwd=home, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SELF_TEST_SECONDS)
+            result = processes.run([sys.executable, "-I", "-S", "-c", code, str(version)], cwd=home, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SELF_TEST_SECONDS)
         except subprocess.TimeoutExpired:
             return False, "the self-test took longer than 20 seconds"
         return result.returncode == 0, result.stdout.decode("utf-8", "replace")[-800:]

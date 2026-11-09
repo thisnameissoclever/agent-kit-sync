@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from support import ROOT, TwoMachines, git, remove_tree
+from agent_kit_sync import processes
 from agent_kit_sync import dispatch
 
 
@@ -179,13 +180,13 @@ def bash_program():
 
 def run_like_claude_code(command, payload, env=None):
     """Run a hook command the way Claude Code 2.1.318 does on Windows with Git Bash: bash -c, the payload on standard input."""
-    return subprocess.run([bash_program(), "-c", command], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+    return processes.run([bash_program(), "-c", command], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
 
 
 def run_like_claude_code_powershell(command, payload, env=None, program=None):
     """Run a "shell": "powershell" hook command the way Claude Code 2.1.318 does: the payload on standard input."""
     script = command + "\n; if (-not $?) { if ($LASTEXITCODE -eq 2) { exit 2 } }"
-    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+    return processes.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], input=payload + b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
 
 
 def run_like_cursor(command, payload, folder, env=None, program=None):
@@ -203,7 +204,7 @@ def run_like_cursor(command, payload, folder, env=None, program=None):
               f"Get-Content -LiteralPath '{literal}' -Raw -Encoding UTF8 | & {{ $input | {command} }}"
               "; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE } elseif ($null -eq $LASTEXITCODE -and "
               "@($Error | Where-Object { $_.Exception -is [System.Management.Automation.CommandNotFoundException] }).Count -gt 0) { exit 127 }")
-    return subprocess.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+    return processes.run([program or powershell_program()] + POWERSHELL_FLAGS + [script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
 
 
 ECHO_HOOK = """
@@ -346,7 +347,7 @@ class WindowsHookCommandTests(unittest.TestCase):
             # Run the command with Python standing in for the program, so the launcher path and the arguments are what Bash passes.
             import shlex
             line = shlex.quote(sys.executable) + " " + shlex.quote(str(printer)) + command[len(program):]
-            result = subprocess.run([bash_program(), "-c", line], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            result = processes.run([bash_program(), "-c", line], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
             self.assertEqual(json.loads(result.stdout), ["-I", "-S", "C:/Users/Pat Doe/.agent-kit-sync/launcher.py", "run-hook", "m/guard"])
         finally:
@@ -518,7 +519,7 @@ class InstalledToolTests(TwoMachines):
         env.update(extra_env or {})
         launcher = self.a.layout.launcher
         cmd = [sys.executable, "-I", "-S", str(launcher)] if launcher.exists() else [sys.executable, "-I", "-S", str(ROOT / "bootstrap.py")]
-        return subprocess.run(cmd + list(args), input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=120)
+        return processes.run(cmd + list(args), input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=120)
 
     def install(self):
         result = self.cli("setup", "init", "--tool-url", self.tool_url)
@@ -623,7 +624,7 @@ class InstalledToolTests(TwoMachines):
             self.assertIn(str(wrapper), text)
             cmd = [str(wrapper), "--version"]
         self.assertTrue(wrapper.is_file())
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home)), timeout=30)
+        result = processes.run(cmd, stdout=subprocess.PIPE, env=dict(os.environ, HOME=str(self.a.home), USERPROFILE=str(self.a.home)), timeout=30)
         self.assertEqual(result.returncode, 0)
         from agent_kit_sync import VERSION
         self.assertIn(VERSION, result.stdout.decode())

@@ -1,5 +1,12 @@
 # Lessons learned
 
+## 2026-11-08: Hide native child launches and reserve workers before spawning
+
+1. **What happened:** During Windows setup and verification, the owner reported extensive terminal-window creation and exhausted memory. The windows were closed before a complete process-parent record could be preserved, so every window's origin was not established.
+2. **Root cause evidence:** Automated child launch sites lacked consistent Windows hiding flags. The detached launcher combined flags for which Windows ignores `CREATE_NO_WINDOW`. Sync triggers started workers before acquiring the sync lock, and workers could wait for quiet edits before that lock. Test isolation also removed inherited background suppression.
+3. **Prevention:** Route automated library and test launches through the hidden-process helper. Reject incompatible console flags, reserve an inherited operating-system worker lease before spawning, run hooks sequentially, and explicitly disable automatic sync in tests. Preserve pending work for the bounded worker loop or next trigger. Apply the same hidden-launch contract to hook grandchildren. Use mocked checks and the smallest bounded native check; avoid visible reproductions and process stress loops.
+4. **How to verify:** Check launch options without starting a process. Run a small native child and verify it has no console. Start one leased child, confirm a duplicate request starts no second child, and verify ownership releases after exit. Check source launch sites, nested hooks, test isolation, and serial execution. Record evidence and platform limits without claiming an unlimited guarantee over arbitrary programs an agent might execute.
+
 ## 2026-11-08: Apply local disable decisions before incoming approval policy
 
 1. **What happened:** Declining a new item disabled installation, but the next sync raised the same incoming approval request again.

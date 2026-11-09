@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from support import TwoMachines
+from agent_kit_sync import processes
 from agent_kit_sync import cursor_rules
 
 CONFIG = {
@@ -67,7 +68,7 @@ class CursorRuleTests(TwoMachines):
         return self.rules() / f"agent-kit-sync--writing--{item}.mdc"
 
     def head(self) -> str:
-        return subprocess.run(["git", "-C", str(self.a.layout.config), "rev-parse", "HEAD"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        return processes.run(["git", "-C", str(self.a.layout.config), "rev-parse", "HEAD"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
 
     def test_each_section_becomes_a_rule_with_imports_filled_in(self):
         _engine, report = self.a.sync()

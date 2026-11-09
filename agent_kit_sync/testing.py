@@ -1,6 +1,7 @@
 """Running module tests, each as its own process, with the user's folders pointed at a temporary one."""
 
 from __future__ import annotations
+from . import processes
 
 import os
 import shutil
@@ -16,7 +17,7 @@ HOME_VARS = ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONF
 
 def isolated_env(home: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in HOME_VARS and not k.startswith("AGENT_KIT_SYNC")}
-    env.update({"HOME": str(home), "USERPROFILE": str(home), "AGENT_KIT_SYNC_TEST": "1"})
+    env.update({"HOME": str(home), "USERPROFILE": str(home), "AGENT_KIT_SYNC_TEST": "1", "AGENT_KIT_SYNC_NO_BACKGROUND": "1"})
     return env
 
 
@@ -49,7 +50,7 @@ def run_test(module_root: Path, rel: str) -> Tuple[str, str]:
         return "failed", f"did not run: agent-kit-sync runs tests written in Python (.py), JavaScript (.mjs, .js, .cjs), or bash (.sh), not {path.suffix or 'a file with no suffix'}"
     with tempfile.TemporaryDirectory(prefix="aks-test-home-") as home:
         try:
-            result = subprocess.run(cmd, cwd=str(path.parent), env=isolated_env(Path(home)), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=TEST_SECONDS)
+            result = processes.run(cmd, cwd=str(path.parent), env=isolated_env(Path(home)), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=TEST_SECONDS)
         except subprocess.TimeoutExpired:
             return "failed", f"took longer than {TEST_SECONDS} seconds"
     out = result.stdout.decode("utf-8", "replace")

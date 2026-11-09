@@ -92,6 +92,8 @@ Each approval question explains what the item does, which apps it affects, and h
 
 ## How syncing works
 
+Automated child commands use the shared hidden-process launcher on Windows, and hooks execute one at a time. Automatic sync reserves a single background worker before spawning; busy triggers record pending work instead of creating waiting processes. The worker keeps that ownership through edit debouncing and sync. Pending changes are handled by its bounded loop or the next trigger or explicit sync. Tests and self-tests disable automatic sync. These bounds cover the tool's own launchers; hook programs must also hide and bound their nested children.
+
 A sync runs in the background when a session starts, after an agent writes a file, and at the end of a turn when an installed copy changed. You can also run `agent-kit-sync sync`. A sync that succeeds prints nothing and adds nothing to any agent's context.
 
 A run does these steps in order:

@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 
 from support import ROOT, remove_tree  # noqa: F401  (support puts the tool on the path)
+from agent_kit_sync import processes
 from agent_kit_sync import cursor, dispatch, register
 
 
@@ -308,7 +309,7 @@ class DispatcherTests(unittest.TestCase):
         )
         env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
         env.pop("AGENT_KIT_SYNC_APP", None)
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py"), event],
+        result = processes.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py"), event],
                                 input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
         return result.returncode, json.loads(result.stdout or b"null")
 
@@ -350,7 +351,7 @@ class DispatcherTests(unittest.TestCase):
             "sys.exit(dispatch.main(sys.argv[2], sys.argv[3], 'claude', sys.argv[4]))"
         )
         env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py"), event],
+        result = processes.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py"), event],
                                 input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -391,7 +392,7 @@ class DispatcherTests(unittest.TestCase):
         )
         env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
         payload = cursor_payload("preToolUse", tool_name="Shell", tool_input={"command": "rm -rf /tmp/x"})
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py")],
+        result = processes.run([sys.executable, "-I", "-S", "-c", code, str(ROOT), str(self.kit), str(self.kit / "launcher.py")],
                                 input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)
