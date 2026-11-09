@@ -219,6 +219,7 @@ def _posix_access_at_most(source, target, actor):
     old_owner, old_group, old_other = (old >> 6) & 7, (old >> 3) & 7, old & 7
     new_owner, new_group, new_other = (new >> 6) & 7, (new >> 3) & 7, new & 7
     floor = old_owner & old_group & old_other
+    # The executing user already read the snapshot; new ownership does not expose it to another actor.
     if target.st_uid != actor:
         owner_limit = old_owner if target.st_uid == source.st_uid else floor
         if new_owner & ~owner_limit:
@@ -343,8 +344,7 @@ def _load_receipt(path, layout):
             snapshot = entry.get("snapshot") if isinstance(entry, dict) else None
             if not isinstance(snapshot, dict) or not isinstance(snapshot.get("identity"), list) or not isinstance(snapshot.get("files"), dict) or not isinstance(snapshot.get("directories"), list):
                 raise ValueError("invalid source snapshot")
-            from .model import safe_rel
-            if not all(safe_rel(p) for p in list(snapshot["files"]) + snapshot["directories"]):
+            if not all(_native_relative(p) for p in list(snapshot["files"]) + snapshot["directories"]):
                 raise ValueError("unsafe snapshot relative path")
             if not all(isinstance(e, dict) and isinstance(e.get("hash"), str) and re.fullmatch(r"[0-9a-f]{64}", e["hash"]) for e in snapshot["files"].values()):
                 raise ValueError("invalid snapshot file hashes")
@@ -357,6 +357,13 @@ def _load_receipt(path, layout):
         return data
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as error:
         raise PendingMigration(f"Existing receipt is preserved and needs review: {path}: {error}") from None
+
+
+def _native_relative(value):
+    if not isinstance(value, str) or not value or "\0" in value:
+        return False
+    path = Path(value)
+    return not path.anchor and path.parts and all(part not in (".", "..") for part in path.parts)
 
 
 def _recover_retirements(record):
