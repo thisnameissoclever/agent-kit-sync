@@ -30,9 +30,10 @@ class DirectoryPreservationTests(unittest.TestCase):
             engine.layout = layout
             engine.machine = SimpleNamespace(projects=projects, os="windows")
             target = str(projects / "_status" / "data").replace("/", "\\")
-            plans = [Plan(copies=[SimpleNamespace(module="rules", data=target.encode())]),
+            plans = [Plan(copies=[SimpleNamespace(module="rules", data=target.encode(), source_rel="rule.md")]),
                      Plan(cursor_blocks=[("rules", "rule", target)]),
-                     Plan(settings=[SimpleNamespace(item_key="rules/path", value=target)])]
+                     Plan(settings=[SimpleNamespace(item_key="rules/path", value=target)]),
+                     Plan(hooks=[SimpleNamespace(module="rules", args=[target])])]
             for plan in plans:
                 with self.subTest(plan=plan):
                     engine._preserve_migrated_references(plan)
@@ -64,7 +65,10 @@ class DirectoryPreservationTests(unittest.TestCase):
                 receipt.write_text(json.dumps({"version": 2, "state": "complete", "posix_move": {"phase": "complete"}}), encoding="utf-8")
                 source.write_text('Read {{kit.projects}}/_status/commitments.md.\n', encoding="utf-8")
                 blocked = Engine(layout)
-                self.assertTrue(blocked.run(network=False).errors)
+                errors = blocked.run(network=False).errors
+                self.assertTrue(errors)
+                self.assertIn(str(source), errors[0])
+                self.assertIn(str(projects / "_status"), errors[0])
                 self.assertEqual(installed.read_bytes(), original)
                 self.assertFalse((projects / "_status").exists())
                 source.write_text('Read {{kit.projects}}/status/commitments.md.\n', encoding="utf-8")
