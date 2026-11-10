@@ -74,6 +74,24 @@ class SkillPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "defaults.skills"):
                 self.make_engine(Path(folder), "wrong")
 
+    def test_push_retry_uses_policy_from_the_merge_before_installing(self):
+        for initial, incoming in (("apply", "ask"), ("ask", "apply")):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as folder, as_home(Path(folder)):
+                engine, module = self.make_engine(Path(folder), initial)
+                observed = []
+                def merged(*args, **kwargs):
+                    kit = engine.layout.config / "kit.toml"
+                    data = toml.load_file(kit)
+                    data["defaults"]["skills"] = incoming
+                    kit.write_text(toml.dumps(data), encoding="utf-8")
+                    return type("Result", (), {"returncode": 0, "stdout": b""})()
+                def installed(modules, incoming=True):
+                    observed.append(self.effective(engine, module))
+                with mock.patch("agent_kit_sync.engine.gitops.head", return_value="local"), mock.patch("agent_kit_sync.engine.gitops.rev", side_effect=["old-remote", "new-remote"]), mock.patch("agent_kit_sync.engine.gitops.upstream", return_value="origin/main"), mock.patch("agent_kit_sync.engine.gitops.is_ancestor", side_effect=lambda repo, first, second: first == "local" and second == "new-remote"), mock.patch("agent_kit_sync.engine.gitops.push", side_effect=[False, True]), mock.patch("agent_kit_sync.engine.gitops.branch", return_value="main"), mock.patch("agent_kit_sync.engine.gitops.fetch"), mock.patch("agent_kit_sync.engine.gitops.run", side_effect=merged), mock.patch.object(engine, "_set_aside_uncommitted"), mock.patch.object(engine, "install", side_effect=installed):
+                    engine.push()
+                self.assertEqual(engine.machine.policy.get("skills"), incoming)
+                self.assertEqual("work/review" in observed[0], incoming == "apply")
+
 
 class AutomaticSkillSyncTests(TwoMachines):
     def test_fetched_repository_policy_applies_in_the_same_sync_pass(self):

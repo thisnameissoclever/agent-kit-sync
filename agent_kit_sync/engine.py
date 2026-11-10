@@ -183,7 +183,6 @@ class Engine:
         self.install(modules, incoming=False)
         if network and gitops.has_remote(self.checkout):
             self.merge_remote()
-            self.machine.policy = load_machine(self.layout).policy
             # A config repo another machine broke stops the run here; this machine keeps what it has installed.
             modules = self._load_or_alert()
             if modules is None:
@@ -1057,6 +1056,10 @@ class Engine:
         return found, headers
 
     def merge_remote(self) -> None:
+        self._merge_remote()
+        self.machine.policy = load_machine(self.layout).policy
+
+    def _merge_remote(self) -> None:
         # A run started after a file write fetches at most once a minute; every other run fetches.
         if not self.throttle_fetch or time.time() - self.index.last_fetch >= 60 or self.report.edits or self.report.deletions:
             try:
