@@ -1491,7 +1491,7 @@ class Engine:
 
     # ------------------------------------------------------------ installing
 
-    def _preserve_migrated_references(self, plan: Plan, modules: List[Module] = ()) -> None:
+    def _preserve_migrated_references(self, plan: Plan, modules=(), trees=None) -> None:
         projects = self.machine.projects
         receipt = self.layout.state / "status-directory-migration.json"
         if projects is None or not receipt.is_file() or not (projects / "status").is_dir():
@@ -1500,27 +1500,52 @@ class Engine:
         roots = [projects / "_status"] + [parent / name for parent in (projects, projects.parent) for name in names]
         missing = [path for path in roots if not path.exists()]
         module_roots = {module.name: module.root for module in modules}
-        sources = {(module.name, item.name): module.root / item.data.get("file", "module.toml")
-                   for module in modules for item in module.items}
-        def source_root(name):
-            return module_roots.get(name, self.checkout / "modules" / name)
-        texts = [(copy.module, copy.data.decode("utf-8", "replace"), source_root(copy.module) / copy.source_rel) for copy in plan.copies]
-        texts += [(block.module, block.content, source_root(block.module) / block.source_rel) for block in plan.sections]
-        texts += [(module, text, sources.get((module, item), source_root(module) / "module.toml")) for module, item, text in plan.cursor_blocks]
-        texts += [(write.item_key.split("/", 1)[0], json.dumps(write.value), source_root(write.item_key.split("/", 1)[0]) / "module.toml") for write in plan.settings]
-        texts += [(hook.module, json.dumps(hook.args), source_root(hook.module) / "module.toml") for hook in plan.hooks]
+        items = {(module.name, item.name): item for module in modules for item in module.items}
+        overrides = getattr(self.machine, "overrides", {})
+
+        def origin(module, item, app, relative, local_text=False):
+            key = module + "/" + item
+            root = module_roots.get(module, self.checkout / "modules" / module)
+            tree = (trees or {}).get(key)
+            revision = getattr(tree, "commit", None)
+            selected = str(root / relative)
+            if revision:
+                selected += " at held or pinned revision " + revision
+            override = overrides.get(key) or overrides.get(module) or {}
+            if local_text and override.get("kind") in ("replace", "prepend", "append") and override.get("file"):
+                path = Path(override["file"])
+                if not path.is_absolute():
+                    path = self.layout.root / path
+                selected += f"; local {override['kind']} source {path}"
+            return key + " (" + app + ")", selected, revision
+
+        texts = []
+        for copy in plan.copies:
+            texts.append((copy.module, copy.data.decode("utf-8", "replace"), origin(copy.module, copy.item, copy.app, copy.source_rel, copy.kind in ("skill", "agent", "file"))))
+        for block in plan.sections:
+            texts.append((block.module, block.content, origin(block.module, block.item, block.app, block.source_rel, True)))
+        for module, item, text in plan.cursor_blocks:
+            data = items[(module, item)].data if (module, item) in items else {}
+            relative = data.get("variants", {}).get("cursor", data.get("file", "module.toml"))
+            texts.append((module, text, origin(module, item, "cursor", relative, True)))
+        for write in plan.settings:
+            module, item = write.item_key.split("/", 1)
+            texts.append((module, json.dumps(write.value, ensure_ascii=False), origin(module, item, write.app, "module.toml")))
+        for hook in plan.hooks:
+            texts.append((hook.module, json.dumps(hook.args, ensure_ascii=False), origin(hook.module, hook.name, "hooks", "module.toml")))
         affected = {}
-        for module, text, source in texts:
+        for module, text, details in texts:
             text = text.replace("\\\\", "\\").replace("\\", "/")
             for path in missing:
-                pattern = re.escape(str(path).replace("\\", "/")) + r"(?=$|[/\s`\"'.,;:)])"
+                pattern = re.escape(str(path).replace("\\", "/")) + r"(?=$|[^\w-])"
                 if re.search(pattern, text, re.I if self.machine.os == "windows" else 0):
-                    affected.setdefault(module, (source, path))
+                    affected.setdefault(module, (details, path))
                     break
         for module in sorted(affected):
             plan.drop_module(module)
-            source, old = affected[module]
-            plan.errors.append(f"module {module}: {source} references missing directory {old}. Replace that directory in this source file with {projects / 'status'}, then run agent-kit-sync sync. Existing installed configuration is preserved.")
+            (item, selected, revision), old = affected[module]
+            action = "Resolve the held decision or pin, then run agent-kit-sync sync." if revision else "Correct the active source, then run agent-kit-sync sync."
+            plan.errors.append(f"module {module}: {item} references missing directory {old}. Inspect {selected}. The active source must refer to {projects / 'status'}. {action} Existing installed configuration is preserved.")
 
     def install(self, modules: List[Module], incoming: bool) -> None:
         effective, trees = self._effective_modules(modules, incoming)
@@ -1529,7 +1554,7 @@ class Engine:
             return trees.get(item.key) or Tree(module.root)
 
         plan = Planner(self.layout, self.machine, effective, tree_for).build()
-        self._preserve_migrated_references(plan, effective)
+        self._preserve_migrated_references(plan, effective, trees)
         for name in self.held_back:
             if name not in plan.failed:
                 # Keep everything this machine installed for the module, exactly as a module that cannot be planned keeps it.

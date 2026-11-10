@@ -18,7 +18,34 @@ from agent_kit_sync.plan import Plan
 
 
 class DirectoryPreservationTests(unittest.TestCase):
-    def test_migrated_reference_guard_covers_copies_cursor_and_escaped_settings(self):
+    def test_guard_reports_cursor_variant_override_and_effective_revision(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            projects = root / "Projects"
+            (projects / "status").mkdir(parents=True)
+            layout = Layout(root / "kit")
+            layout.state.mkdir(parents=True)
+            (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
+            module_root = layout.config / "modules/rules"
+            module_root.mkdir(parents=True)
+            (module_root / "base.md").write_text("Current checkout is clean", encoding="utf-8")
+            item = SimpleNamespace(name="rule", data={"file": "base.md", "variants": {"cursor": "cursor.md"}})
+            module = SimpleNamespace(name="rules", root=module_root, items=[item])
+            for kind in ("replace", "prepend", "append"):
+                engine = Engine.__new__(Engine)
+                engine.layout = layout
+                engine.machine = SimpleNamespace(projects=projects, os="linux", overrides={"rules/rule": {"kind": kind, "file": "overrides/local.md"}})
+                plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "_status" / "data"))])
+                engine._preserve_migrated_references(plan, [module], {"rules/rule": SimpleNamespace(commit="older-revision")})
+                self.assertEqual(plan.failed, ["rules"])
+                message = plan.errors[0]
+                self.assertIn(str(module_root / "cursor.md"), message)
+                self.assertNotIn(str(module_root / "base.md"), message)
+                self.assertIn(str(layout.root / "overrides/local.md"), message)
+                self.assertIn("older-revision", message)
+                self.assertIn("Resolve the held decision or pin", message)
+
+    def test_guard_accepts_markdown_delimiters_and_ignores_similar_names(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
             projects = root / "Projects"
@@ -28,12 +55,29 @@ class DirectoryPreservationTests(unittest.TestCase):
             (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
             engine = Engine.__new__(Engine)
             engine.layout = layout
+            engine.machine = SimpleNamespace(projects=projects, os="linux")
+            for suffix, blocked in (("]", True), (">", True), ("", True), ("/data", True), ("-other/data", False), ("_extra/data", False)):
+                with self.subTest(suffix=suffix):
+                    plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "_status") + suffix)])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(bool(plan.failed), blocked)
+
+    def test_migrated_reference_guard_covers_copies_cursor_and_escaped_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            projects = root / "Prójècts"
+            (projects / "status").mkdir(parents=True)
+            layout = Layout(root / "kit")
+            layout.state.mkdir(parents=True)
+            (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
+            engine = Engine.__new__(Engine)
+            engine.layout = layout
             engine.machine = SimpleNamespace(projects=projects, os="windows")
             target = str(projects / "_status" / "data").replace("/", "\\")
-            plans = [Plan(copies=[SimpleNamespace(module="rules", data=target.encode(), source_rel="rule.md")]),
+            plans = [Plan(copies=[SimpleNamespace(module="rules", item="rule", app="kit", kind="file", data=target.encode(), source_rel="rule.md")]),
                      Plan(cursor_blocks=[("rules", "rule", target)]),
-                     Plan(settings=[SimpleNamespace(item_key="rules/path", value=target)]),
-                     Plan(hooks=[SimpleNamespace(module="rules", args=[target])])]
+                     Plan(settings=[SimpleNamespace(item_key="rules/path", app="codex", value=target)]),
+                     Plan(hooks=[SimpleNamespace(module="rules", name="guard", args=[target])])]
             for plan in plans:
                 with self.subTest(plan=plan):
                     engine._preserve_migrated_references(plan)
