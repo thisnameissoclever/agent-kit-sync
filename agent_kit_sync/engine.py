@@ -164,8 +164,6 @@ class Engine:
 
     def run(self, network: bool = True) -> Report:
         self.recover()
-        if not self._migrate_status_directory():
-            return self._finish()
         # Version 0.1.0 raised an alert for instruction files over 32 KiB, citing a Codex limit that
         # does not apply to the files this tool writes. Close any such alert left open by that version.
         for alert in self.alerts.open():
@@ -189,43 +187,10 @@ class Engine:
             modules = self._load_or_alert()
             if modules is None:
                 return self._finish()
-        if not self._migrate_status_directory():
-            return self._finish()
         self.install(modules, incoming=True)
-        if not self.report.errors and not self._finalize_status_directory():
-            return self._finish()
         if network and gitops.has_remote(self.checkout) and not self.machine.cloud:
             self.push()
         return self._finish()
-
-    def _migrate_status_directory(self) -> bool:
-        from .status_directory import migrate_status, migration_enabled
-        if not migration_enabled(self.layout):
-            return True
-        result = migrate_status(self.layout, self.machine.projects, required=True)
-        self._status_plan_id = result.get("plan_id")
-        if result["state"] in ("pending", "not-configured"):
-            detail = "; ".join(result.get("pending", [])) or "Configure this machine's projects directory."
-            self.alerts.raise_("status-directory-migration", f"Status-directory migration needs attention: {detail}", "agent-kit-sync migrate-status")
-            self.report.errors.append("Status-directory migration is pending; original and retained data are preserved.")
-            return False
-        self.alerts.close("status-directory-migration")
-        return True
-
-    def _finalize_status_directory(self) -> bool:
-        from .status_directory import installed_paths, migrate_status, migration_enabled
-        if not migration_enabled(self.layout):
-            return True
-        result = migrate_status(self.layout, self.machine.projects, required=True, finalize=True,
-                                active_paths=installed_paths(self.layout, self.machine, self.index),
-                                plan_id=getattr(self, "_status_plan_id", None))
-        if result["state"] != "complete":
-            detail = "; ".join(result.get("pending", [])) or "Migration did not complete."
-            self.alerts.raise_("status-directory-migration", detail, "agent-kit-sync migrate-status")
-            self.report.errors.append("Status-directory retirement is pending; retained data must be reconciled.")
-            return False
-        self.alerts.close("status-directory-migration")
-        return True
 
     def _load_or_alert(self) -> Optional[List[Module]]:
         try:
@@ -235,6 +200,7 @@ class Engine:
             self.report.errors.append(str(error))
             return None
         self.alerts.close("config")
+        self.alerts.close("status-directory-migration")
         return modules
 
     def _finish(self) -> Report:
