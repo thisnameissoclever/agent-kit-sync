@@ -17,38 +17,26 @@ def normalized(value):
     return re.sub(r"[/\\]+", "/", str(value))
 
 
-def quoted_strings(text):
-    start, escaped = None, False
-    for index, char in enumerate(text):
-        if start is None:
-            if char == '"':
-                start = index
-        elif escaped:
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == '"':
-            yield text[start:index + 1]
-            start = None
-
-
 def reference_views(text):
-    """Inspect raw text and decoded JSON-compatible or TOML basic strings."""
+    """Inspect raw text and string values in complete JSON or TOML documents."""
     yield normalized(text)
-    for literal in quoted_strings(text):
-        if "\\" not in literal:
-            continue
+    try:
+        decoded = json.loads(text)
+    except (ValueError, RecursionError):
         try:
-            decoded = json.loads(literal)
-        except ValueError:
-            if "\\U" not in literal:
-                continue
-            try:
-                decoded = toml.loads("value = " + literal)["value"]
-            except ValueError:
-                continue
-        if isinstance(decoded, str):
-            yield normalized(decoded)
+            decoded = toml.loads(text)
+        except (ValueError, RecursionError):
+            return
+    pending = [decoded]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            yield normalized(value)
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
 
 
 @dataclass(frozen=True)

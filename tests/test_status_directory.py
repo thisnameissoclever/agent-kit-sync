@@ -26,6 +26,14 @@ class DirectoryPreservationTests(unittest.TestCase):
                 for suffix, blocked in (("_status/data", True), ("_status.backup/data", False)):
                     value = str(projects / suffix).replace("/", "\\")
                     packets = [("config.json", json.dumps({"path": value})), ("config.toml", toml.dumps({"path": value}))]
+                    packets.append(("nested.json", json.dumps({"paths": [{"path": value}]})))
+                    packets.append(("keys.json", json.dumps({value: "entry"})))
+                    multiline = value.replace("\\", "\\\\")
+                    for char in name:
+                        if ord(char) > 127:
+                            escaped = "\\u%04x" % ord(char) if ord(char) <= 0xffff else "\\U%08x" % ord(char)
+                            multiline = multiline.replace(char, escaped)
+                    packets.append(("multiline.toml", 'path = """\n' + multiline + '"""\n'))
                     if name == "🐱":
                         packets.append(("unicode.toml", "path = " + json.dumps(value, ensure_ascii=False).replace("🐱", "\\U0001F431")))
                     for source, content in packets:
