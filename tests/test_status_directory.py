@@ -19,6 +19,27 @@ from agent_kit_sync.status_references import StatusReferences
 
 
 class DirectoryPreservationTests(unittest.TestCase):
+    def test_copied_json_paths_decode_unicode_without_matching_similar_names(self):
+        for name in ("José", "é", "🐱"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:
+                engine, projects, layout = self.reference_fixture(Path(folder).resolve() / name, {"version": 2, "state": "complete", "staged": {}, "retired": []})
+                for suffix, blocked in (("_status/data", True), ("_status.backup/data", False)):
+                    value = str(projects / suffix).replace("/", "\\")
+                    packets = [("config.json", json.dumps({"path": value})), ("config.toml", toml.dumps({"path": value}))]
+                    if name == "🐱":
+                        packets.append(("unicode.toml", "path = " + json.dumps(value, ensure_ascii=False).replace("🐱", "\\U0001F431")))
+                    for source, content in packets:
+                        copy = SimpleNamespace(module="rules", item="rule", app="kit", kind="file", source_rel=source, data=content.encode())
+                        plan = Plan(copies=[copy])
+                        engine._preserve_migrated_references(plan)
+                        self.assertEqual(bool(plan.failed), blocked)
+                other = str(projects.parent.parent / "u00e9/Projects/_status/data").replace("/", "\\")
+                for data in (other.encode(), json.dumps({"path": other}).encode()):
+                    copy = SimpleNamespace(module="rules", item="rule", app="kit", kind="file", source_rel="config.json", data=data)
+                    plan = Plan(copies=[copy])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(plan.failed, [])
+
     def reference_fixture(self, root, receipt):
         projects = root / "Projects"
         if receipt.get("state") == "complete":
@@ -95,7 +116,8 @@ class DirectoryPreservationTests(unittest.TestCase):
         target = str(engine.machine.projects / "_status/data").replace("/", "\\")
         for text in (target, json.dumps(target)):
             plan = Plan(cursor_blocks=[("rules", "rule", text)])
-            with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "exists", return_value=False):
+            receipt = json.dumps({"version": 2, "state": "complete", "canonical": str(engine.machine.projects / "status"), "staged": {}, "retired": []}).encode()
+            with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "exists", return_value=False), mock.patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(receipt)):
                 engine._preserve_migrated_references(plan)
             self.assertEqual(plan.failed, ["rules"])
 

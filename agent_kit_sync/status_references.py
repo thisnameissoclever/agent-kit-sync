@@ -7,12 +7,48 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import toml
+
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 COMPONENT_END = r"(?=$|[/\s`\"'<>()\[\]{},;:!?]|\.(?=$|\s))"
 
 
 def normalized(value):
     return re.sub(r"[/\\]+", "/", str(value))
+
+
+def quoted_strings(text):
+    start, escaped = None, False
+    for index, char in enumerate(text):
+        if start is None:
+            if char == '"':
+                start = index
+        elif escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            yield text[start:index + 1]
+            start = None
+
+
+def reference_views(text):
+    """Inspect raw text and decoded JSON-compatible or TOML basic strings."""
+    yield normalized(text)
+    for literal in quoted_strings(text):
+        if "\\" not in literal:
+            continue
+        try:
+            decoded = json.loads(literal)
+        except ValueError:
+            if "\\U" not in literal:
+                continue
+            try:
+                decoded = toml.loads("value = " + literal)["value"]
+            except ValueError:
+                continue
+        if isinstance(decoded, str):
+            yield normalized(decoded)
 
 
 @dataclass(frozen=True)
@@ -75,16 +111,17 @@ class StatusReferences:
             return False
 
     def find_unsafe(self, text):
-        for pattern, parent, destination in self.patterns:
-            for match in pattern.finditer(normalized(text)):
-                path = parent / match.group("name")
-                if destination:
-                    if not self.complete:
-                        return UnsafeReference(path, True)
-                else:
-                    try:
-                        if not path.exists():
-                            return UnsafeReference(path, False)
-                    except OSError:
-                        return UnsafeReference(path, True)
+        for view in reference_views(text):
+            for pattern, parent, destination in self.patterns:
+                for match in pattern.finditer(view):
+                    path = parent / match.group("name")
+                    if destination:
+                        if not self.complete:
+                            return UnsafeReference(path, True)
+                    else:
+                        try:
+                            if not path.exists():
+                                return UnsafeReference(path, False)
+                        except OSError:
+                            return UnsafeReference(path, True)
         return None
