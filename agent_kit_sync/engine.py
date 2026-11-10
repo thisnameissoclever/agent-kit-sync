@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -1492,13 +1491,11 @@ class Engine:
     # ------------------------------------------------------------ installing
 
     def _preserve_migrated_references(self, plan: Plan, modules=(), trees=None) -> None:
+        from .status_references import StatusReferences
         projects = self.machine.projects
-        receipt = self.layout.state / "status-directory-migration.json"
-        if projects is None or not receipt.is_file() or not (projects / "status").is_dir():
+        references = StatusReferences(self.layout, projects, self.machine.os)
+        if not references.enabled:
             return
-        names = {projects.name + "_status", projects.name.lower() + "_status", projects.name.upper() + "_status"}
-        roots = [projects / "_status"] + [parent / name for parent in (projects, projects.parent) for name in names]
-        missing = [path for path in roots if not path.exists()]
         module_roots = {module.name: module.root for module in modules}
         items = {(module.name, item.name): item for module in modules for item in module.items}
         overrides = getattr(self.machine, "overrides", {})
@@ -1535,17 +1532,18 @@ class Engine:
             texts.append((hook.module, json.dumps(hook.args, ensure_ascii=False), origin(hook.module, hook.name, "hooks", "module.toml")))
         affected = {}
         for module, text, details in texts:
-            text = re.sub(r"[/\\]+", "/", text)
-            for path in missing:
-                pattern = re.escape(re.sub(r"[/\\]+", "/", str(path))) + r"(?=$|[^\w-])"
-                if re.search(pattern, text, re.I if self.machine.os == "windows" else 0):
-                    affected.setdefault(module, (details, path))
-                    break
+            unsafe = references.find_unsafe(text)
+            if unsafe is not None:
+                affected.setdefault(module, (details, unsafe))
         for module in sorted(affected):
             plan.drop_module(module)
-            (item, selected, revision), old = affected[module]
+            (item, selected, revision), unsafe = affected[module]
             action = "Resolve the held decision or pin, then run agent-kit-sync sync." if revision else "Correct the active source, then run agent-kit-sync sync."
-            plan.errors.append(f"module {module}: {item} references missing directory {old}. Inspect {selected}. The active source must refer to {projects / 'status'}. {action} Existing installed configuration is preserved.")
+            if unsafe.unverified or not references.complete:
+                problem = f"references unverified prior migration data at {unsafe.path}. Inspect receipt {references.receipt} for the recorded source directories, compare their files with {projects / 'status'}, and inspect source candidates {selected}. Point the active source at the directory containing the required files."
+            else:
+                problem = f"references missing directory {unsafe.path}. Inspect {selected}. The active source must refer to {projects / 'status'}."
+            plan.errors.append(f"module {module}: {item} {problem} {action} Existing installed configuration is preserved.")
 
     def install(self, modules: List[Module], incoming: bool) -> None:
         effective, trees = self._effective_modules(modules, incoming)

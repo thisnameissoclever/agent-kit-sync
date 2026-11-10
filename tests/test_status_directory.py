@@ -15,9 +15,79 @@ from agent_kit_sync import cli, render, toml
 from agent_kit_sync.engine import Engine
 from agent_kit_sync.paths import Layout
 from agent_kit_sync.plan import Plan
+from agent_kit_sync.status_references import StatusReferences
 
 
 class DirectoryPreservationTests(unittest.TestCase):
+    def reference_fixture(self, root, receipt):
+        projects = root / "Projects"
+        if receipt.get("state") == "complete":
+            receipt.setdefault("canonical", str(projects / "status"))
+        (projects / "status").mkdir(parents=True)
+        layout = Layout(root / "kit")
+        layout.state.mkdir(parents=True)
+        (layout.state / "status-directory-migration.json").write_text(json.dumps(receipt), encoding="utf-8")
+        engine = Engine.__new__(Engine)
+        engine.layout = layout
+        engine.machine = SimpleNamespace(projects=projects, os="linux")
+        return engine, projects, layout
+
+    def test_mixed_case_alias_is_held_only_when_that_exact_directory_is_absent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "complete", "staged": {}, "retired": []})
+            alias = projects / "pRoJeCtS_status"
+            plan = Plan(cursor_blocks=[("rules", "rule", str(alias / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+            alias.mkdir()
+            plan = Plan(cursor_blocks=[("rules", "rule", str(alias / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, [])
+
+    def test_pending_destination_is_held_but_existing_original_references_are_allowed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "pending", "staged": {}, "retired": []})
+            old = projects / "_status"
+            old.mkdir()
+            (old / "data").write_bytes(b"complete original")
+            receipt = layout.state / "status-directory-migration.json"
+            before = receipt.read_bytes()
+            for path, blocked in ((projects / "status/data", True), (old / "data", False)):
+                plan = Plan(cursor_blocks=[("rules", "rule", str(path))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(bool(plan.failed), blocked)
+            (projects / "status").rmdir()
+            plan = Plan(cursor_blocks=[("rules", "rule", str(old / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, [])
+            self.assertEqual(receipt.read_bytes(), before)
+            self.assertEqual((old / "data").read_bytes(), b"complete original")
+
+    def test_invalid_and_oversized_receipts_hold_unverified_canonical_references(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {})
+            receipt = layout.state / "status-directory-migration.json"
+            with mock.patch("agent_kit_sync.status_references.MAX_RECEIPT_BYTES", 64):
+                for payload in (b'{bad json', b'x' * 80, b'{"version":2,"state":"unknown"}'):
+                    receipt.write_bytes(payload)
+                    plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "status/data"))])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(plan.failed, ["rules"])
+                    self.assertEqual(receipt.read_bytes(), payload)
+
+    def test_unreadable_or_contradictory_receipt_keeps_canonical_updates_held(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "complete", "canonical": "/different", "staged": {}, "retired": []})
+            plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "status/data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+            with mock.patch.object(Path, "open", side_effect=PermissionError("unreadable")):
+                references = StatusReferences(layout, projects, "linux")
+            self.assertIsNotNone(references.find_unsafe(str(projects / "status/data")))
+            with mock.patch.object(Path, "is_file", side_effect=PermissionError("unreadable metadata")):
+                references = StatusReferences(layout, projects, "linux")
+            self.assertIsNotNone(references.find_unsafe(str(projects / "status/data")))
+
     def test_guard_matches_raw_and_json_escaped_network_share_paths(self):
         engine = Engine.__new__(Engine)
         engine.layout = Layout(Path("/kit"))
@@ -36,7 +106,7 @@ class DirectoryPreservationTests(unittest.TestCase):
             (projects / "status").mkdir(parents=True)
             layout = Layout(root / "kit")
             layout.state.mkdir(parents=True)
-            (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
             module_root = layout.config / "modules/rules"
             module_root.mkdir(parents=True)
             (module_root / "base.md").write_text("Current checkout is clean", encoding="utf-8")
@@ -63,11 +133,11 @@ class DirectoryPreservationTests(unittest.TestCase):
             (projects / "status").mkdir(parents=True)
             layout = Layout(root / "kit")
             layout.state.mkdir(parents=True)
-            (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
             engine = Engine.__new__(Engine)
             engine.layout = layout
             engine.machine = SimpleNamespace(projects=projects, os="linux")
-            for suffix, blocked in (("]", True), (">", True), ("", True), ("/data", True), ("-other/data", False), ("_extra/data", False)):
+            for suffix, blocked in (("]", True), (">", True), ("", True), ("/data", True), ("-other/data", False), ("_extra/data", False), (".backup/data", False), (".", True), (". ", True)):
                 with self.subTest(suffix=suffix):
                     plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "_status") + suffix)])
                     engine._preserve_migrated_references(plan)
@@ -80,7 +150,7 @@ class DirectoryPreservationTests(unittest.TestCase):
             (projects / "status").mkdir(parents=True)
             layout = Layout(root / "kit")
             layout.state.mkdir(parents=True)
-            (layout.state / "status-directory-migration.json").write_text('{}', encoding="utf-8")
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
             engine = Engine.__new__(Engine)
             engine.layout = layout
             engine.machine = SimpleNamespace(projects=projects, os="windows")
@@ -117,7 +187,7 @@ class DirectoryPreservationTests(unittest.TestCase):
                 installed = home / ".codex/AGENTS.md"
                 original = installed.read_bytes()
                 receipt = layout.state / "status-directory-migration.json"
-                receipt.write_text(json.dumps({"version": 2, "state": "complete", "posix_move": {"phase": "complete"}}), encoding="utf-8")
+                receipt.write_text(json.dumps({"version": 2, "state": "complete", "posix_move": {"phase": "complete", "canonical": str(active), "data_location": str(active)}}), encoding="utf-8")
                 source.write_text('Read {{kit.projects}}/_status/commitments.md.\n', encoding="utf-8")
                 blocked = Engine(layout)
                 errors = blocked.run(network=False).errors
