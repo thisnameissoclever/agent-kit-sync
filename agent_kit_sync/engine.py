@@ -183,6 +183,7 @@ class Engine:
         self.install(modules, incoming=False)
         if network and gitops.has_remote(self.checkout):
             self.merge_remote()
+            self.machine.policy = load_machine(self.layout).policy
             # A config repo another machine broke stops the run here; this machine keeps what it has installed.
             modules = self._load_or_alert()
             if modules is None:
@@ -1336,6 +1337,7 @@ class Engine:
         if held is None or held.get("kind") in ("new-item", "incoming"):
             if held is not None:
                 self.held.remove(held["id"])
+                self.report.held = [identifier for identifier in self.report.held if identifier != held["id"]]
             self.alerts.close(key)
 
     def _disabled_incoming(self, item_key: str) -> bool:

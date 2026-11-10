@@ -41,10 +41,12 @@ class SkillPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, as_home(Path(folder)):
             engine, module = self.make_engine(Path(folder), "apply")
             held = engine.held.add("incoming:work/review", "new-item", "Old request", ["apply", "decline"], item_key="work/review")
+            engine.report.held.append(held["id"])
             engine.alerts.raise_("incoming:work/review", "Old request", "agent-kit-sync held")
             saved = engine.held.add("held:work/review", "edit", "Saved local edit", ["retry"], {"edit": b"keep this"}, item_key="work/review")
             self.assertIn("work/review", self.effective(engine, module))
             self.assertIsNone(engine.held.find(held["id"]))
+            self.assertNotIn(held["id"], engine.report.held)
             self.assertEqual(engine.held.blob(saved, "edit"), b"keep this")
             self.assertNotIn("incoming:work/review", [a["key"] for a in engine.alerts.open()])
             self.assertTrue(any(h["item_key"] == "work/guard" for h in engine.held.all()))
@@ -74,6 +76,22 @@ class SkillPolicyTests(unittest.TestCase):
 
 
 class AutomaticSkillSyncTests(TwoMachines):
+    def test_fetched_repository_policy_applies_in_the_same_sync_pass(self):
+        self.seed_files({
+            "kit.toml": 'format = 2\n[[modules]]\nname = "work"\n',
+            "modules/work/module.toml": '[[skills]]\nname = "review"\ndir = "skills/review"\n',
+            "modules/work/skills/review/SKILL.md": '---\nname: review\ndescription: Review code\n---\nShared procedure.\n',
+        })
+        machine = self.machine("a", policy={"new_items": "ask", "other_changes": "ask", "code_changes": "ask", "outgoing": "push"})
+        engine, _report = machine.sync()
+        self.assertTrue(any(h.get("item_key") == "work/review" for h in engine.held.all()))
+        self.seed_files({"kit.toml": 'format = 2\n[defaults]\nskills = "apply"\n[[modules]]\nname = "work"\n'}, "Enable automatic skill sync")
+        engine, report = machine.sync()
+        self.assertEqual(report.errors, [])
+        self.assertIn("Shared procedure", machine.read(".agents", "skills", "review", "SKILL.md"))
+        self.assertFalse(any(h.get("item_key") == "work/review" for h in engine.held.all()))
+        self.assertEqual(report.held, [])
+
     def test_new_and_updated_skills_install_without_individual_requests(self):
         self.seed_files({
             "kit.toml": 'format = 2\n[defaults]\nskills = "apply"\n[[modules]]\nname = "work"\n',
