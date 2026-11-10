@@ -18,6 +18,17 @@ from agent_kit_sync.plan import Plan
 
 
 class DirectoryPreservationTests(unittest.TestCase):
+    def test_guard_matches_raw_and_json_escaped_network_share_paths(self):
+        engine = Engine.__new__(Engine)
+        engine.layout = Layout(Path("/kit"))
+        engine.machine = SimpleNamespace(projects=Path("//server/share/Projects"), os="windows")
+        target = str(engine.machine.projects / "_status/data").replace("/", "\\")
+        for text in (target, json.dumps(target)):
+            plan = Plan(cursor_blocks=[("rules", "rule", text)])
+            with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "exists", return_value=False):
+                engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+
     def test_guard_reports_cursor_variant_override_and_effective_revision(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()

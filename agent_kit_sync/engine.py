@@ -1535,9 +1535,9 @@ class Engine:
             texts.append((hook.module, json.dumps(hook.args, ensure_ascii=False), origin(hook.module, hook.name, "hooks", "module.toml")))
         affected = {}
         for module, text, details in texts:
-            text = text.replace("\\\\", "\\").replace("\\", "/")
+            text = re.sub(r"[/\\]+", "/", text)
             for path in missing:
-                pattern = re.escape(str(path).replace("\\", "/")) + r"(?=$|[^\w-])"
+                pattern = re.escape(re.sub(r"[/\\]+", "/", str(path))) + r"(?=$|[^\w-])"
                 if re.search(pattern, text, re.I if self.machine.os == "windows" else 0):
                     affected.setdefault(module, (details, path))
                     break
