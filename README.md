@@ -250,6 +250,7 @@ When another program changes a synced setting, agent-kit-sync holds the change a
 
 | Setting | Values | Recommended |
 |---|---|---|
+| `skills` | `apply` or `ask`; omit to use the other policy rows | Set `apply` to sync new and changed skills automatically |
 | `new_items` | `apply` or `ask` | `ask` |
 | `code_changes` | `apply` or `ask` | `ask` |
 | `other_changes` | `apply` or `ask` | `apply` |
@@ -258,6 +259,8 @@ When another program changes a synced setting, agent-kit-sync holds the change a
 | `approval` | `agent` or `terminal` | `agent` |
 
 Code means anything that can run or change what agents may do without asking: hooks, scripts, non-Markdown files in skills, tests, hooks inside subagent definitions, and settings under `hooks`, `permissions`, `env`, and keys agent-kit-sync does not recognize. With the recommended values, text spreads by itself, and code moves between machines only after you approve it where it was written and where it arrives. With `approval = "terminal"`, approving a held change needs `yes` typed in an interactive terminal outside an agent session. An agent that can run commands in a terminal of its own could still type it, so treat this setting as a guard against mistakes, not against a determined agent.
+
+Set `skills = "apply"` under `[defaults]` in the shared `kit.toml` to sync skill additions and updates across machines without individual approval requests. A machine can override that choice with `skills = "ask"` under its own `[policy]`. This policy applies only to skills; hooks and settings keep their existing approval rules. Existing checks, pins, disabled items, and local-edit protection still apply. Obsolete incoming skill-approval requests close automatically when the skill is accepted by policy.
 
 The machine file also sets this machine's projects folder and worktrees folder. When it sets no projects folder, agent-kit-sync uses a folder in the home folder named by `defaults.projects_folder_name` in `kit.toml`, or `Projects` when that is not set. When it sets no worktrees folder, agent-kit-sync uses a folder inside the projects folder named by `defaults.worktrees_folder_name`, or `_worktrees` when that is not set (`.worktrees` on Windows). `agent-kit-sync doctor` shows each folder it uses this way.
 
