@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -1490,6 +1491,30 @@ class Engine:
 
     # ------------------------------------------------------------ installing
 
+    def _preserve_migrated_references(self, plan: Plan) -> None:
+        projects = self.machine.projects
+        receipt = self.layout.state / "status-directory-migration.json"
+        if projects is None or not receipt.is_file() or not (projects / "status").is_dir():
+            return
+        names = {projects.name + "_status", projects.name.lower() + "_status", projects.name.upper() + "_status"}
+        roots = [projects / "_status"] + [parent / name for parent in (projects, projects.parent) for name in names]
+        missing = [path for path in roots if not path.exists()]
+        texts = [(copy.module, copy.data.decode("utf-8", "replace")) for copy in plan.copies]
+        texts += [(block.module, block.content) for block in plan.sections]
+        texts += [(module, text) for module, _item, text in plan.cursor_blocks]
+        texts += [(write.item_key.split("/", 1)[0], json.dumps(write.value)) for write in plan.settings]
+        affected = set()
+        for module, text in texts:
+            text = text.replace("\\\\", "\\").replace("\\", "/")
+            for path in missing:
+                pattern = re.escape(str(path).replace("\\", "/")) + r"(?=$|[/\s`\"'.,;:)])"
+                if re.search(pattern, text, re.I if self.machine.os == "windows" else 0):
+                    affected.add(module)
+                    break
+        for module in sorted(affected):
+            plan.drop_module(module)
+            plan.errors.append(f"module {module}: a source reference uses a missing historical status directory. Update its source path to {projects / 'status'}; existing installed configuration is preserved.")
+
     def install(self, modules: List[Module], incoming: bool) -> None:
         effective, trees = self._effective_modules(modules, incoming)
 
@@ -1497,13 +1522,15 @@ class Engine:
             return trees.get(item.key) or Tree(module.root)
 
         plan = Planner(self.layout, self.machine, effective, tree_for).build()
+        self._preserve_migrated_references(plan)
         for name in self.held_back:
             if name not in plan.failed:
                 # Keep everything this machine installed for the module, exactly as a module that cannot be planned keeps it.
                 plan.drop_module(name)
         self.failed_modules = set(plan.failed)
         for error in plan.errors:
-            self.report.errors.append(error)
+            if error not in self.report.errors:
+                self.report.errors.append(error)
         for name in plan.failed:
             if name in self.held_back:
                 continue  # Its tests alert says why.
