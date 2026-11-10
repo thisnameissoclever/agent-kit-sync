@@ -25,6 +25,7 @@ POLICY_DEFAULTS = {
     "approval": "agent",
 }
 POLICY_VALUES = {
+    "skills": ("apply", "ask"),
     "new_items": ("apply", "ask"),
     "code_changes": ("apply", "ask"),
     "other_changes": ("apply", "ask"),
@@ -282,6 +283,11 @@ def load_machine(layout: Layout) -> Machine:
     except toml.TOMLDecodeError as error:
         raise ConfigError(f"{path}: {error}") from None
     policy = dict(POLICY_DEFAULTS)
+    repository_skills = kit_defaults(layout).get("skills")
+    if repository_skills is not None:
+        if repository_skills not in POLICY_VALUES["skills"]:
+            raise ConfigError(f"{layout.config / 'kit.toml'}: defaults.skills must be apply or ask")
+        policy["skills"] = repository_skills
     policy.update(data.get("policy", {}))
     for key, value in policy.items():
         if key in POLICY_VALUES and value not in POLICY_VALUES[key]:

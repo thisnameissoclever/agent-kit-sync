@@ -1245,9 +1245,11 @@ class Engine:
                     kept.append(item)  # This machine's own edit, carried back or approved in this run.
                     continue
                 approved = self.index.approvals.get(item.key) == fingerprint
+                skill_policy = self.machine.policy.get("skills") if item.kind == "skill" else None
                 if info is None or "fp" not in info:
-                    if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new or approved:
+                    if (skill_policy or self.machine.policy["new_items"]) == "apply" or item.key in self.approve_new or approved:
                         kept.append(item)
+                        self._clear_incoming_approval(item.key)
                         if self._needs_incoming_tests(module, item, tree):
                             pending.append((module, item, None))
                         continue
@@ -1255,14 +1257,16 @@ class Engine:
                     continue
                 if info["fp"] == fingerprint:
                     kept.append(item)
+                    self._clear_incoming_approval(item.key)
                     if info.get("untested") and self._needs_incoming_tests(module, item, tree):
                         # Never tested here, so no earlier version has run here either: treat it as new.
                         pending.append((module, item, None))
                     continue
                 code = item_is_code(module, item, tree)
-                policy = self.machine.policy["code_changes" if code else "other_changes"]
+                policy = skill_policy or self.machine.policy["code_changes" if code else "other_changes"]
                 if policy == "apply" or approved:
                     kept.append(item)
+                    self._clear_incoming_approval(item.key)
                     if self._needs_incoming_tests(module, item, tree):
                         pending.append((module, item, info["commit"]))
                     continue
@@ -1326,6 +1330,14 @@ class Engine:
                 pending.append((module, item, info.get("commit")))
                 queued.add(item.key)
                 self._retest.add(item.key)
+
+    def _clear_incoming_approval(self, item_key: str) -> None:
+        key = f"incoming:{item_key}"
+        held = self.held.by_key(key)
+        if held is None or held.get("kind") in ("new-item", "incoming"):
+            if held is not None:
+                self.held.remove(held["id"])
+            self.alerts.close(key)
 
     def _disabled_incoming(self, item_key: str) -> bool:
         module_name = item_key.split("/", 1)[0]
