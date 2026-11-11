@@ -1,390 +1,327 @@
-"""Small filesystem fixtures for data-preserving status-directory migration."""
+"""Sync must preserve existing project directories and their path references."""
 
+import contextlib
+import io
 import json
-import os
 import tempfile
 import sys
-import io
-import contextlib
-import stat
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 from support import ROOT, as_home
-from agent_kit_sync import cli, model, render, status_directory as migration, toml
+from agent_kit_sync import cli, render, toml
 from agent_kit_sync.engine import Engine
 from agent_kit_sync.paths import Layout
-from agent_kit_sync.state import run_lock
+from agent_kit_sync.plan import Plan
+from agent_kit_sync.status_references import StatusReferences
 
 
-@unittest.skipUnless(os.name == "nt", "Windows copy-and-retain backend")
-class StatusDirectoryTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="aks-status-")
-        self.root = Path(self.temp.name)
-        self.projects = self.root / "Projects"
-        self.projects.mkdir()
-        self.layout = Layout(self.root / "kit")
-        self.old = self.projects / "_status"
-        self.canonical = self.projects / "status"
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def write(self, path, data=b"original"):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-    def prepare(self, **kwargs):
-        return migration.migrate_status(self.layout, self.projects, required=True, **kwargs)
-
-    def finish(self, prepared, **kwargs):
-        return self.prepare(finalize=True, plan_id=prepared["plan_id"], **kwargs)
-
-    def test_prepare_preserves_sources_then_finalize_retains_whole_tree(self):
-        self.write(self.old / "state/commitments.md")
-        (self.old / "empty").mkdir()
-        prepared = self.prepare()
-        self.assertEqual(prepared["state"], "prepared")
-        self.assertEqual((self.canonical / "state/commitments.md").read_bytes(), b"original")
-        self.assertTrue(self.old.exists())
-        result = self.finish(prepared)
-        self.assertEqual(result["state"], "complete")
-        self.assertFalse(self.old.exists())
-        retained = Path(result["retired"][0]["retained"])
-        self.assertEqual((retained / "state/commitments.md").read_bytes(), b"original")
-        self.assertTrue((retained / "empty").is_dir())
-        self.assertEqual(retained.parent, self.old.parent)
-        self.assertEqual(self.prepare()["state"], "complete")
-
-    def test_all_aliases_preflight_before_any_copy_or_retirement(self):
-        self.write(self.old / "exclusions.md", b"first")
-        sibling = self.projects.parent / (self.projects.name + "_status")
-        self.write(sibling / "exclusions.md", b"second")
-        result = self.prepare()
-        self.assertEqual(result["state"], "pending")
-        self.assertFalse(self.canonical.exists())
-        self.assertEqual((self.old / "exclusions.md").read_bytes(), b"first")
-        self.assertEqual((sibling / "exclusions.md").read_bytes(), b"second")
-
-    def test_existing_canonical_data_is_never_overwritten(self):
-        self.write(self.old / "exclusions.md", b"legacy")
-        self.write(self.canonical / "exclusions.md", b"canonical")
-        self.assertEqual(self.prepare()["state"], "pending")
-        self.assertEqual((self.old / "exclusions.md").read_bytes(), b"legacy")
-        self.assertEqual((self.canonical / "exclusions.md").read_bytes(), b"canonical")
-
-    def test_duplicate_files_from_multiple_aliases_are_preserved(self):
-        self.write(self.old / "notes.md")
-        sibling = self.projects.parent / (self.projects.name + "_status")
-        self.write(sibling / "notes.md")
-        result = self.finish(self.prepare())
-        self.assertEqual(result["state"], "complete")
-        self.assertEqual(len(result["retired"]), 2)
-        self.assertTrue(all((Path(e["retained"]) / "notes.md").read_bytes() == b"original" for e in result["retired"]))
-
-    def test_installed_legacy_reference_blocks_retirement(self):
-        self.write(self.old / "notes.md")
-        prepared = self.prepare()
-        installed = self.root / "AGENTS.md"
-        installed.write_text("Read " + str(self.old / "notes.md"), encoding="utf-8")
-        self.assertEqual(self.finish(prepared, active_paths=[installed])["state"], "pending")
-        self.assertTrue(self.old.exists())
-
-    def test_reference_scan_covers_utf16_json_and_markdown_paths(self):
-        path = self.root / "settings.json"
-        source = Path(r"\\server\share\Projects\_status")
-        for text in (json.dumps({"path": str(source)}), "[old path](" + str(source) + ")"):
-            path.write_bytes(text.encode("utf-16"))
-            with self.assertRaises(migration.PendingMigration):
-                migration._old_references([path], [source])
-
-    def test_completed_rename_is_recovered_after_interrupted_receipt_update(self):
-        self.write(self.old / "notes.md")
-        prepared = self.prepare()
-        original = Path.rename
-        def interrupted(path, target):
-            original(path, target)
-            raise SystemExit("simulated interruption")
-        with mock.patch.object(Path, "rename", interrupted), self.assertRaises(SystemExit):
-            self.finish(prepared)
-        recovered = self.prepare()
-        self.assertEqual(recovered["state"], "complete")
-        self.assertEqual(recovered["retired"][0]["phase"], "retained")
-        self.assertEqual((Path(recovered["retired"][0]["retained"]) / "notes.md").read_bytes(), b"original")
-
-    def test_source_edit_after_prepare_keeps_both_versions(self):
-        self.write(self.old / "notes.md")
-        prepared = self.prepare()
-        self.write(self.old / "notes.md", b"latest")
-        self.assertEqual(self.finish(prepared)["state"], "pending")
-        self.assertEqual((self.old / "notes.md").read_bytes(), b"latest")
-        self.assertEqual((self.canonical / "notes.md").read_bytes(), b"original")
-
-    def test_late_write_at_rename_is_retained_and_reported(self):
-        self.write(self.old / "notes.md")
-        prepared = self.prepare()
-        original = Path.rename
-        def concurrent_rename(path, target):
-            result = original(path, target)
-            (target / "notes.md").write_bytes(b"late writer")
-            return result
-        with mock.patch.object(Path, "rename", concurrent_rename):
-            result = self.finish(prepared)
-        self.assertEqual(result["state"], "pending")
-        self.assertEqual((Path(result["retired"][0]["retained"]) / "notes.md").read_bytes(), b"late writer")
-        self.assertEqual((self.canonical / "notes.md").read_bytes(), b"original")
-        self.assertEqual(self.prepare()["state"], "pending")
-
-    def test_failed_rename_is_retryable_without_losing_data(self):
-        self.write(self.old / "notes.md")
-        prepared = self.prepare()
-        with mock.patch.object(Path, "rename", side_effect=PermissionError("writer holds directory")):
-            self.assertEqual(self.finish(prepared)["state"], "pending")
-        retry = self.prepare()
-        self.assertEqual(self.finish(retry)["state"], "complete")
-
-    def test_explicit_old_location_is_local_and_supported(self):
-        old_location = self.root / "other-volume/Previous_status"
-        self.write(old_location / "notes.md")
-        prepared = self.prepare(explicit_sources=[old_location])
-        result = self.finish(prepared)
-        self.assertEqual(result["state"], "complete")
-        self.assertEqual(result["explicit_sources"], [str(old_location)])
-        self.assertFalse(old_location.exists())
-
-    @unittest.skipUnless(os.environ.get("AKS_STATUS_TEST_VOLUME"), "requires an explicitly authorized second-volume test root")
-    def test_native_cross_volume_copy_and_same_volume_retention(self):
-        base = Path(os.environ["AKS_STATUS_TEST_VOLUME"]).resolve()
-        self.assertTrue(base.is_absolute() and base.is_dir())
-        with tempfile.TemporaryDirectory(prefix=".agent-kit-sync-status-test-", dir=base) as folder:
-            owned = Path(folder)
-            self.assertEqual(owned.resolve().parent, base)
-            projects = owned / "Projects"
-            projects.mkdir()
-            if projects.stat().st_dev == self.root.stat().st_dev:
-                self.skipTest("the selected root is not a different filesystem device")
-            old_location = self.root / "previous/Old_status"
-            self.write(old_location / "notes.md", b"cross-volume fixture")
-            prepared = migration.migrate_status(self.layout, projects, required=True, explicit_sources=[old_location])
-            self.assertEqual(prepared["state"], "prepared")
-            result = migration.migrate_status(self.layout, projects, required=True, finalize=True, plan_id=prepared["plan_id"])
-            self.assertEqual(result["state"], "complete")
-            self.assertEqual((projects / "status/notes.md").read_bytes(), b"cross-volume fixture")
-            retained = Path(result["retired"][0]["retained"])
-            self.assertEqual(retained.parent, old_location.parent)
-            self.assertEqual((retained / "notes.md").read_bytes(), b"cross-volume fixture")
-
-    def test_missing_explicit_location_is_not_reported_complete(self):
-        result = self.prepare(explicit_sources=[self.root / "unmounted/Old_status"])
-        self.assertEqual(result["state"], "pending")
-        self.assertFalse(self.canonical.exists())
-
-    def test_overlapping_source_and_canonical_are_rejected(self):
-        self.write(self.canonical / "notes.md")
-        result = self.prepare(explicit_sources=[self.canonical])
-        self.assertEqual(result["state"], "pending")
-        self.assertEqual((self.canonical / "notes.md").read_bytes(), b"original")
-
-    def test_corrupt_receipt_is_preserved_before_any_data_change(self):
-        self.write(self.old / "notes.md")
-        receipt = self.layout.state / "status-directory-migration.json"
-        self.write(receipt, b"{broken")
-        self.assertEqual(self.prepare()["state"], "pending")
-        self.assertEqual(receipt.read_bytes(), b"{broken")
-        self.assertTrue(self.old.exists())
-        self.assertFalse(self.canonical.exists())
-
-    def test_cli_receipt_is_read_only_through_the_bounded_loader(self):
-        self.write(self.old / "notes.md")
-        receipt = self.layout.state / "status-directory-migration.json"
-        self.write(receipt, b" " * 17)
-        machine = SimpleNamespace(projects=self.projects, app_homes={})
-        for args in (["migrate-status"], ["migrate-status", "--finalize"]):
-            output = io.StringIO()
-            with mock.patch.object(cli, "layout_from_env", return_value=self.layout), mock.patch.object(model, "load_machine", return_value=machine), mock.patch.object(migration, "MAX_RECEIPT_BYTES", 16), mock.patch.object(Path, "read_text", side_effect=AssertionError("Unbounded receipt reader")), contextlib.redirect_stdout(output):
-                self.assertEqual(cli.main(args), 1)
-            self.assertEqual(json.loads(output.getvalue())["state"], "pending")
-        self.assertEqual(receipt.read_bytes(), b" " * 17)
-        self.assertTrue(self.old.exists())
-
-    def test_deeply_nested_malformed_receipt_is_pending(self):
-        receipt = self.layout.state / "status-directory-migration.json"
-        raw = b"[" * 1100 + b"0" + b"]" * 1100
-        self.write(receipt, raw)
-        self.assertEqual(self.prepare()["state"], "pending")
-        self.assertEqual(receipt.read_bytes(), raw)
-
-    def test_lock_loser_does_not_write_the_receipt(self):
-        self.write(self.old / "notes.md")
-        self.prepare()
-        receipt = self.layout.state / "status-directory-migration.json"
-        before = receipt.read_bytes()
-        with run_lock(Layout(self.layout.state / "status-directory-migration")):
-            self.assertEqual(self.prepare()["state"], "pending")
-        self.assertEqual(receipt.read_bytes(), before)
-
-    def test_resource_bound_does_not_retire_sources(self):
-        self.write(self.old / "notes.md")
-        with mock.patch.object(migration, "MAX_FILE_BYTES", 1):
-            self.assertEqual(self.prepare()["state"], "pending")
-        self.assertTrue(self.old.exists())
-        self.assertFalse(self.canonical.exists())
-
-    def test_read_only_file_permission_is_preserved(self):
-        self.write(self.old / "notes.md")
-        (self.old / "notes.md").chmod(0o400)
-        prepared = self.prepare()
-        self.assertEqual(prepared["state"], "prepared")
-        self.assertFalse((self.canonical / "notes.md").stat().st_mode & stat.S_IWRITE)
-        self.assertEqual(self.finish(prepared)["state"], "complete")
-
-    def test_repository_and_links_are_not_followed(self):
-        self.write(self.old / ".git/config")
-        self.assertEqual(self.prepare()["state"], "pending")
-        self.assertTrue((self.old / ".git/config").exists())
-
-
-class StatusRenderingTests(unittest.TestCase):
-    def values(self, projects, enabled):
-        system = "windows" if ":" in projects or projects.startswith("\\\\") else "linux"
-        return render.Values(home="/h", projects=projects, worktrees="/w", module="/m", app="codex", os=system, cli="aks", hooks={}, canonical_status=enabled)
-
-    def test_opt_in_corrects_old_and_concatenated_templates(self):
-        for root in ("/mnt/projects", "D:\\Projects", "/Volumes/Data/Projects"):
-            for source in ("{{kit.projects}}/_status/state/commitments.md", "{{kit.projects}}_status/exclusions.md"):
-                text = render.render_text(source, self.values(root, True)).text
-                self.assertIn(root + "/status/", text)
-                self.assertNotIn("_status", text)
-            text = render.render_text("{{kit.projects}}/projects_status/exclusions.md", self.values(root, True)).text
-            self.assertEqual(text, root + "/status/exclusions.md")
-
-    def test_unrelated_users_and_literal_examples_are_unchanged(self):
-        source = "{{kit.projects}}/_status/notes.md"
-        self.assertIn("/_status/", render.render_text(source, self.values("/p", False)).text)
-        self.assertEqual(render.render_text("{{kit.literal projects}}/_status", self.values("/p", True)).text, "{{kit.projects}}/_status")
-
-    def test_carry_back_preserves_unedited_original_source(self):
-        source = "Read {{kit.projects}}/_status/notes.md.\nSecond line.\n"
-        values = self.values("/p", True)
-        shown = render.render_text(source, values).text
-        updated = render.carry_back_text(source, shown, shown.replace("Second", "Changed"), values)
-        self.assertIn("{{kit.projects}}/_status/notes.md", updated)
-        self.assertIn("Changed line", updated)
-
-
-class FormatGateTests(unittest.TestCase):
-    def test_future_schema_does_not_start_migration(self):
+class DirectoryPreservationTests(unittest.TestCase):
+    def test_recorded_source_paths_match_lexically_normalized_references(self):
         with tempfile.TemporaryDirectory() as folder:
-            layout = Layout(Path(folder))
-            layout.config.mkdir(parents=True)
-            (layout.config / "kit.toml").write_bytes(b'format = 3\n[migrations]\nproject_status_directory = 1\n')
-            self.assertFalse(migration.migration_enabled(layout))
-            with self.assertRaisesRegex(model.ConfigError, "must update first"):
-                model.load_inventory(layout.config)
+            root = Path(folder).resolve()
+            (root / "OtherVolume/marker").mkdir(parents=True)
+            source = root / "OtherVolume/Old_status"
+            recorded = root / "OtherVolume/marker/../Old_status"
+            engine, projects, layout = self.reference_fixture(root, {"version": 2, "state": "complete", "staged": {}, "retired": [], "explicit_sources": [str(recorded)]})
+            plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
 
-    def test_older_client_gate_requires_update_before_loading_modules(self):
+    def test_recorded_source_count_is_bounded_before_pattern_compilation(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            (root / "kit.toml").write_bytes(b'format = 2\n[migrations]\nproject_status_directory = 1\n')
-            with mock.patch.object(model, "FORMAT", 1), self.assertRaisesRegex(model.ConfigError, "must update first"):
-                model.load_inventory(root)
-            self.assertEqual(model.load_inventory(root).format, 2)
+            root = Path(folder).resolve()
+            sources = [str(root / name) for name in ("one", "two", "three")]
+            engine, projects, layout = self.reference_fixture(root, {"version": 2, "state": "complete", "staged": {}, "retired": [], "explicit_sources": sources})
+            with mock.patch("agent_kit_sync.status_references.MAX_SOURCE_PATHS", 2), self.assertRaisesRegex(RuntimeError, "distinct source paths"):
+                StatusReferences(layout, projects, "linux")
 
-    def test_migration_requires_gate_but_plain_format_one_stays_supported(self):
+    def test_recorded_explicit_and_retired_sources_are_checked_outside_projects(self):
+        for field in ("explicit_sources", "retired", "staged"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder).resolve()
+                source = root / "OtherVolume/Old_status"
+                record = {"version": 2, "state": "complete", "staged": {}, "retired": []}
+                if field == "explicit_sources":
+                    record[field] = [str(source)]
+                elif field == "retired":
+                    record[field] = [{"source": str(source), "phase": "retained"}]
+                else:
+                    record[field] = {str(source): {}}
+                    record["state"] = "pending"
+                engine, projects, layout = self.reference_fixture(root, record)
+                receipt = layout.state / "status-directory-migration.json"
+                before = receipt.read_bytes()
+                plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(plan.failed, ["rules"])
+                source.mkdir(parents=True)
+                plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(plan.failed, [])
+                self.assertEqual(receipt.read_bytes(), before)
+
+    def test_copied_json_paths_decode_unicode_without_matching_similar_names(self):
+        for name in ("José", "é", "🐱"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:
+                engine, projects, layout = self.reference_fixture(Path(folder).resolve() / name, {"version": 2, "state": "complete", "staged": {}, "retired": []})
+                for suffix, blocked in (("_status/data", True), ("_status.backup/data", False)):
+                    value = str(projects / suffix).replace("/", "\\")
+                    packets = [("config.json", json.dumps({"path": value})), ("config.toml", toml.dumps({"path": value}))]
+                    packets.append(("nested.json", json.dumps({"paths": [{"path": value}]})))
+                    packets.append(("keys.json", json.dumps({value: "entry"})))
+                    multiline = value.replace("\\", "\\\\")
+                    for char in name:
+                        if ord(char) > 127:
+                            escaped = "\\u%04x" % ord(char) if ord(char) <= 0xffff else "\\U%08x" % ord(char)
+                            multiline = multiline.replace(char, escaped)
+                    packets.append(("multiline.toml", 'path = """\n' + multiline + '"""\n'))
+                    if name == "🐱":
+                        packets.append(("unicode.toml", "path = " + json.dumps(value, ensure_ascii=False).replace("🐱", "\\U0001F431")))
+                    for source, content in packets:
+                        copy = SimpleNamespace(module="rules", item="rule", app="kit", kind="file", source_rel=source, data=content.encode())
+                        plan = Plan(copies=[copy])
+                        engine._preserve_migrated_references(plan)
+                        self.assertEqual(bool(plan.failed), blocked)
+                other = str(projects.parent.parent / "u00e9/Projects/_status/data").replace("/", "\\")
+                for data in (other.encode(), json.dumps({"path": other}).encode()):
+                    copy = SimpleNamespace(module="rules", item="rule", app="kit", kind="file", source_rel="config.json", data=data)
+                    plan = Plan(copies=[copy])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(plan.failed, [])
+
+    def reference_fixture(self, root, receipt):
+        projects = root / "Projects"
+        if receipt.get("state") == "complete":
+            receipt.setdefault("canonical", str(projects / "status"))
+        (projects / "status").mkdir(parents=True)
+        layout = Layout(root / "kit")
+        layout.state.mkdir(parents=True)
+        (layout.state / "status-directory-migration.json").write_text(json.dumps(receipt), encoding="utf-8")
+        engine = Engine.__new__(Engine)
+        engine.layout = layout
+        engine.machine = SimpleNamespace(projects=projects, os="linux")
+        return engine, projects, layout
+
+    def test_mixed_case_alias_is_held_only_when_that_exact_directory_is_absent(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            config = root / "kit.toml"
-            config.write_bytes(b'format = 1\n')
-            self.assertEqual(model.load_inventory(root).format, 1)
-            config.write_bytes(b'format = 1\n[migrations]\nproject_status_directory = 1\n')
-            with self.assertRaisesRegex(model.ConfigError, "requires kit.toml format = 2"):
-                model.load_inventory(root)
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "complete", "staged": {}, "retired": []})
+            alias = projects / "pRoJeCtS_status"
+            plan = Plan(cursor_blocks=[("rules", "rule", str(alias / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+            alias.mkdir()
+            plan = Plan(cursor_blocks=[("rules", "rule", str(alias / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, [])
 
-
-class DirectoryPrivacyTests(unittest.TestCase):
-    def info(self, mode, uid=10, gid=20):
-        return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid, st_gid=gid)
-
-    def test_existing_public_destination_cannot_replace_private_directory(self):
-        self.assertFalse(migration._posix_access_at_most(self.info(0o700), self.info(0o755), 10))
-        self.assertTrue(migration._posix_access_at_most(self.info(0o700), self.info(0o700), 10))
-
-    def test_private_ancestor_is_part_of_effective_access(self):
-        sources = [self.info(0o755), self.info(0o700)]
-        self.assertFalse(migration._posix_chain_private(sources, [self.info(0o755)], 10))
-        self.assertTrue(migration._posix_chain_private(sources, [self.info(0o755), self.info(0o700)], 10))
-
-    def test_unrelated_destination_group_cannot_gain_access(self):
-        self.assertFalse(migration._posix_access_at_most(self.info(0o750, gid=20), self.info(0o750, gid=30), 10))
-
-    @unittest.skipUnless(os.name == "nt", "Windows directory access-control contract")
-    def test_windows_directory_acl_difference_requires_reconciliation(self):
+    def test_pending_destination_is_held_but_existing_original_references_are_allowed(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            source, target = root / "source", root / "target"
-            source.mkdir()
-            target.mkdir()
-            with mock.patch.object(migration, "_windows_acl", side_effect=lambda path: b"private" if path == source else b"public"):
-                with self.assertRaises(migration.PendingMigration):
-                    migration._directory_privacy(source, target)
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "pending", "staged": {}, "retired": []})
+            old = projects / "_status"
+            old.mkdir()
+            (old / "data").write_bytes(b"complete original")
+            receipt = layout.state / "status-directory-migration.json"
+            before = receipt.read_bytes()
+            for path, blocked in ((projects / "status/data", True), (old / "data", False)):
+                plan = Plan(cursor_blocks=[("rules", "rule", str(path))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(bool(plan.failed), blocked)
+            (projects / "status").rmdir()
+            plan = Plan(cursor_blocks=[("rules", "rule", str(old / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, [])
+            self.assertEqual(receipt.read_bytes(), before)
+            self.assertEqual((old / "data").read_bytes(), b"complete original")
 
+    def test_invalid_and_oversized_receipts_hold_unverified_canonical_references(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {})
+            receipt = layout.state / "status-directory-migration.json"
+            with mock.patch("agent_kit_sync.status_references.MAX_RECEIPT_BYTES", 64):
+                for payload in (b'{bad json', b'x' * 80, b'{"version":2,"state":"unknown"}'):
+                    receipt.write_bytes(payload)
+                    plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "status/data"))])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(plan.failed, ["rules"])
+                    self.assertEqual(receipt.read_bytes(), payload)
 
-class PosixDispatchTests(unittest.TestCase):
-    def test_owned_prepared_link_is_dispatched_before_generic_link_rejection(self):
+    def test_unreadable_or_contradictory_receipt_keeps_canonical_updates_held(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine, projects, layout = self.reference_fixture(Path(folder).resolve(), {"version": 2, "state": "complete", "canonical": "/different", "staged": {}, "retired": []})
+            plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "status/data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+            with mock.patch.object(Path, "open", side_effect=PermissionError("unreadable")):
+                references = StatusReferences(layout, projects, "linux")
+            self.assertIsNotNone(references.find_unsafe(str(projects / "status/data")))
+            with mock.patch.object(Path, "is_file", side_effect=PermissionError("unreadable metadata")):
+                references = StatusReferences(layout, projects, "linux")
+            self.assertIsNotNone(references.find_unsafe(str(projects / "status/data")))
+
+    def test_guard_matches_raw_and_json_escaped_network_share_paths(self):
+        engine = Engine.__new__(Engine)
+        engine.layout = Layout(Path("/kit"))
+        engine.machine = SimpleNamespace(projects=Path("//server/share/Projects"), os="windows")
+        target = str(engine.machine.projects / "_status/data").replace("/", "\\")
+        for text in (target, json.dumps(target)):
+            plan = Plan(cursor_blocks=[("rules", "rule", text)])
+            receipt = json.dumps({"version": 2, "state": "complete", "canonical": str(engine.machine.projects / "status"), "staged": {}, "retired": []}).encode()
+            with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "exists", return_value=False), mock.patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.BytesIO(receipt)):
+                engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+
+    def test_guard_reports_cursor_variant_override_and_effective_revision(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
             projects = root / "Projects"
-            old = projects / "_status"
-            old.mkdir(parents=True)
-            canonical = projects / "status"
-            try:
-                canonical.symlink_to(old, target_is_directory=True)
-            except OSError as error:
-                self.skipTest(str(error))
+            (projects / "status").mkdir(parents=True)
             layout = Layout(root / "kit")
             layout.state.mkdir(parents=True)
-            (layout.state / "status-directory-migration.json").write_text(json.dumps({"version":2,"staged":{},"retired":[],"explicit_sources":[],"posix_move":{}}),encoding="utf-8")
-            def prepared(record, *args, **kwargs):
-                record.update(state="prepared", pending=[], plan_id="fixture")
-                return record
-            from agent_kit_sync import status_posix
-            with mock.patch.object(migration, "NATIVE_WINDOWS_COPY", False), mock.patch.object(status_posix, "run", side_effect=prepared) as run, mock.patch.object(migration, "_exclusive_copy", side_effect=AssertionError("POSIX byte copying")):
-                result = migration.migrate_status(layout, projects, required=True)
-            self.assertEqual(result["state"], "prepared")
-            run.assert_called_once()
-            self.assertTrue((old / "state").is_dir())
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
+            module_root = layout.config / "modules/rules"
+            module_root.mkdir(parents=True)
+            (module_root / "base.md").write_text("Current checkout is clean", encoding="utf-8")
+            item = SimpleNamespace(name="rule", data={"file": "base.md", "variants": {"cursor": "cursor.md"}})
+            module = SimpleNamespace(name="rules", root=module_root, items=[item])
+            for kind in ("replace", "prepend", "append"):
+                engine = Engine.__new__(Engine)
+                engine.layout = layout
+                engine.machine = SimpleNamespace(projects=projects, os="linux", overrides={"rules/rule": {"kind": kind, "file": "overrides/local.md"}})
+                plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "_status" / "data"))])
+                engine._preserve_migrated_references(plan, [module], {"rules/rule": SimpleNamespace(commit="older-revision")})
+                self.assertEqual(plan.failed, ["rules"])
+                message = plan.errors[0]
+                self.assertIn(str(module_root / "cursor.md"), message)
+                self.assertNotIn(str(module_root / "base.md"), message)
+                self.assertIn(str(layout.root / "overrides/local.md"), message)
+                self.assertIn("older-revision", message)
+                self.assertIn("Resolve the held decision or pin", message)
 
+    def test_guard_accepts_markdown_delimiters_and_ignores_similar_names(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            projects = root / "Projects"
+            (projects / "status").mkdir(parents=True)
+            layout = Layout(root / "kit")
+            layout.state.mkdir(parents=True)
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
+            engine = Engine.__new__(Engine)
+            engine.layout = layout
+            engine.machine = SimpleNamespace(projects=projects, os="linux")
+            for suffix, blocked in (("]", True), (">", True), ("", True), ("/data", True), ("-other/data", False), ("_extra/data", False), (".backup/data", False), (".", True), (". ", True)):
+                with self.subTest(suffix=suffix):
+                    plan = Plan(cursor_blocks=[("rules", "rule", str(projects / "_status") + suffix)])
+                    engine._preserve_migrated_references(plan)
+                    self.assertEqual(bool(plan.failed), blocked)
 
-class EngineStatusMigrationTests(unittest.TestCase):
-    def test_install_switches_references_before_whole_directory_retirement(self):
-        with tempfile.TemporaryDirectory(prefix="aks-status-engine-") as folder:
+    def test_migrated_reference_guard_covers_copies_cursor_and_escaped_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            projects = root / "Prójècts"
+            (projects / "status").mkdir(parents=True)
+            layout = Layout(root / "kit")
+            layout.state.mkdir(parents=True)
+            (layout.state / "status-directory-migration.json").write_text(json.dumps({'version': 2, 'state': 'complete', 'staged': {}, 'retired': [], 'canonical': str(projects / 'status')}), encoding="utf-8")
+            engine = Engine.__new__(Engine)
+            engine.layout = layout
+            engine.machine = SimpleNamespace(projects=projects, os="windows")
+            target = str(projects / "_status" / "data").replace("/", "\\")
+            plans = [Plan(copies=[SimpleNamespace(module="rules", item="rule", app="kit", kind="file", data=target.encode(), source_rel="rule.md")]),
+                     Plan(cursor_blocks=[("rules", "rule", target)]),
+                     Plan(settings=[SimpleNamespace(item_key="rules/path", app="codex", value=target)]),
+                     Plan(hooks=[SimpleNamespace(module="rules", name="guard", args=[target])])]
+            for plan in plans:
+                with self.subTest(plan=plan):
+                    engine._preserve_migrated_references(plan)
+                    self.assertIn("rules", plan.failed)
+                    self.assertTrue(plan.errors)
+
+    def test_previously_migrated_machine_keeps_working_references_until_source_is_corrected(self):
+        with tempfile.TemporaryDirectory(prefix="aks-migrated-") as folder:
+            home = Path(folder).resolve()
+            projects = home / "Projects"
+            active = projects / "status"
+            active.mkdir(parents=True)
+            (active / "commitments.md").write_bytes(b"existing data")
+            layout = Layout(home / "kit")
+            module = layout.config / "modules/rules"
+            module.mkdir(parents=True)
+            (home / ".codex").mkdir()
+            layout.machine_file.write_text(toml.dumps({"name": "fixture", "apps": ["codex"], "projects": str(projects), "python": sys.executable}), encoding="utf-8")
+            (layout.config / "kit.toml").write_text('format = 2\n[[modules]]\nname = "rules"\n', encoding="utf-8")
+            (module / "module.toml").write_text('[[sections]]\nname = "rule"\nfile = "rule.md"\n', encoding="utf-8")
+            source = module / "rule.md"
+            source.write_text('Read {{kit.projects}}/status/commitments.md.\n', encoding="utf-8")
+            with as_home(home), mock.patch.object(Engine, "commit_local"):
+                first = Engine(layout)
+                self.assertEqual(first.run(network=False).errors, [])
+                installed = home / ".codex/AGENTS.md"
+                original = installed.read_bytes()
+                receipt = layout.state / "status-directory-migration.json"
+                receipt.write_text(json.dumps({"version": 2, "state": "complete", "posix_move": {"phase": "complete", "canonical": str(active), "data_location": str(active)}}), encoding="utf-8")
+                source.write_text('Read {{kit.projects}}/_status/commitments.md.\n', encoding="utf-8")
+                blocked = Engine(layout)
+                errors = blocked.run(network=False).errors
+                self.assertTrue(errors)
+                self.assertIn(str(source), errors[0])
+                self.assertIn(str(projects / "_status"), errors[0])
+                self.assertEqual(installed.read_bytes(), original)
+                self.assertFalse((projects / "_status").exists())
+                source.write_text('Read {{kit.projects}}/status/commitments.md.\n', encoding="utf-8")
+                recovered = Engine(layout)
+                self.assertEqual(recovered.run(network=False).errors, [])
+                self.assertNotIn("module:rules", [a["key"] for a in recovered.alerts.open()])
+            self.assertEqual((active / "commitments.md").read_bytes(), b"existing data")
+
+    def test_sync_ignores_old_migration_flag_and_preserves_existing_data(self):
+        with tempfile.TemporaryDirectory(prefix="aks-preserve-") as folder:
             home = Path(folder).resolve()
             projects = home / "Projects"
             old = projects / "_status"
             old.mkdir(parents=True)
-            (old / "exclusions.md").write_bytes(b"private local policy")
-            layout = Layout(home / ".agent-kit-sync")
-            module = layout.config / "modules/writing"
+            data = old / "commitments.md"
+            data.write_bytes(b"existing private data")
+            original_identity = old.stat().st_ino
+            canonical = projects / "status"
+            canonical.mkdir()
+            (canonical / "unrelated").write_bytes(b"separate user directory")
+            layout = Layout(home / "kit")
+            module = layout.config / "modules/rules"
             module.mkdir(parents=True)
             (home / ".codex").mkdir()
-            layout.machine_file.write_bytes(toml.dumps({"name":"fixture", "apps":["codex"], "projects":str(projects), "python":sys.executable}).encode())
-            (layout.config / "kit.toml").write_bytes(b'format = 2\n[migrations]\nproject_status_directory = 1\n[[modules]]\nname = "writing"\n')
-            (module / "module.toml").write_bytes(b'description = "Status reference"\n[[sections]]\nname = "rule"\nfile = "rule.md"\n')
-            (module / "rule.md").write_bytes(b'Read {{kit.projects}}/_status/exclusions.md.\n')
+            layout.machine_file.write_text(toml.dumps({"name": "fixture", "apps": ["codex"], "projects": str(projects), "python": sys.executable}), encoding="utf-8")
+            (layout.config / "kit.toml").write_text('format = 2\n[migrations]\nproject_status_directory = 1\n[[modules]]\nname = "rules"\n', encoding="utf-8")
+            (module / "module.toml").write_text('description = "Existing paths"\n[[sections]]\nname = "rule"\nfile = "rule.md"\n', encoding="utf-8")
+            (module / "rule.md").write_text('Read {{kit.projects}}/_status/commitments.md.\n', encoding="utf-8")
             with as_home(home), mock.patch.object(Engine, "commit_local"):
                 engine = Engine(layout)
-                original = engine._write_sections
-                def install_sections(plan):
-                    self.assertTrue(old.exists())
-                    return original(plan)
-                with mock.patch.object(engine, "_write_sections", side_effect=install_sections):
-                    report = engine.run(network=False)
+                engine.alerts.raise_("config", "Old format error", "agent-kit-sync status")
+                engine.alerts.raise_("status-directory-migration", "Old migration error", "agent-kit-sync status")
+                report = engine.run(network=False)
             self.assertEqual(report.errors, [])
-            self.assertFalse(old.exists())
-            self.assertIn(str(projects) + "/status/exclusions.md", (home / ".codex/AGENTS.md").read_text(encoding="utf-8"))
-            receipt = json.loads((layout.state / "status-directory-migration.json").read_text())
-            self.assertEqual(receipt["state"], "complete")
-            self.assertEqual((Path(receipt["retired"][0]["retained"]) / "exclusions.md").read_bytes(), b"private local policy")
+            self.assertEqual(old.stat().st_ino, original_identity)
+            self.assertFalse(old.is_symlink())
+            self.assertEqual(data.read_bytes(), b"existing private data")
+            self.assertEqual((canonical / "unrelated").read_bytes(), b"separate user directory")
+            self.assertIn(str(old / "commitments.md"), (home / ".codex/AGENTS.md").read_text())
+            self.assertFalse((layout.state / "status-directory-migration.json").exists())
+            keys = [alert["key"] for alert in engine.alerts.open()]
+            self.assertNotIn("config", keys)
+            self.assertNotIn("status-directory-migration", keys)
+
+    def test_migration_command_cannot_move_existing_directories(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            cli.main(["migrate-status"])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_render_preserves_each_existing_directory_name(self):
+        values = render.Values(home="/home", projects="/Projects", worktrees="/work", module="/module", app="codex", os="linux", cli="aks", hooks={})
+        for name in ("_status", "status", "Projects_status", "custom"):
+            self.assertEqual(render.substitute("{{kit.projects}}/" + name + "/file", values), "/Projects/" + name + "/file")
+
+
+if __name__ == "__main__":
+    unittest.main()

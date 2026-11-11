@@ -163,17 +163,16 @@ class Engine:
     # ------------------------------------------------------------ the run
 
     def run(self, network: bool = True) -> Report:
+        self._fetched_for_recovery = False
         self.recover()
-        if not self._migrate_status_directory():
-            return self._finish()
         # Version 0.1.0 raised an alert for instruction files over 32 KiB, citing a Codex limit that
         # does not apply to the files this tool writes. Close any such alert left open by that version.
         for alert in self.alerts.open():
             if alert.get("key", "").startswith("size:"):
                 self.alerts.close(alert["key"])
-        modules = self._load_or_alert()
+        modules = self._load_or_alert(recover_from_remote=network)
         if modules is None:
-            return self.report
+            return self._finish()
         changes = self.find_local_changes(modules)
         if changes:
             self.carry_modules = modules
@@ -184,57 +183,30 @@ class Engine:
             return self._finish()
         self.install(modules, incoming=False)
         if network and gitops.has_remote(self.checkout):
-            self.merge_remote()
+            if not self._fetched_for_recovery:
+                self.merge_remote()
             # A config repo another machine broke stops the run here; this machine keeps what it has installed.
             modules = self._load_or_alert()
             if modules is None:
                 return self._finish()
-        if not self._migrate_status_directory():
-            return self._finish()
         self.install(modules, incoming=True)
-        if not self.report.errors and not self._finalize_status_directory():
-            return self._finish()
         if network and gitops.has_remote(self.checkout) and not self.machine.cloud:
             self.push()
         return self._finish()
 
-    def _migrate_status_directory(self) -> bool:
-        from .status_directory import migrate_status, migration_enabled
-        if not migration_enabled(self.layout):
-            return True
-        result = migrate_status(self.layout, self.machine.projects, required=True)
-        self._status_plan_id = result.get("plan_id")
-        if result["state"] in ("pending", "not-configured"):
-            detail = "; ".join(result.get("pending", [])) or "Configure this machine's projects directory."
-            self.alerts.raise_("status-directory-migration", f"Status-directory migration needs attention: {detail}", "agent-kit-sync migrate-status")
-            self.report.errors.append("Status-directory migration is pending; original and retained data are preserved.")
-            return False
-        self.alerts.close("status-directory-migration")
-        return True
-
-    def _finalize_status_directory(self) -> bool:
-        from .status_directory import installed_paths, migrate_status, migration_enabled
-        if not migration_enabled(self.layout):
-            return True
-        result = migrate_status(self.layout, self.machine.projects, required=True, finalize=True,
-                                active_paths=installed_paths(self.layout, self.machine, self.index),
-                                plan_id=getattr(self, "_status_plan_id", None))
-        if result["state"] != "complete":
-            detail = "; ".join(result.get("pending", [])) or "Migration did not complete."
-            self.alerts.raise_("status-directory-migration", detail, "agent-kit-sync migrate-status")
-            self.report.errors.append("Status-directory retirement is pending; retained data must be reconciled.")
-            return False
-        self.alerts.close("status-directory-migration")
-        return True
-
-    def _load_or_alert(self) -> Optional[List[Module]]:
+    def _load_or_alert(self, recover_from_remote: bool = False) -> Optional[List[Module]]:
         try:
             _inventory, modules = self.load_modules()
         except ConfigError as error:
+            if recover_from_remote and gitops.has_remote(self.checkout):
+                self._fetched_for_recovery = True
+                self.merge_remote()
+                return self._load_or_alert()
             self.alerts.raise_("config", f"agent-kit-sync cannot read the config repo: {error}", "agent-kit-sync status")
             self.report.errors.append(str(error))
             return None
         self.alerts.close("config")
+        self.alerts.close("status-directory-migration")
         return modules
 
     def _finish(self) -> Report:
@@ -1090,6 +1062,10 @@ class Engine:
         return found, headers
 
     def merge_remote(self) -> None:
+        self._merge_remote()
+        self.machine.policy = load_machine(self.layout).policy
+
+    def _merge_remote(self) -> None:
         # A run started after a file write fetches at most once a minute; every other run fetches.
         if not self.throttle_fetch or time.time() - self.index.last_fetch >= 60 or self.report.edits or self.report.deletions:
             try:
@@ -1278,9 +1254,11 @@ class Engine:
                     kept.append(item)  # This machine's own edit, carried back or approved in this run.
                     continue
                 approved = self.index.approvals.get(item.key) == fingerprint
+                skill_policy = self.machine.policy.get("skills") if item.kind == "skill" else None
                 if info is None or "fp" not in info:
-                    if self.machine.policy["new_items"] == "apply" or item.key in self.approve_new or approved:
+                    if (skill_policy or self.machine.policy["new_items"]) == "apply" or item.key in self.approve_new or approved:
                         kept.append(item)
+                        self._clear_incoming_approval(item.key)
                         if self._needs_incoming_tests(module, item, tree):
                             pending.append((module, item, None))
                         continue
@@ -1288,14 +1266,16 @@ class Engine:
                     continue
                 if info["fp"] == fingerprint:
                     kept.append(item)
+                    self._clear_incoming_approval(item.key)
                     if info.get("untested") and self._needs_incoming_tests(module, item, tree):
                         # Never tested here, so no earlier version has run here either: treat it as new.
                         pending.append((module, item, None))
                     continue
                 code = item_is_code(module, item, tree)
-                policy = self.machine.policy["code_changes" if code else "other_changes"]
+                policy = skill_policy or self.machine.policy["code_changes" if code else "other_changes"]
                 if policy == "apply" or approved:
                     kept.append(item)
+                    self._clear_incoming_approval(item.key)
                     if self._needs_incoming_tests(module, item, tree):
                         pending.append((module, item, info["commit"]))
                     continue
@@ -1359,6 +1339,15 @@ class Engine:
                 pending.append((module, item, info.get("commit")))
                 queued.add(item.key)
                 self._retest.add(item.key)
+
+    def _clear_incoming_approval(self, item_key: str) -> None:
+        key = f"incoming:{item_key}"
+        held = self.held.by_key(key)
+        if held is None or held.get("kind") in ("new-item", "incoming"):
+            if held is not None:
+                self.held.remove(held["id"])
+                self.report.held = [identifier for identifier in self.report.held if identifier != held["id"]]
+            self.alerts.close(key)
 
     def _disabled_incoming(self, item_key: str) -> bool:
         module_name = item_key.split("/", 1)[0]
@@ -1524,6 +1513,61 @@ class Engine:
 
     # ------------------------------------------------------------ installing
 
+    def _preserve_migrated_references(self, plan: Plan, modules=(), trees=None) -> None:
+        from .status_references import StatusReferences
+        projects = self.machine.projects
+        references = StatusReferences(self.layout, projects, self.machine.os)
+        if not references.enabled:
+            return
+        module_roots = {module.name: module.root for module in modules}
+        items = {(module.name, item.name): item for module in modules for item in module.items}
+        overrides = getattr(self.machine, "overrides", {})
+
+        def origin(module, item, app, relative, local_text=False):
+            key = module + "/" + item
+            root = module_roots.get(module, self.checkout / "modules" / module)
+            tree = (trees or {}).get(key)
+            revision = getattr(tree, "commit", None)
+            selected = str(root / relative)
+            if revision:
+                selected += " at held or pinned revision " + revision
+            override = overrides.get(key) or overrides.get(module) or {}
+            if local_text and override.get("kind") in ("replace", "prepend", "append") and override.get("file"):
+                path = Path(override["file"])
+                if not path.is_absolute():
+                    path = self.layout.root / path
+                selected += f"; local {override['kind']} source {path}"
+            return key + " (" + app + ")", selected, revision
+
+        texts = []
+        for copy in plan.copies:
+            texts.append((copy.module, copy.data.decode("utf-8", "replace"), origin(copy.module, copy.item, copy.app, copy.source_rel, copy.kind in ("skill", "agent", "file"))))
+        for block in plan.sections:
+            texts.append((block.module, block.content, origin(block.module, block.item, block.app, block.source_rel, True)))
+        for module, item, text in plan.cursor_blocks:
+            data = items[(module, item)].data if (module, item) in items else {}
+            relative = data.get("variants", {}).get("cursor", data.get("file", "module.toml"))
+            texts.append((module, text, origin(module, item, "cursor", relative, True)))
+        for write in plan.settings:
+            module, item = write.item_key.split("/", 1)
+            texts.append((module, json.dumps(write.value, ensure_ascii=False), origin(module, item, write.app, "module.toml")))
+        for hook in plan.hooks:
+            texts.append((hook.module, json.dumps(hook.args, ensure_ascii=False), origin(hook.module, hook.name, "hooks", "module.toml")))
+        affected = {}
+        for module, text, details in texts:
+            unsafe = references.find_unsafe(text)
+            if unsafe is not None:
+                affected.setdefault(module, (details, unsafe))
+        for module in sorted(affected):
+            plan.drop_module(module)
+            (item, selected, revision), unsafe = affected[module]
+            action = "Resolve the held decision or pin, then run agent-kit-sync sync." if revision else "Correct the active source, then run agent-kit-sync sync."
+            if unsafe.unverified or not references.complete:
+                problem = f"references unverified prior migration data at {unsafe.path}. Inspect receipt {references.receipt} for the recorded source directories, compare their files with {projects / 'status'}, and inspect source candidates {selected}. Point the active source at the directory containing the required files."
+            else:
+                problem = f"references missing directory {unsafe.path}. Inspect {selected}. The active source must refer to {projects / 'status'}."
+            plan.errors.append(f"module {module}: {item} {problem} {action} Existing installed configuration is preserved.")
+
     def install(self, modules: List[Module], incoming: bool) -> None:
         effective, trees = self._effective_modules(modules, incoming)
 
@@ -1531,13 +1575,15 @@ class Engine:
             return trees.get(item.key) or Tree(module.root)
 
         plan = Planner(self.layout, self.machine, effective, tree_for).build()
+        self._preserve_migrated_references(plan, effective, trees)
         for name in self.held_back:
             if name not in plan.failed:
                 # Keep everything this machine installed for the module, exactly as a module that cannot be planned keeps it.
                 plan.drop_module(name)
         self.failed_modules = set(plan.failed)
         for error in plan.errors:
-            self.report.errors.append(error)
+            if error not in self.report.errors:
+                self.report.errors.append(error)
         for name in plan.failed:
             if name in self.held_back:
                 continue  # Its tests alert says why.
