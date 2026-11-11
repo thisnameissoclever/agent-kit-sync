@@ -19,6 +19,50 @@ from agent_kit_sync.status_references import StatusReferences
 
 
 class DirectoryPreservationTests(unittest.TestCase):
+    def test_recorded_source_paths_match_lexically_normalized_references(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / "OtherVolume/marker").mkdir(parents=True)
+            source = root / "OtherVolume/Old_status"
+            recorded = root / "OtherVolume/marker/../Old_status"
+            engine, projects, layout = self.reference_fixture(root, {"version": 2, "state": "complete", "staged": {}, "retired": [], "explicit_sources": [str(recorded)]})
+            plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+            engine._preserve_migrated_references(plan)
+            self.assertEqual(plan.failed, ["rules"])
+
+    def test_recorded_source_count_is_bounded_before_pattern_compilation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            sources = [str(root / name) for name in ("one", "two", "three")]
+            engine, projects, layout = self.reference_fixture(root, {"version": 2, "state": "complete", "staged": {}, "retired": [], "explicit_sources": sources})
+            with mock.patch("agent_kit_sync.status_references.MAX_SOURCE_PATHS", 2), self.assertRaisesRegex(RuntimeError, "distinct source paths"):
+                StatusReferences(layout, projects, "linux")
+
+    def test_recorded_explicit_and_retired_sources_are_checked_outside_projects(self):
+        for field in ("explicit_sources", "retired", "staged"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder).resolve()
+                source = root / "OtherVolume/Old_status"
+                record = {"version": 2, "state": "complete", "staged": {}, "retired": []}
+                if field == "explicit_sources":
+                    record[field] = [str(source)]
+                elif field == "retired":
+                    record[field] = [{"source": str(source), "phase": "retained"}]
+                else:
+                    record[field] = {str(source): {}}
+                    record["state"] = "pending"
+                engine, projects, layout = self.reference_fixture(root, record)
+                receipt = layout.state / "status-directory-migration.json"
+                before = receipt.read_bytes()
+                plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(plan.failed, ["rules"])
+                source.mkdir(parents=True)
+                plan = Plan(cursor_blocks=[("rules", "rule", str(source / "data"))])
+                engine._preserve_migrated_references(plan)
+                self.assertEqual(plan.failed, [])
+                self.assertEqual(receipt.read_bytes(), before)
+
     def test_copied_json_paths_decode_unicode_without_matching_similar_names(self):
         for name in ("José", "é", "🐱"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:

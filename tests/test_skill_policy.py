@@ -7,11 +7,12 @@ from pathlib import Path
 from unittest import mock
 
 from support import ROOT, TwoMachines, as_home
-from agent_kit_sync import toml
+from agent_kit_sync import gitops, toml
 from agent_kit_sync.engine import Engine
 from agent_kit_sync.model import load_module
 from agent_kit_sync.model import ConfigError
 from agent_kit_sync.paths import Layout
+from agent_kit_sync.state import Index
 
 
 class SkillPolicyTests(unittest.TestCase):
@@ -71,8 +72,24 @@ class SkillPolicyTests(unittest.TestCase):
 
     def test_invalid_repository_skill_policy_is_reported(self):
         with tempfile.TemporaryDirectory() as folder, as_home(Path(folder)):
+            engine, _module = self.make_engine(Path(folder), "wrong")
             with self.assertRaisesRegex(ConfigError, "defaults.skills"):
-                self.make_engine(Path(folder), "wrong")
+                engine.load_modules()
+
+    def test_invalid_local_skill_policy_still_requires_local_correction(self):
+        with tempfile.TemporaryDirectory() as folder, as_home(Path(folder)):
+            with self.assertRaisesRegex(ConfigError, "policy skills"):
+                self.make_engine(Path(folder), None, {"skills": "wrong"})
+
+    def test_failed_recovery_saves_fetch_timestamp_for_throttling(self):
+        with tempfile.TemporaryDirectory() as folder, as_home(Path(folder)):
+            engine, _module = self.make_engine(Path(folder), "wrong")
+            def fetched():
+                engine.index.last_fetch = 123.0
+            with mock.patch("agent_kit_sync.engine.gitops.has_remote", return_value=True), mock.patch.object(engine, "merge_remote", side_effect=fetched):
+                report = engine.run(network=True)
+            self.assertTrue(report.errors)
+            self.assertEqual(Index(engine.layout).last_fetch, 123.0)
 
     def test_push_retry_uses_policy_from_the_merge_before_installing(self):
         for initial, incoming in (("apply", "ask"), ("ask", "apply")):
@@ -94,6 +111,28 @@ class SkillPolicyTests(unittest.TestCase):
 
 
 class AutomaticSkillSyncTests(TwoMachines):
+    def test_invalid_repository_policy_does_not_prevent_fetching_its_correction(self):
+        good_kit = 'format = 2\n[defaults]\nskills = "apply"\n[[modules]]\nname = "work"\n'
+        self.seed_files({
+            "kit.toml": good_kit,
+            "modules/work/module.toml": '[[skills]]\nname = "review"\ndir = "skills/review"\n',
+            "modules/work/skills/review/SKILL.md": '---\nname: review\ndescription: Review code\n---\nInitial procedure.\n',
+        })
+        machine = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"})
+        machine.sync()
+        before = machine.read(".agents", "skills", "review", "SKILL.md")
+        self.seed_files({"kit.toml": good_kit.replace('"apply"', '"wrong"')}, "Invalid shared policy")
+        _engine, report = machine.sync()
+        self.assertTrue(report.errors)
+        self.assertEqual(machine.read(".agents", "skills", "review", "SKILL.md"), before)
+        self.seed_files({"kit.toml": good_kit, "modules/work/skills/review/SKILL.md": '---\nname: review\ndescription: Review code\n---\nRecovered procedure.\n'}, "Correct shared policy")
+        with mock.patch("agent_kit_sync.engine.gitops.fetch", wraps=gitops.fetch) as fetch:
+            engine, report = machine.sync()
+        self.assertEqual(report.errors, [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("Recovered procedure", machine.read(".agents", "skills", "review", "SKILL.md"))
+        self.assertNotIn("config", [alert["key"] for alert in engine.alerts.open()])
+
     def test_fetched_repository_policy_applies_in_the_same_sync_pass(self):
         self.seed_files({
             "kit.toml": 'format = 2\n[[modules]]\nname = "work"\n',

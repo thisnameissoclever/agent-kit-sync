@@ -192,6 +192,11 @@ def load_inventory(root: Path) -> Inventory:
     fmt = int(data.get("format", 1))
     if fmt > FORMAT:
         raise ConfigError(f"kit.toml uses format {fmt}; this agent-kit-sync reads format {FORMAT} and must update first")
+    defaults = data.get("defaults", {})
+    if not isinstance(defaults, dict):
+        raise ConfigError(f"{path}: defaults must be a table")
+    if defaults.get("skills") is not None and defaults["skills"] not in POLICY_VALUES["skills"]:
+        raise ConfigError(f"{path}: defaults.skills must be apply or ask")
     modules = []
     names = set()
     for entry in data.get("modules", []):
@@ -202,7 +207,7 @@ def load_inventory(root: Path) -> Inventory:
         if entry.get("source"):
             continue  # Modules from sources are installed by a later version.
         modules.append(load_module(root / "modules" / name, name, local=False))
-    return Inventory(root=root, format=fmt, defaults=dict(data.get("defaults", {})), modules=modules, sources=dict(data.get("sources", {})))
+    return Inventory(root=root, format=fmt, defaults=dict(defaults), modules=modules, sources=dict(data.get("sources", {})))
 
 
 def load_local_modules(layout: Layout) -> List[Module]:
@@ -284,9 +289,7 @@ def load_machine(layout: Layout) -> Machine:
         raise ConfigError(f"{path}: {error}") from None
     policy = dict(POLICY_DEFAULTS)
     repository_skills = kit_defaults(layout).get("skills")
-    if repository_skills is not None:
-        if repository_skills not in POLICY_VALUES["skills"]:
-            raise ConfigError(f"{layout.config / 'kit.toml'}: defaults.skills must be apply or ask")
+    if repository_skills in POLICY_VALUES["skills"]:
         policy["skills"] = repository_skills
     policy.update(data.get("policy", {}))
     for key, value in policy.items():

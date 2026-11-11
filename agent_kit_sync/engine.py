@@ -163,15 +163,16 @@ class Engine:
     # ------------------------------------------------------------ the run
 
     def run(self, network: bool = True) -> Report:
+        self._fetched_for_recovery = False
         self.recover()
         # Version 0.1.0 raised an alert for instruction files over 32 KiB, citing a Codex limit that
         # does not apply to the files this tool writes. Close any such alert left open by that version.
         for alert in self.alerts.open():
             if alert.get("key", "").startswith("size:"):
                 self.alerts.close(alert["key"])
-        modules = self._load_or_alert()
+        modules = self._load_or_alert(recover_from_remote=network)
         if modules is None:
-            return self.report
+            return self._finish()
         changes = self.find_local_changes(modules)
         if changes:
             self.carry_modules = modules
@@ -182,7 +183,8 @@ class Engine:
             return self._finish()
         self.install(modules, incoming=False)
         if network and gitops.has_remote(self.checkout):
-            self.merge_remote()
+            if not self._fetched_for_recovery:
+                self.merge_remote()
             # A config repo another machine broke stops the run here; this machine keeps what it has installed.
             modules = self._load_or_alert()
             if modules is None:
@@ -192,10 +194,14 @@ class Engine:
             self.push()
         return self._finish()
 
-    def _load_or_alert(self) -> Optional[List[Module]]:
+    def _load_or_alert(self, recover_from_remote: bool = False) -> Optional[List[Module]]:
         try:
             _inventory, modules = self.load_modules()
         except ConfigError as error:
+            if recover_from_remote and gitops.has_remote(self.checkout):
+                self._fetched_for_recovery = True
+                self.merge_remote()
+                return self._load_or_alert()
             self.alerts.raise_("config", f"agent-kit-sync cannot read the config repo: {error}", "agent-kit-sync status")
             self.report.errors.append(str(error))
             return None
