@@ -225,10 +225,30 @@ class CodexTrustTests(unittest.TestCase):
     def test_settle_leaves_approval_to_the_user_under_the_terminal_policy(self):
         alerts = FakeAlerts()
         machine = self.machine_with({"approval": "terminal"})
-        self.assertIsNone(codex_trust.settle(self.layout, machine, self.hooks, alerts, True, self.command()))
+        result = codex_trust.settle(self.layout, machine, self.hooks, alerts, True, self.command())
+        self.assertFalse(result.ok)
         self.assertIn("open /hooks", alerts.raised["codex-approval"])
         self.assertEqual(self.approvals(), {})
-        self.assertEqual(self.methods(), [])
+        self.assertNotIn("config/batchWrite", self.methods())
+
+    def test_settle_closes_the_terminal_alert_once_the_user_approved(self):
+        codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command())
+        alerts = FakeAlerts(open_keys=["codex-approval"])
+        machine = self.machine_with({"approval": "terminal"})
+        with mock.patch("agent_kit_sync.commands._codex_unapproved", return_value=[]):
+            result = codex_trust.settle(self.layout, machine, self.hooks, alerts, False, self.command())
+        self.assertTrue(result.ok)
+        self.assertEqual(alerts.closed, ["codex-approval"])
+
+    def test_app_server_gets_the_registered_codex_home(self):
+        seen = {}
+        real = codex_trust._Server.__init__
+        def spy(server, command, cwd, deadline, environment=None):
+            seen["home"] = (environment or {}).get("CODEX_HOME")
+            real(server, command, cwd, deadline, environment)
+        with mock.patch.object(codex_trust._Server, "__init__", spy):
+            codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command())
+        self.assertEqual(seen["home"], str(self.codex))
 
     def test_settle_skips_a_machine_without_codex(self):
         machine = Machine(name="test", apps=["claude"], app_homes={"claude": self.tmp / ".claude"}, tags=[], python=sys.executable, projects=None,

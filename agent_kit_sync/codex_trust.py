@@ -17,6 +17,7 @@ read has a deadline, and the process is stopped when the exchange ends or fails.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import threading
@@ -107,11 +108,11 @@ def ours_exactly(entry: dict, hooks_path: Path, expected: Dict[str, dict], data:
 
 
 class _Server:
-    def __init__(self, command: Sequence[str], cwd: Path, deadline: float):
+    def __init__(self, command: Sequence[str], cwd: Path, deadline: float, environment: Optional[Dict[str, str]] = None):
         self.deadline = deadline
         self.lines: "queue.Queue[Optional[str]]" = queue.Queue()
         self.process = processes.popen(list(command), cwd=str(cwd), stdin=processes.subprocess.PIPE, stdout=processes.subprocess.PIPE,
-                                       stderr=processes.subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1)
+                                       stderr=processes.subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=environment)
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
         self.next_id = 0
@@ -175,8 +176,11 @@ def _entries(result: dict) -> List[dict]:
     return [entry for group in result.get("data") or [] if isinstance(group, dict) for entry in group.get("hooks") or [] if isinstance(entry, dict)]
 
 
-def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command: Optional[Sequence[str]] = None) -> TrustResult:
-    """Approve agent-kit-sync's own Codex entries. Returns what it approved and what is still unapproved."""
+def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command: Optional[Sequence[str]] = None, write: bool = True) -> TrustResult:
+    """Approve agent-kit-sync's own Codex entries. Returns what it approved and what is still unapproved.
+
+    With `write` False it only checks: every unapproved entry of its own is reported in `remaining`.
+    """
     hooks_path = machine.app_homes["codex"] / "hooks.json"
     expected = expected_entries(layout, machine, hooks)
     if command is None:
@@ -185,7 +189,9 @@ def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command
             return TrustResult(error="the codex program is not on PATH")
         command = [program, "app-server"]
     try:
-        server = _Server(command, Path.home(), time.monotonic() + DEADLINE_SECONDS)
+        # The app server must read and write the Codex home agent-kit-sync registered in, which can differ from the inherited one.
+        environment = dict(os.environ, CODEX_HOME=str(machine.app_homes["codex"]))
+        server = _Server(command, Path.home(), time.monotonic() + DEADLINE_SECONDS, environment)
     except OSError as error:
         return TrustResult(error=f"Codex's app server could not start: {error}")
     try:
@@ -208,6 +214,8 @@ def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command
         pending = [entry for entry in mine if entry.get("trustStatus") not in TRUSTED]
         if not pending:
             return TrustResult()
+        if not write:
+            return TrustResult(remaining=[entry["key"] for entry in pending], error="Codex lists them as not approved")
         edits = [{"keyPath": f"hooks.state.{json.dumps(entry['key'])}.trusted_hash", "value": entry["currentHash"], "mergeStrategy": "replace"}
                  for entry in pending if entry.get("currentHash")]
         if (hooks_path.read_bytes() if hooks_path.exists() else b"") != raw:
@@ -257,8 +265,13 @@ def _settle(layout: Layout, machine: Machine, hooks: List[dict], alerts, codex_c
     if not (force or codex_changed or alert_open or _codex_unapproved(machine.app_homes["codex"], hooks_path, layout)):
         return None
     if machine.policy.get("approval") == "terminal":
-        alerts.raise_("codex-approval", "Codex has agent-kit-sync hook entries that are not approved. This machine's policy requires you to approve them: open /hooks in Codex and approve the agent-kit-sync entries, or Codex skips them.", "agent-kit-sync doctor")
-        return None
+        # Only check: close the alert once the user has approved the entries in Codex.
+        check = trust_own_hooks(layout, machine, hooks, command, write=False)
+        if check.ok:
+            alerts.close("codex-approval")
+        else:
+            alerts.raise_("codex-approval", "Codex has agent-kit-sync hook entries that are not approved. This machine's policy requires you to approve them: open /hooks in Codex and approve the agent-kit-sync entries, or Codex skips them.", "agent-kit-sync doctor")
+        return check
     result = trust_own_hooks(layout, machine, hooks, command)
     if result.ok:
         alerts.close("codex-approval")

@@ -317,12 +317,13 @@ def apply(args, layout: Layout) -> int:
     result = engine.run(network=gitops.has_remote(layout.config))
     write_launcher(layout)
     changed = register(layout, engine.machine, engine.index.hooks)
-    codex_trust = _settle_codex(layout, engine.machine, engine.index.hooks, changed)
     # Only now that the dispatcher runs the adopted hooks, remove their old registrations.
     installed_scripts = {Path(h["path"]).name for h in engine.index.hooks}
     wanted = [e for e in answers.get("remove_registrations", []) if any(name in str(e.get("command", "")) for name in installed_scripts)]
     skipped = [e for e in answers.get("remove_registrations", []) if e not in wanted]
     removed = remove_registrations(layout, wanted)
+    # Approve last: removing a registration can move the dispatcher's group, and Codex keys each approval by position.
+    codex_trust = _settle_codex(layout, engine.machine, engine.index.hooks, changed)
     out({"installed": len(result.installed), "held": result.held, "errors": result.errors, "registered": changed, "removed_registrations": removed, "codex_approval": codex_trust,
          "kept_registrations": [e.get("command") for e in skipped], "pushed": result.pushed})
     return 1 if result.errors else 0
