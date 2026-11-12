@@ -886,7 +886,8 @@ class Engine:
         if commit:
             self.record.data["commits"].append(commit)
             for path in paths:
-                if PurePosixPath(path).name == "module.toml" or not path.startswith("modules/"):
+                parts = PurePosixPath(path).parts
+                if len(parts) < 3 or parts[0] != "modules" or parts[2:] == ("module.toml",):
                     continue  # Only an item's own files can arrive before the manifest lists them.
                 committed = self._own_file_mark(commit, path)
                 before = self._own_file_mark(head, path) if head else None

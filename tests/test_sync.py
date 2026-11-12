@@ -434,6 +434,20 @@ class PolicyTests(TwoMachines):
         engine, _report = a.sync()
         self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
 
+    def test_a_skill_with_a_nested_module_toml_committed_before_its_entry_is_not_held_here(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.approved_machine("a", policy=ask)
+        skill = a.layout.config / "modules/writing/skills/later"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: later\ndescription: Later skill.\n---\n\nDo the later thing.\n", encoding="utf-8")
+        (skill / "module.toml").write_text('note = "data file inside the skill"\n', encoding="utf-8")
+        a.sync()
+        manifest = a.layout.config / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[skills]]\nname = "later"\ndir = "skills/later"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+
     def test_a_held_alert_names_the_item_and_what_to_do(self):
         self.standard_config()
         a = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"})
