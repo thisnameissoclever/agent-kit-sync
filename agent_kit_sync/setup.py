@@ -322,9 +322,21 @@ def apply(args, layout: Layout) -> int:
     wanted = [e for e in answers.get("remove_registrations", []) if any(name in str(e.get("command", "")) for name in installed_scripts)]
     skipped = [e for e in answers.get("remove_registrations", []) if e not in wanted]
     removed = remove_registrations(layout, wanted)
-    out({"installed": len(result.installed), "held": result.held, "errors": result.errors, "registered": changed, "removed_registrations": removed,
+    # Approve last: removing a registration can move the dispatcher's group, and Codex keys each approval by position.
+    codex_trust = _settle_codex(layout, engine.machine, engine.index.hooks, changed)
+    out({"installed": len(result.installed), "held": result.held, "errors": result.errors, "registered": changed, "removed_registrations": removed, "codex_approval": codex_trust,
          "kept_registrations": [e.get("command") for e in skipped], "pushed": result.pushed})
     return 1 if result.errors else 0
+
+
+def _settle_codex(layout: Layout, machine, hooks: List[dict], changed: Dict[str, bool]) -> Dict[str, object]:
+    """Approve agent-kit-sync's own Codex entries and say what happened, for the setup skill to report."""
+    from .codex_trust import settle
+    from .state import Alerts
+    result = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")), force=True)
+    if result is None:
+        return {"needed": False}
+    return {"needed": True, "approved": result.approved, "remaining": result.remaining, "error": result.error}
 
 
 def remove_registrations(layout: Layout, entries: List[dict]) -> List[str]:
@@ -403,6 +415,8 @@ def register_step(args, layout: Layout) -> int:
     from .model import load_machine
     from .register import register
     from .state import Index
-    changed = register(layout, load_machine(layout), Index(layout).hooks)
-    out({"registered": changed})
+    machine = load_machine(layout)
+    hooks = Index(layout).hooks
+    changed = register(layout, machine, hooks)
+    out({"registered": changed, "codex_approval": _settle_codex(layout, machine, hooks, changed)})
     return 0

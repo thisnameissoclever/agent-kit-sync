@@ -413,7 +413,7 @@ def cmd_doctor(args, layout: Layout) -> int:
             problems.append(f"{override} exists, so Codex ignores AGENTS.md and none of the synced sections.")
         unapproved = _codex_unapproved(machine.app_homes["codex"], path, layout)
         if unapproved:
-            problems.append(f"Codex has not approved {len(unapproved)} agent-kit-sync hook entries ({', '.join(unapproved)}). Open /hooks in Codex and approve them.")
+            problems.append(f"Codex has not approved {len(unapproved)} agent-kit-sync hook entries ({', '.join(unapproved)}). Run agent-kit-sync repair, which approves them, or open /hooks in Codex and approve them.")
     if (Path.home() / ".cursor").is_dir():
         notes.append("Cursor is installed. It runs the hooks registered for Claude Code; if the dispatcher cannot start there, Cursor lets every action continue.")
         exec_form = [event for event, handler in _own_entries(_json(machine.app_homes["claude"] / "settings.json"), layout) if handler.get("args")] if "claude" in machine.apps else []
@@ -529,8 +529,18 @@ def cmd_repair(args, layout: Layout) -> int:
     atomic_write(layout.machine_file, toml.dumps(data).encode("utf-8"))
     write_launcher(layout)
     machine = load_machine(layout)
-    register(layout, machine, Index(layout).hooks)
+    hooks = Index(layout).hooks
+    changed = register(layout, machine, hooks)
     say(f"Registered the dispatcher again with {sys.executable}.")
+    from .codex_trust import settle
+    from .state import Alerts
+    trust = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")), force=True)
+    if trust is not None:
+        if trust.approved:
+            say(f"Approved {len(trust.approved)} agent-kit-sync hook entries in Codex.")
+        if not trust.ok:
+            say(f"Could not approve agent-kit-sync's hook entries in Codex: {trust.error}. Open /hooks in Codex and approve them.")
+            return 1
     return 0
 
 

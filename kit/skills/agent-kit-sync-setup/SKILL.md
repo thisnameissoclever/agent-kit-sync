@@ -94,5 +94,5 @@ Explain when each hook runs, what it can block or change, which apps run it, and
 ## 9. Finish
 
 1. Offer to add `~/.agent-kit-sync/bin` to the user's command path, and say which file you would change.
-2. If Codex is installed, ask the user to open `/hooks` in Codex and approve the agent-kit-sync entries.
+2. If Codex is installed, read `codex_approval` in the output of `setup apply`. agent-kit-sync approves its own Codex hook entries itself. If `error` is set, or the machine's `approval` policy is `terminal`, ask the user to open `/hooks` in Codex and approve the agent-kit-sync entries, and say why.
 3. Run `{{kit.cli}} doctor` and report any problem it prints, with the fix.
