@@ -46,8 +46,9 @@ class Index:
         self.hooks: List[dict] = list(raw.get("hooks", []))
         self.instruction_sigs: Dict[str, list] = dict(raw.get("instruction_sigs", {}))
         self.approvals: Dict[str, str] = dict(raw.get("approvals", {}))
-        # Config repo paths this machine committed itself, with the SHA-256 of the committed text
-        # (line breaks as LF), so a later run can tell its own earlier commit from another machine's.
+        # Config repo paths this machine committed itself, with the committed Git file mode and the
+        # SHA-256 of the text (line breaks as LF), so a later run can tell its own earlier commit
+        # from another machine's.
         self.own_files: Dict[str, str] = dict(raw.get("own_files", {}))
         self.always_restore: List[str] = list(raw.get("always_restore", []))
         self.last_fetch: float = float(raw.get("last_fetch", 0))

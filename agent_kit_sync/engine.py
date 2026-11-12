@@ -888,12 +888,12 @@ class Engine:
             for path in paths:
                 if PurePosixPath(path).name == "module.toml" or not path.startswith("modules/"):
                     continue  # Only an item's own files can arrive before the manifest lists them.
-                committed = gitops.show(self.checkout, commit, path)
-                before = gitops.show(self.checkout, head, path) if head else None
+                committed = self._own_file_mark(commit, path)
+                before = self._own_file_mark(head, path) if head else None
                 if committed is None:
                     continue
-                if before is None or self.index.own_files.get(path) == sha256(before.replace(b"\r\n", b"\n")):
-                    self.index.own_files[path] = sha256(committed.replace(b"\r\n", b"\n"))
+                if before is None or self.index.own_files.get(path) == before:
+                    self.index.own_files[path] = committed
                 elif path in self.index.own_files:
                     # Built on a version this machine did not write, so the file is not wholly its own.
                     self.index.drop_own_file(path)
@@ -982,10 +982,20 @@ class Engine:
         files are still this machine's own work, unless another machine changed them in between.
         """
         for path in paths:
-            before = gitops.show(self.checkout, parent, path)
-            if before is not None and self.index.own_files.get(path) != sha256(before.replace(b"\r\n", b"\n")):
+            before = self._own_file_mark(parent, path)
+            if before is not None and self.index.own_files.get(path) != before:
                 return False
         return True
+
+    def _own_file_mark(self, commit: str, path: str) -> Optional[str]:
+        """The Git file mode and the SHA-256 of the text, with line breaks as LF, of a file at a commit."""
+        data = gitops.show(self.checkout, commit, path)
+        if data is None:
+            return None
+        parent, _, name = path.rpartition("/")
+        mode = next((m for m, rel in gitops.ls_tree(self.checkout, commit, parent) if rel == name), "") if parent else ""
+        digest = sha256(data.replace(b"\r\n", b"\n"))
+        return f"{mode}:{digest}"
 
     @staticmethod
     def _same_as_committed(module: Module, item: Item, tree: Tree, committed: Tree) -> bool:

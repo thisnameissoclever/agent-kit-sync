@@ -417,6 +417,23 @@ class PolicyTests(TwoMachines):
         engine, _report = a.sync()
         self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
 
+    def test_another_machines_mode_change_to_a_file_committed_here_before_listing_is_held(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.approved_machine("a", policy=ask)
+        b = self.approved_machine("b")
+        (a.layout.config / "modules/writing/sections/later.md").write_text("Later rule.\n", encoding="utf-8")
+        a.sync()
+        b.sync()
+        git(b.layout.config, "update-index", "--chmod=+x", "modules/writing/sections/later.md")
+        git(b.layout.config, "commit", "-q", "-m", "mode")
+        git(b.layout.config, "push", "-q")
+        a.sync()
+        manifest = a.layout.config / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[sections]]\nname = "later"\nfile = "sections/later.md"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
+
     def test_a_held_alert_names_the_item_and_what_to_do(self):
         self.standard_config()
         a = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"})
