@@ -332,7 +332,7 @@ def _settle_codex(layout: Layout, machine, hooks: List[dict], changed: Dict[str,
     """Approve agent-kit-sync's own Codex entries and say what happened, for the setup skill to report."""
     from .codex_trust import settle
     from .state import Alerts
-    result = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")))
+    result = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")), force=True)
     if result is None:
         return {"needed": False}
     return {"needed": True, "approved": result.approved, "remaining": result.remaining, "error": result.error}

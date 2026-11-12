@@ -534,7 +534,7 @@ def cmd_repair(args, layout: Layout) -> int:
     say(f"Registered the dispatcher again with {sys.executable}.")
     from .codex_trust import settle
     from .state import Alerts
-    trust = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")))
+    trust = settle(layout, machine, hooks, Alerts(layout), bool(changed.get("codex")), force=True)
     if trust is not None:
         if trust.approved:
             say(f"Approved {len(trust.approved)} agent-kit-sync hook entries in Codex.")

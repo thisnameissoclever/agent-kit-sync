@@ -58,6 +58,14 @@ FAKE_SERVER = textwrap.dedent(r'''
             time.sleep(60)
         if mode == "exit":
             sys.exit(1)
+        if mode == "request-first":
+            print(json.dumps({"id": message["id"], "method": "item/tool/requestUserInput", "params": {}}), flush=True)
+        if mode == "empty-list" and method == "hooks/list":
+            print(json.dumps({"id": message["id"], "result": {"data": []}}), flush=True)
+            continue
+        if mode == "bad-result" and method == "hooks/list":
+            print(json.dumps({"id": message["id"], "result": ["not", "a", "dict"]}), flush=True)
+            continue
         if method == "initialize":
             result = {"userAgent": "fake"}
         elif method == "hooks/list":
@@ -84,9 +92,13 @@ FAKE_SERVER = textwrap.dedent(r'''
 
 
 class FakeAlerts:
-    def __init__(self):
+    def __init__(self, open_keys=()):
         self.raised = {}
         self.closed = []
+        self.open_keys = list(open_keys)
+
+    def open(self):
+        return [{"key": key} for key in self.open_keys]
 
     def raise_(self, key, message, command="", detail=""):
         self.raised[key] = message
@@ -222,6 +234,49 @@ class CodexTrustTests(unittest.TestCase):
         machine = Machine(name="test", apps=["claude"], app_homes={"claude": self.tmp / ".claude"}, tags=[], python=sys.executable, projects=None,
                           worktrees=None, git_identity={}, policy={}, overrides={})
         self.assertIsNone(codex_trust.settle(self.layout, machine, self.hooks, FakeAlerts(), True, self.command()))
+
+    def test_leaves_an_entry_with_an_added_field(self):
+        self.data["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = "evil.exe"
+        self.write_hooks()
+        codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command())
+        self.assertFalse(any(":stop:" in key for key in self.approvals()))
+        self.assertTrue(any(":session_start:" in key for key in self.approvals()))
+
+    def test_leaves_an_entry_sharing_its_group_with_another_hook(self):
+        self.data["hooks"]["Stop"][0]["hooks"].append({"type": "command", "command": "other-tool --stop"})
+        self.write_hooks()
+        codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command())
+        self.assertFalse(any(":stop:" in key for key in self.approvals()))
+
+    def test_a_listing_without_its_entries_is_an_error(self):
+        result = codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command("empty-list"))
+        self.assertIn("did not list", result.error)
+        result = codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command("bad-result"))
+        self.assertIn("did not list", result.error)
+
+    def test_a_server_request_with_the_same_id_is_not_taken_as_the_answer(self):
+        result = codex_trust.trust_own_hooks(self.layout, self.machine, self.hooks, self.command("request-first"))
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.approved)
+
+    def test_settle_retries_while_the_alert_is_open(self):
+        alerts = FakeAlerts(open_keys=["codex-approval"])
+        with mock.patch("agent_kit_sync.commands._codex_unapproved", return_value=[]):
+            result = codex_trust.settle(self.layout, self.machine, self.hooks, alerts, False, self.command())
+        self.assertTrue(result.ok)
+        self.assertEqual(alerts.closed, ["codex-approval"])
+
+    def test_settle_runs_when_forced(self):
+        with mock.patch("agent_kit_sync.commands._codex_unapproved", return_value=[]):
+            result = codex_trust.settle(self.layout, self.machine, self.hooks, FakeAlerts(), False, self.command(), force=True)
+        self.assertTrue(result.approved)
+
+    def test_settle_turns_an_unexpected_error_into_the_alert(self):
+        alerts = FakeAlerts()
+        with mock.patch.object(codex_trust, "trust_own_hooks", side_effect=KeyError("codex")):
+            result = codex_trust.settle(self.layout, self.machine, self.hooks, alerts, True, self.command())
+        self.assertIn("KeyError", result.error)
+        self.assertIn("could not approve", alerts.raised["codex-approval"])
 
     def test_key_event_handles_colons_in_the_path(self):
         self.assertEqual(codex_trust._key_event(r"C:\Users\x\.codex\hooks.json:pre_tool_use:1:0"), "pre_tool_use")

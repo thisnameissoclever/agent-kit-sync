@@ -53,8 +53,29 @@ def expected_entries(layout: Layout, machine: Machine, hooks: List[dict]) -> Dic
     """What agent-kit-sync writes in Codex's hooks.json, keyed by Codex's snake_case event name."""
     result = {}
     for native, wanted in desired_entries(layout, machine, "codex", hooks, False).items():
-        result[_snake(native)] = {"command": wanted["handler"]["command"], "matcher": wanted["matcher"], "timeout": wanted["handler"].get("timeout")}
+        result[_snake(native)] = {"native": native, "command": wanted["handler"]["command"], "matcher": wanted["matcher"],
+                                  "timeout": wanted["handler"].get("timeout"), "handler": wanted["handler"]}
     return result
+
+
+def _on_disk(data: dict, key: str, expected: Dict[str, dict]) -> bool:
+    """True when the group and handler a Codex key names hold exactly what agent-kit-sync writes, and nothing else.
+
+    Codex's listing shows only some of an entry's fields, so the file itself is the check that no
+    other field, such as `commandWindows`, was added or changed.
+    """
+    parts = key.rsplit(":", 3)
+    wanted = expected.get(parts[1]) if len(parts) == 4 else None
+    if not wanted:
+        return False
+    try:
+        group = (data.get("hooks") or {}).get(wanted["native"])[int(parts[2])]
+        handlers = group.get("hooks")
+        if int(parts[3]) != 0 or not isinstance(handlers, list) or len(handlers) != 1:
+            return False
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    return handlers[0] == wanted["handler"] and group.get("matcher") == wanted["matcher"] and set(group) <= {"matcher", "hooks"}
 
 
 def _key_event(key: str) -> str:
@@ -70,8 +91,10 @@ def _same_file(left: str, right: Path) -> bool:
         return False
 
 
-def ours_exactly(entry: dict, hooks_path: Path, expected: Dict[str, dict]) -> bool:
+def ours_exactly(entry: dict, hooks_path: Path, expected: Dict[str, dict], data: Optional[dict] = None) -> bool:
     if not isinstance(entry, dict) or entry.get("isManaged") or entry.get("source") == "system":
+        return False
+    if data is not None and not _on_disk(data, str(entry.get("key") or ""), expected):
         return False
     if not _same_file(str(entry.get("sourcePath") or ""), hooks_path):
         return False
@@ -121,10 +144,11 @@ class _Server:
                 message = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(message, dict) and message.get("id") == ident:
+            if isinstance(message, dict) and message.get("id") == ident and "method" not in message:
                 if "error" in message:
                     raise RuntimeError(f"Codex's app server refused {method}: {str(message['error'])[:200]}")
-                return message.get("result") or {}
+                result = message.get("result")
+                return result if isinstance(result, dict) else {}
 
     def close(self) -> None:
         try:
@@ -136,10 +160,11 @@ class _Server:
         except processes.subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=3)
-        try:
-            self.process.stdout.close()
-        except OSError:
-            pass
+        if self.process.returncode is not None:
+            try:
+                self.process.stdout.close()
+            except OSError:
+                pass
 
 
 def _entries(result: dict) -> List[dict]:
@@ -163,11 +188,21 @@ def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command
         server.call("initialize", {"clientInfo": {"name": "agent-kit-sync", "version": "1"}})
         server.send({"method": "initialized"})
         entries = _entries(server.call("hooks/list", {}))
-        pending = [entry for entry in entries if ours_exactly(entry, hooks_path, expected) and entry.get("trustStatus") not in TRUSTED]
+        raw = hooks_path.read_bytes() if hooks_path.exists() else b""
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        except ValueError:
+            return TrustResult(error=f"{hooks_path} is not valid JSON")
+        mine = [entry for entry in entries if ours_exactly(entry, hooks_path, expected, data if isinstance(data, dict) else {})]
+        if expected and not mine:
+            return TrustResult(error=f"Codex did not list agent-kit-sync's entries from {hooks_path} as written")
+        pending = [entry for entry in mine if entry.get("trustStatus") not in TRUSTED]
         if not pending:
             return TrustResult()
         edits = [{"keyPath": f"hooks.state.{json.dumps(entry['key'])}.trusted_hash", "value": entry["currentHash"], "mergeStrategy": "replace"}
                  for entry in pending if entry.get("currentHash")]
+        if (hooks_path.read_bytes() if hooks_path.exists() else b"") != raw:
+            return TrustResult(error=f"{hooks_path} changed while agent-kit-sync was approving its entries")
         if edits:
             server.call("config/batchWrite", {"edits": edits})
         after = {entry.get("key"): entry for entry in _entries(server.call("hooks/list", {}))}
@@ -182,21 +217,35 @@ def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command
         server.close()
 
 
-def settle(layout: Layout, machine: Machine, hooks: List[dict], alerts, codex_changed: bool, command: Optional[Sequence[str]] = None) -> Optional[TrustResult]:
+def settle(layout: Layout, machine: Machine, hooks: List[dict], alerts, codex_changed: bool, command: Optional[Sequence[str]] = None, force: bool = False) -> Optional[TrustResult]:
+    """Run `_settle`, and turn any unexpected error into the alert, so approval can never break a sync."""
+    try:
+        return _settle(layout, machine, hooks, alerts, codex_changed, command, force)
+    except Exception as error:  # noqa: BLE001  (an approval problem must never stop a sync)
+        result = TrustResult(error=f"{type(error).__name__}: {error}")
+        alerts.raise_("codex-approval", f"agent-kit-sync could not approve its own hook entries in Codex ({result.error}), so Codex may skip them. Run agent-kit-sync repair to try again, or open /hooks in Codex and approve the agent-kit-sync entries.", "agent-kit-sync repair")
+        return result
+
+
+def _settle(layout: Layout, machine: Machine, hooks: List[dict], alerts, codex_changed: bool, command: Optional[Sequence[str]], force: bool) -> Optional[TrustResult]:
     """After registering, approve agent-kit-sync's own Codex entries, and raise or close the alert.
 
-    Runs only when Codex is one of this machine's apps and either agent-kit-sync just changed its
-    entries or one of them has no approval at all. A machine whose policy says approvals must be
-    typed in a terminal keeps the alert instead, so the user approves the entries in Codex.
+    Runs only when Codex is one of this machine's apps and agent-kit-sync just changed its entries,
+    one of them has no approval at all, the approval alert is still open, or the caller forces it,
+    as `repair` and setup do. The open alert matters because a stale approval, recorded for an
+    earlier form of an entry, looks like an approval in config.toml. A machine whose policy says
+    approvals must be typed in a terminal keeps the alert instead, so the user approves the entries
+    in Codex.
     """
     if "codex" not in machine.apps:
         return None
     from .commands import _codex_unapproved
     hooks_path = machine.app_homes["codex"] / "hooks.json"
-    if not codex_changed and not _codex_unapproved(machine.app_homes["codex"], hooks_path, layout):
+    alert_open = any(alert.get("key") == "codex-approval" for alert in alerts.open())
+    if not (force or codex_changed or alert_open or _codex_unapproved(machine.app_homes["codex"], hooks_path, layout)):
         return None
     if machine.policy.get("approval") == "terminal":
-        alerts.raise_("codex-approval", "agent-kit-sync changed its hook entries in Codex. This machine's policy requires you to approve them: open /hooks in Codex and approve the agent-kit-sync entries, or Codex skips them.", "agent-kit-sync doctor")
+        alerts.raise_("codex-approval", "Codex has agent-kit-sync hook entries that are not approved. This machine's policy requires you to approve them: open /hooks in Codex and approve the agent-kit-sync entries, or Codex skips them.", "agent-kit-sync doctor")
         return None
     result = trust_own_hooks(layout, machine, hooks, command)
     if result.ok:
