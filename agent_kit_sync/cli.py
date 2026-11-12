@@ -113,8 +113,8 @@ def _one_run(args, layout: Layout) -> int:
     alerts.close("run")
     try:
         changed = register(layout, engine.machine, engine.index.hooks)
-        if changed.get("codex"):
-            alerts.raise_("codex-approval", "agent-kit-sync changed its hook entries in Codex. Open /hooks in Codex and approve the agent-kit-sync entries, or Codex skips them.", "agent-kit-sync doctor")
+        from .codex_trust import settle
+        settle(layout, engine.machine, engine.index.hooks, alerts, bool(changed.get("codex")))
     except ValueError as error:
         alerts.raise_("register", f"agent-kit-sync could not register its hooks: {error}", "agent-kit-sync doctor")
     fresh = [alert for alert in alerts.open() if alert["id"] not in before]
