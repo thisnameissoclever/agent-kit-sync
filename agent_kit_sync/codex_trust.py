@@ -5,8 +5,8 @@ entry in `config.toml`. When agent-kit-sync changes an entry, for example its ti
 hash no longer matches and Codex skips the entry until someone approves it again. This module
 asks Codex's app server, `codex app-server`, for the current entries and their hashes, and
 approves exactly the entries agent-kit-sync wrote: an entry qualifies only when it is in this
-machine's Codex `hooks.json` and its event, command, matcher, and timeout equal what agent-kit-sync
-writes there. Every other hook, including one edited to add commands around the dispatcher,
+machine's Codex `hooks.json`, alone in its group, and its handler and matcher equal, field for
+field, what agent-kit-sync writes there. Every other hook, including one edited to add commands around the dispatcher,
 is left for the user to approve in Codex's `/hooks` screen. It then lists the entries again and
 reports any that are still not approved.
 
@@ -65,7 +65,7 @@ def _on_disk(data: dict, key: str, expected: Dict[str, dict]) -> bool:
     other field, such as `commandWindows`, was added or changed.
     """
     parts = key.rsplit(":", 3)
-    wanted = expected.get(parts[1]) if len(parts) == 4 else None
+    wanted = expected.get(parts[1]) if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit() else None
     if not wanted:
         return False
     try:
@@ -112,7 +112,8 @@ class _Server:
         self.lines: "queue.Queue[Optional[str]]" = queue.Queue()
         self.process = processes.popen(list(command), cwd=str(cwd), stdin=processes.subprocess.PIPE, stdout=processes.subprocess.PIPE,
                                        stderr=processes.subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1)
-        threading.Thread(target=self._read, daemon=True).start()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
         self.next_id = 0
 
     def _read(self) -> None:
@@ -160,7 +161,10 @@ class _Server:
         except processes.subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=3)
-        if self.process.returncode is not None:
+        # Close standard output only after the reader has reached its end. A child process that
+        # outlived the server can hold the pipe open, and closing it under a blocked reader blocks.
+        self.reader.join(timeout=1)
+        if not self.reader.is_alive():
             try:
                 self.process.stdout.close()
             except OSError:
@@ -187,8 +191,13 @@ def trust_own_hooks(layout: Layout, machine: Machine, hooks: List[dict], command
     try:
         server.call("initialize", {"clientInfo": {"name": "agent-kit-sync", "version": "1"}})
         server.send({"method": "initialized"})
+        # Read the file before and after the listing: when both reads agree, the hashes Codex
+        # listed are of the content checked below.
+        before = hooks_path.read_bytes() if hooks_path.exists() else b""
         entries = _entries(server.call("hooks/list", {}))
         raw = hooks_path.read_bytes() if hooks_path.exists() else b""
+        if raw != before:
+            return TrustResult(error=f"{hooks_path} changed while agent-kit-sync was approving its entries")
         try:
             data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
         except ValueError:
@@ -223,7 +232,10 @@ def settle(layout: Layout, machine: Machine, hooks: List[dict], alerts, codex_ch
         return _settle(layout, machine, hooks, alerts, codex_changed, command, force)
     except Exception as error:  # noqa: BLE001  (an approval problem must never stop a sync)
         result = TrustResult(error=f"{type(error).__name__}: {error}")
-        alerts.raise_("codex-approval", f"agent-kit-sync could not approve its own hook entries in Codex ({result.error}), so Codex may skip them. Run agent-kit-sync repair to try again, or open /hooks in Codex and approve the agent-kit-sync entries.", "agent-kit-sync repair")
+        try:
+            alerts.raise_("codex-approval", f"agent-kit-sync could not approve its own hook entries in Codex ({result.error}), so Codex may skip them. Run agent-kit-sync repair to try again, or open /hooks in Codex and approve the agent-kit-sync entries.", "agent-kit-sync repair")
+        except Exception:  # noqa: BLE001
+            pass
         return result
 
 
