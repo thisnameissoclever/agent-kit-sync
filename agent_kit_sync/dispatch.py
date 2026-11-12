@@ -10,6 +10,7 @@ from . import processes
 import json
 import os
 import sys
+import time
 
 # The tool's event names, and each app's name for them.
 APP_EVENTS = {
@@ -303,7 +304,26 @@ def unseen_alerts(state: str, session: str) -> list:
     if not alerts:
         return []
     seen = _seen(state, session)
-    return [a for a in alerts if a.get("id") not in seen]
+    now = time.time()
+    return [a for a in alerts if a.get("id") not in seen and not _settling(a, now)]
+
+
+HELD_ALERT_DELAY = 30  # Seconds a held-change alert waits before it is shown.
+
+
+def _settling(alert: dict, now: float) -> bool:
+    """True for an alert about a held change from the config repo, raised moments ago.
+
+    A sync that holds a change can be followed within seconds by a command or another sync that
+    resolves it, so the alert waits for a later event and is shown only if it is still open.
+    """
+    if not str(alert.get("key", "")).startswith("incoming:"):
+        return False
+    try:
+        # `since` is when the alert opened; `time` moves each time a sync raises it again.
+        return now - float(alert.get("since", alert.get("time", 0))) < HELD_ALERT_DELAY
+    except (TypeError, ValueError):
+        return False
 
 
 def mark_shown(state: str, session: str, alerts: list) -> None:

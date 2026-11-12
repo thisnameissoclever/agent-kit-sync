@@ -435,6 +435,21 @@ class DispatchUnitTests(unittest.TestCase):
             with self.subTest(app=app, event=event, n=len(results)):
                 self.assertIsNone(dispatch.pass_through(app, event, results, [], False))
 
+    def test_a_held_change_alert_waits_until_it_has_been_open_a_while(self):
+        import tempfile, time
+        with tempfile.TemporaryDirectory() as state:
+            now = time.time()
+            alerts = [
+                {"id": "fresh", "key": "incoming:m/a", "message": "Held.", "command": "agent-kit-sync held", "time": now, "since": now},
+                {"id": "old", "key": "incoming:m/b", "message": "Held long.", "command": "agent-kit-sync held", "time": now, "since": now - 600},
+                {"id": "status", "key": "fetch", "message": "Failed.", "command": "agent-kit-sync status", "time": now, "since": now},
+                {"id": "other-held", "key": "checkout:x", "message": "Set back.", "command": "agent-kit-sync held", "time": now, "since": now},
+                {"id": "legacy", "key": "incoming:m/c", "message": "Old format.", "command": "agent-kit-sync held", "time": now - 600},
+            ]
+            with open(os.path.join(state, "alerts.json"), "w", encoding="utf-8") as handle:
+                json.dump(alerts, handle)
+            self.assertEqual(sorted(a["id"] for a in dispatch.unseen_alerts(state, "s1")), ["legacy", "old", "other-held", "status"])
+
     def test_alerts_join_a_lone_hooks_json(self):
         alert = {"id": "1", "message": "Something failed.", "command": "agent-kit-sync status"}
         printed = json.dumps({"systemMessage": "Mine.", "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "Context."}}).encode()

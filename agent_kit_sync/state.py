@@ -46,14 +46,22 @@ class Index:
         self.hooks: List[dict] = list(raw.get("hooks", []))
         self.instruction_sigs: Dict[str, list] = dict(raw.get("instruction_sigs", {}))
         self.approvals: Dict[str, str] = dict(raw.get("approvals", {}))
+        # Config repo paths this machine committed itself, with the SHA-256 of the committed text
+        # (line breaks as LF), so a later run can tell its own earlier commit from another machine's.
+        self.own_files: Dict[str, str] = dict(raw.get("own_files", {}))
         self.always_restore: List[str] = list(raw.get("always_restore", []))
         self.last_fetch: float = float(raw.get("last_fetch", 0))
         self._dropped_approvals: set = set()
         self._cleared_force: set = set()
+        self._dropped_own_files: set = set()
 
     def drop_approval(self, key: str) -> None:
         self.approvals.pop(key, None)
         self._dropped_approvals.add(key)
+
+    def drop_own_file(self, path: str) -> None:
+        self.own_files.pop(path, None)
+        self._dropped_own_files.add(path)
 
     def clear_force(self, key: str) -> None:
         info = self.items.get(key)
@@ -84,6 +92,9 @@ class Index:
         for key, value in dict(on_disk.get("approvals", {})).items():
             if key not in self.approvals and key not in self._dropped_approvals:
                 self.approvals[key] = value
+        for key, value in dict(on_disk.get("own_files", {})).items():
+            if key not in self._dropped_own_files:
+                self.own_files.setdefault(key, value)
         for key in on_disk.get("always_restore", []):
             if key not in self.always_restore:
                 self.always_restore.append(key)
@@ -103,6 +114,7 @@ class Index:
             "hooks": self.hooks,
             "instruction_sigs": self.instruction_sigs,
             "approvals": self.approvals,
+            "own_files": self.own_files,
             "always_restore": self.always_restore,
             "last_fetch": self.last_fetch,
         })
@@ -296,10 +308,12 @@ class Alerts:
         alerts = self.all()
         for alert in alerts:
             if alert.get("key") == key and not alert.get("closed"):
+                alert.setdefault("since", alert.get("time", time.time()))
                 alert.update(message=message, command=command, detail=detail, time=time.time())
                 _save(self.path, alerts)
                 return alert
-        alert = {"id": new_id(), "key": key, "message": message, "command": command, "detail": detail, "time": time.time()}
+        now = time.time()
+        alert = {"id": new_id(), "key": key, "message": message, "command": command, "detail": detail, "time": now, "since": now}
         alerts.append(alert)
         _save(self.path, alerts)
         return alert

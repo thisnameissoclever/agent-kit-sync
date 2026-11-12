@@ -885,6 +885,18 @@ class Engine:
         commit = gitops.commit_all(self.checkout, message, self.machine.git_identity, paths=paths)
         if commit:
             self.record.data["commits"].append(commit)
+            for path in paths:
+                if PurePosixPath(path).name == "module.toml" or not path.startswith("modules/"):
+                    continue  # Only an item's own files can arrive before the manifest lists them.
+                committed = gitops.show(self.checkout, commit, path)
+                before = gitops.show(self.checkout, head, path) if head else None
+                if committed is None:
+                    continue
+                if before is None or self.index.own_files.get(path) == sha256(before.replace(b"\r\n", b"\n")):
+                    self.index.own_files[path] = sha256(committed.replace(b"\r\n", b"\n"))
+                elif path in self.index.own_files:
+                    # Built on a version this machine did not write, so the file is not wholly its own.
+                    self.index.drop_own_file(path)
             self._approve_own_items(paths, head, commit)
 
     def _hold_checkout_file(self, path: str, summary: str, ours: bytes, set_back: Optional[bytes]) -> None:
@@ -944,11 +956,36 @@ class Engine:
                     old = item_fingerprint(module, before, previous[1])
                     if info.get("fp") != old and self.index.approvals.get(item.key) != old:
                         continue  # Not what this machine had installed or approved; leave it to the policy.
-                elif parent and any(gitops.show(self.checkout, parent, f"{prefix}/{rel}") is not None for rel in item_source_files(module, item, tree)):
+                elif parent and not self._own_before(parent, [f"{prefix}/{rel}" for rel in item_source_files(module, item, tree)]):
                     continue  # New to the manifest, but its files were already in the config repo from elsewhere.
                 if committed is not None and not self._same_as_committed(module, item, tree, committed):
                     continue  # Part of the item was left out of the commit, such as a hook whose tests failed.
                 self.index.approvals[item.key] = item_fingerprint(module, item, tree)
+        # A file that belongs to a listed item is tracked through that item from now on.
+        for module in modules:
+            if module.local:
+                continue
+            prefix = module.root.relative_to(self.checkout).as_posix()
+            current = Tree(module.root)
+            for item in module.items:
+                for rel in item_source_files(module, item, current):
+                    if f"{prefix}/{rel}" in self.index.own_files:
+                        self.index.drop_own_file(f"{prefix}/{rel}")
+        for path in [p for p in self.index.own_files if read_or_none(self.checkout / p) is None]:
+            self.index.drop_own_file(path)
+
+    def _own_before(self, parent: str, paths: List[str]) -> bool:
+        """True when every one of these files that existed at `parent` is exactly what this machine committed.
+
+        An item's files can reach the config repo in one run and its manifest entry in the next, for
+        example when an agent writes a section file and then lists it a few seconds later. Those
+        files are still this machine's own work, unless another machine changed them in between.
+        """
+        for path in paths:
+            before = gitops.show(self.checkout, parent, path)
+            if before is not None and self.index.own_files.get(path) != sha256(before.replace(b"\r\n", b"\n")):
+                return False
+        return True
 
     @staticmethod
     def _same_as_committed(module: Module, item: Item, tree: Tree, committed: Tree) -> bool:
@@ -1509,7 +1546,8 @@ class Engine:
         entry = self.held.add(f"incoming:{item_key}", kind, summary + f" This machine's policy asks before installing {'new items' if kind == 'new-item' else what + ' changes'}.", ["apply", "decline"], item_key=item_key, commit=head)
         if entry["id"] not in self.report.held:
             self.report.held.append(entry["id"])
-        self.alerts.raise_(f"incoming:{item_key}", f"agent-kit-sync is holding a change to {item_key} from the config repo for your approval.", "agent-kit-sync held")
+        action = {"new-item": f"installs {item_key}, a new item from your config repo", "removal": f"removes {item_key}, which was deleted from your config repo"}.get(kind, f"installs a change to {item_key} from your config repo")
+        self.alerts.raise_(f"incoming:{item_key}", f"agent-kit-sync is waiting for your approval before it {action}. Ask your agent to resolve it, or run `agent-kit-sync held` to see it and the choices.", "agent-kit-sync held")
 
     # ------------------------------------------------------------ installing
 

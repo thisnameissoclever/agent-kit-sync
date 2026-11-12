@@ -348,6 +348,83 @@ class PolicyTests(TwoMachines):
         engine, _report = b.sync()
         self.assertIn("extra/s", [e.get("item_key") for e in engine.held.all()])
 
+    def approved_machine(self, name, **kwargs):
+        machine = self.machine(name, **kwargs)
+        engine, _report = machine.sync()
+        from agent_kit_sync.resolve import resolve
+        for entry in engine.held.all():
+            with machine.env():
+                resolve(machine.layout, entry["id"], "apply")
+        machine.sync()
+        return machine
+
+    def test_a_section_file_committed_before_its_manifest_entry_is_not_held_here(self):
+        # An agent writes a new section file, a sync commits it, and the agent lists it in
+        # module.toml seconds later, so the next sync commits the entry on its own.
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.approved_machine("a", policy=ask)
+        b = self.approved_machine("b", policy=ask)
+        config = a.layout.config
+        (config / "modules/writing/sections/later.md").write_text("Later rule.\n", encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        manifest = config / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[sections]]\nname = "later"\nfile = "sections/later.md"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertEqual([e.get("item_key") for e in engine.held.all()], [])
+        self.assertEqual([a for a in engine.alerts.open() if a["key"].startswith("incoming:")], [])
+        self.assertIn("Later rule.", a.read(".claude", "CLAUDE.md"))
+        # The file is tracked through its item now, so the separate record of it is gone.
+        from agent_kit_sync.state import Index
+        self.assertNotIn("modules/writing/sections/later.md", Index(a.layout).own_files)
+        # Another machine still asks before installing it.
+        engine, _report = b.sync()
+        self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
+
+    def test_another_machines_edit_to_a_file_committed_here_before_listing_is_held(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.approved_machine("a", policy=ask)
+        b = self.approved_machine("b")
+        (a.layout.config / "modules/writing/sections/later.md").write_text("Later rule.\n", encoding="utf-8")
+        a.sync()
+        b.sync()
+        (b.layout.config / "modules/writing/sections/later.md").write_text("Changed by b.\n", encoding="utf-8")
+        b.sync()
+        a.sync()
+        manifest = a.layout.config / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[sections]]\nname = "later"\nfile = "sections/later.md"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
+        self.assertNotIn("Changed by b.", a.read(".claude", "CLAUDE.md"))
+
+    def test_a_file_another_machine_wrote_and_this_machine_edited_is_held_when_listed(self):
+        self.standard_config()
+        ask = {"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"}
+        a = self.approved_machine("a", policy=ask)
+        b = self.approved_machine("b")
+        (b.layout.config / "modules/writing/sections/later.md").write_text("Written by b.\n", encoding="utf-8")
+        b.sync()
+        a.sync()
+        path = a.layout.config / "modules/writing/sections/later.md"
+        path.write_text(path.read_text(encoding="utf-8") + "Added by a.\n", encoding="utf-8")
+        a.sync()
+        from agent_kit_sync.state import Index
+        self.assertNotIn("modules/writing/sections/later.md", Index(a.layout).own_files)
+        manifest = a.layout.config / "modules/writing/module.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + '\n[[sections]]\nname = "later"\nfile = "sections/later.md"\n', encoding="utf-8")
+        engine, _report = a.sync()
+        self.assertIn("writing/later", [e.get("item_key") for e in engine.held.all()])
+
+    def test_a_held_alert_names_the_item_and_what_to_do(self):
+        self.standard_config()
+        a = self.machine("a", policy={"new_items": "ask", "code_changes": "ask", "other_changes": "ask", "outgoing": "push"})
+        engine, _report = a.sync()
+        alert = next(x for x in engine.alerts.open() if x["key"] == "incoming:writing/plain")
+        self.assertIn("before it installs writing/plain, a new item from your config repo.", alert["message"])
+        self.assertIn("`agent-kit-sync held`", alert["message"])
+
     def extra_module(self, machine, hook=False):
         """Write a module into the checkout with CRLF line breaks, as a Windows editor does; Git stores them as LF."""
         config = machine.layout.config
