@@ -988,13 +988,17 @@ class Engine:
         return True
 
     def _own_file_mark(self, commit: str, path: str) -> Optional[str]:
-        """The Git file mode and the SHA-256 of the text, with line breaks as LF, of a file at a commit."""
+        """The Git file mode and the SHA-256 of the committed bytes of a file at a commit.
+
+        Both sides of every comparison are committed blobs, so the bytes are compared exactly,
+        which also holds for binary files.
+        """
         data = gitops.show(self.checkout, commit, path)
         if data is None:
             return None
         parent, _, name = path.rpartition("/")
         mode = next((m for m, rel in gitops.ls_tree(self.checkout, commit, parent) if rel == name), "") if parent else ""
-        digest = sha256(data.replace(b"\r\n", b"\n"))
+        digest = sha256(data)
         return f"{mode}:{digest}"
 
     @staticmethod

@@ -449,6 +449,8 @@ class DispatchUnitTests(unittest.TestCase):
             with open(os.path.join(state, "alerts.json"), "w", encoding="utf-8") as handle:
                 json.dump(alerts, handle)
             self.assertEqual(sorted(a["id"] for a in dispatch.unseen_alerts(state, "s1")), ["legacy", "old", "other-held", "status"])
+            # At the agent's stop event nothing waits, because no later event may follow.
+            self.assertEqual(sorted(a["id"] for a in dispatch.unseen_alerts(state, "s1", settle=False)), ["fresh", "legacy", "old", "other-held", "status"])
 
     def test_alerts_join_a_lone_hooks_json(self):
         alert = {"id": "1", "message": "Something failed.", "command": "agent-kit-sync status"}

@@ -294,8 +294,11 @@ def _seen(state: str, session: str) -> set:
         return set()
 
 
-def unseen_alerts(state: str, session: str) -> list:
-    """Open alerts this session has not been shown. mark_shown records the ones delivered."""
+def unseen_alerts(state: str, session: str, settle: bool = True) -> list:
+    """Open alerts this session has not been shown. mark_shown records the ones delivered.
+
+    With `settle`, an alert about a held change raised moments ago waits for a later event.
+    """
     try:
         with open(os.path.join(state, "alerts.json"), encoding="utf-8") as handle:
             alerts = [a for a in json.load(handle) if not a.get("closed")]
@@ -305,7 +308,7 @@ def unseen_alerts(state: str, session: str) -> list:
         return []
     seen = _seen(state, session)
     now = time.time()
-    return [a for a in alerts if a.get("id") not in seen and not _settling(a, now)]
+    return [a for a in alerts if a.get("id") not in seen and not (settle and _settling(a, now))]
 
 
 HELD_ALERT_DELAY = 30  # Seconds a held-change alert waits before it is shown.
@@ -315,7 +318,8 @@ def _settling(alert: dict, now: float) -> bool:
     """True for an alert about a held change from the config repo, raised moments ago.
 
     A sync that holds a change can be followed within seconds by a command or another sync that
-    resolves it, so the alert waits for a later event and is shown only if it is still open.
+    resolves it, so the alert waits for a later event and is shown only if it is still open. The
+    agent's stop event shows it without waiting.
     """
     if not str(alert.get("key", "")).startswith("incoming:"):
         return False
@@ -471,7 +475,8 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     fresh = []
     # Cursor shows nothing a hook says when the agent stops, so an alert waits for a later event.
     if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop"):
-        fresh = unseen_alerts(state, session)
+        # A hold still open when the agent stops is shown then, because no later event may follow.
+        fresh = unseen_alerts(state, session, settle=event != "stop")
     cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
     # Cursor gets every answer through emit(), so cursor.stdout() reads one shape, not exit code 2 or plain text.
     passed = None if calling == "cursor" else pass_through(app, event, results, fresh, cursor_ask_is_deny)
