@@ -231,6 +231,7 @@ class DirectoryPreservationTests(unittest.TestCase):
             target = str(projects / "_status" / "data").replace("/", "\\")
             plans = [Plan(copies=[SimpleNamespace(module="rules", item="rule", app="kit", kind="file", data=target.encode(), source_rel="rule.md")]),
                      Plan(cursor_blocks=[("rules", "rule", target)]),
+                     Plan(antigravity_blocks=[("rules", "rule", target)]),
                      Plan(settings=[SimpleNamespace(item_key="rules/path", app="codex", value=target)]),
                      Plan(hooks=[SimpleNamespace(module="rules", name="guard", args=[target])])]
             for plan in plans:
@@ -306,7 +307,7 @@ class DirectoryPreservationTests(unittest.TestCase):
             self.assertFalse(old.is_symlink())
             self.assertEqual(data.read_bytes(), b"existing private data")
             self.assertEqual((canonical / "unrelated").read_bytes(), b"separate user directory")
-            self.assertIn(str(old / "commitments.md"), (home / ".codex/AGENTS.md").read_text())
+            self.assertIn(f"{projects}/_status/commitments.md", (home / ".codex/AGENTS.md").read_text())
             self.assertFalse((layout.state / "status-directory-migration.json").exists())
             keys = [alert["key"] for alert in engine.alerts.open()]
             self.assertNotIn("config", keys)

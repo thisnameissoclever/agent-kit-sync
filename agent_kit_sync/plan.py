@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import render
 from .model import Inventory, Item, Machine, Module, module_applies
-from .paths import Layout, os_name
+from .paths import Layout, antigravity_plugin_dir, os_name
 from .tree import Tree
 
 INSTRUCTION_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md"}
@@ -89,6 +89,7 @@ class Plan:
     errors: List[str] = field(default_factory=list)
     failed: List[str] = field(default_factory=list)   # modules that could not be rendered
     cursor_blocks: List[Tuple[str, str, str]] = field(default_factory=list)   # (module, item, text) of each section for Cursor
+    antigravity_blocks: List[Tuple[str, str, str]] = field(default_factory=list)   # (module, item, text) of each section for Antigravity
 
     def instruction_files(self, machine: Machine) -> Dict[str, Path]:
         return {app: machine.app_homes[app] / name for app, name in INSTRUCTION_FILES.items() if app in machine.apps}
@@ -100,6 +101,7 @@ class Plan:
         self.settings = [s for s in self.settings if s.item_key.split("/", 1)[0] != name]
         self.hooks = [h for h in self.hooks if h.module != name]
         self.cursor_blocks = [b for b in self.cursor_blocks if b[0] != name]
+        self.antigravity_blocks = [b for b in self.antigravity_blocks if b[0] != name]
         if name not in self.failed:
             self.failed.append(name)
 
@@ -240,6 +242,8 @@ def skill_dest(machine: Machine, app: str, name: str) -> Optional[Path]:
         if "claude" in machine.apps or "codex" in machine.apps:
             return None  # Cursor reads Claude Code's and Codex's skill folders.
         return homes["cursor"] / "skills" / name
+    if app == "antigravity":
+        return antigravity_plugin_dir(homes["antigravity"]) / "skills" / name
     return None
 
 
@@ -251,6 +255,8 @@ def agent_dest(machine: Machine, app: str, name: str) -> Optional[Path]:
         return homes["codex"] / "agents" / f"{name}.toml"
     if app == "cursor":
         return homes["cursor"] / "agents" / f"{name}.md"
+    if app == "antigravity":
+        return antigravity_plugin_dir(homes["antigravity"]) / "agents" / f"{name}.md"
     return None
 
 
@@ -292,12 +298,12 @@ class Planner:
             if reason is not None:
                 plan.skipped[module.name] = reason
                 continue
-            before = (len(plan.copies), len(plan.sections), len(plan.settings), len(plan.hooks), len(plan.cursor_blocks))
+            before = (len(plan.copies), len(plan.sections), len(plan.settings), len(plan.hooks), len(plan.cursor_blocks), len(plan.antigravity_blocks))
             try:
                 self._module(plan, module, order)
             except (render.RenderError, OSError, ValueError, UnicodeDecodeError) as error:
                 # Drop whatever this module planned, so the engine keeps its previous copies.
-                del plan.copies[before[0]:], plan.sections[before[1]:], plan.settings[before[2]:], plan.hooks[before[3]:], plan.cursor_blocks[before[4]:]
+                del plan.copies[before[0]:], plan.sections[before[1]:], plan.settings[before[2]:], plan.hooks[before[3]:], plan.cursor_blocks[before[4]:], plan.antigravity_blocks[before[5]:]
                 plan.errors.append(f"module {module.name}: {error}")
                 plan.failed.append(module.name)
                 plan.skipped[module.name] = f"error: {error}"
@@ -361,7 +367,7 @@ class Planner:
     def _section(self, plan: Plan, module: Module, item: Item, apps: List[str], tree: Tree) -> None:
         prepend, append, replace = self._local_text(module.name, item.name)
         for app in apps:
-            if app != "cursor" and app not in INSTRUCTION_FILES:
+            if app not in ("cursor", "antigravity") and app not in INSTRUCTION_FILES:
                 continue
             rel = dict(item.data.get("variants", {})).get(app, item.data["file"])
             raw = replace if replace is not None else tree.read(rel)
@@ -374,6 +380,9 @@ class Planner:
             if app == "cursor":
                 # Cursor reads rule files, written as output only; see cursor_rules.
                 plan.cursor_blocks.append((module.name, item.name, text))
+            elif app == "antigravity":
+                # Antigravity reads plugin rule files, written as output only; see antigravity_rules.
+                plan.antigravity_blocks.append((module.name, item.name, text))
             else:
                 plan.sections.append(SectionBlock(app, item.key, module.name, item.name, rel, text, module.local))
 

@@ -18,24 +18,36 @@ APP_EVENTS = {
                "stop": "Stop", "subagent_start": "SubagentStart", "subagent_stop": "SubagentStop", "pre_compact": "PreCompact", "session_end": "SessionEnd"},
     "codex": {"session_start": "SessionStart", "user_prompt": "UserPromptSubmit", "pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse",
               "stop": "Stop", "subagent_start": "SubagentStart", "subagent_stop": "SubagentStop", "pre_compact": "PreCompact", "session_end": "SessionEnd"},
+    "antigravity": {"session_start": "SessionStart", "user_prompt": "PreInvocation", "pre_tool_use": "PreToolUse", "post_tool_use": "PostToolUse",
+                    "stop": "Stop"},
 }
 # Each app's tool names, by the tool's own names.
 APP_TOOLS = {
     "claude": {"shell": ["Bash", "PowerShell"], "read": ["Read"], "write": ["Write", "NotebookEdit"], "edit": ["Edit", "MultiEdit"],
                "search": ["Grep", "Glob"], "web": ["WebFetch", "WebSearch"], "task": ["Agent", "Task"], "mcp": ["mcp__.*"]},
     "codex": {"shell": ["Bash"], "read": [], "write": ["apply_patch"], "edit": ["apply_patch"], "search": [], "web": [], "task": ["Agent"], "mcp": ["mcp__.*"]},
+    "antigravity": {"shell": ["run_command"], "read": ["read_file", "view_file", "view_file_outline", "view_code_item"],
+                    "write": ["write_file", "write_to_file"],
+                    "edit": ["edit_file", "replace_file_content", "multi_replace_file_content"],
+                    "search": ["grep_search", "find_by_name", "list_dir"],
+                    "web": ["search_web", "read_url_content"],
+                    "task": ["invoke_subagent"], "mcp": ["call_mcp_tool", "mcp_.*"]},
 }
 # Cursor runs Claude Code's entries and tests each matcher as a regular expression against its own
 # tool names, so a Claude Code matcher also lists these. Cursor reports every file edit as Write, and
 # an MCP tool as MCP:<tool name>. Claude Code's own Write then also matches an edit hook's matcher;
 # the tool-kind filter in main() still runs only the hooks for the tool that was used.
 CURSOR_TOOLS = {"shell": ["Shell"], "edit": ["Write"], "mcp": ["MCP:.*"]}
-WRITE_TOOLS = {"claude": ["Write", "Edit", "MultiEdit", "NotebookEdit"], "codex": ["apply_patch"]}
+WRITE_TOOLS = {
+    "claude": ["Write", "Edit", "MultiEdit", "NotebookEdit"],
+    "codex": ["apply_patch"],
+    "antigravity": ["write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content"],
+}
 CLAUDE_MIN_ON_FAILURE = (2, 1, 295)
 
 
 def tool_kind(app: str, name: str) -> str:
-    if name.startswith(("mcp__", "MCP:")):
+    if name.startswith(("mcp__", "MCP:")) or (app == "antigravity" and (name == "call_mcp_tool" or name.startswith("mcp_"))):
         return "mcp"
     for kind, names in APP_TOOLS.get(app, {}).items():
         if name in names:
@@ -43,6 +55,14 @@ def tool_kind(app: str, name: str) -> str:
     if app == "codex" and name in ("exec_command", "functions.exec_command", "shell", "local_shell"):
         return "shell"
     return name.lower()
+
+
+def _resolved_tool_kind(app: str, calling: str, tool_name: str) -> str:
+    """Resolve tool kind after to_claude() translation, falling back to Antigravity's native names."""
+    kind = tool_kind("claude" if calling == "antigravity" else app, tool_name)
+    if calling == "antigravity" and kind == tool_name.lower():
+        kind = tool_kind("antigravity", tool_name)
+    return kind
 
 
 def matcher_for(app: str, tools) -> str:
@@ -54,6 +74,9 @@ def matcher_for(app: str, tools) -> str:
         names.extend(APP_TOOLS.get(app, {}).get(kind, []))
         if app == "claude":
             names.extend(CURSOR_TOOLS.get(kind, []))
+        elif app == "antigravity" and kind == "edit":
+            # Antigravity can overwrite an existing file via write_file/write_to_file, which to_claude maps to Edit.
+            names.extend(APP_TOOLS["antigravity"].get("write", []))
     names = sorted(set(names))
     return "^(?:" + "|".join(names) + ")$" if names else "*"
 
@@ -112,8 +135,9 @@ def run_one(hook: dict, app: str, event: str, raw: bytes, payload: dict, env: di
 
 
 def kit_input(app: str, event: str, payload: dict) -> dict:
+    calling = caller(app, payload)
     return {
-        "app": caller(app, payload), "event": event, "tool": tool_kind(app, str(payload.get("tool_name", ""))),
+        "app": calling, "event": event, "tool": _resolved_tool_kind(app, calling, str(payload.get("tool_name", ""))),
         "tool_input": payload.get("tool_input"), "session_id": payload.get("session_id", ""), "cwd": payload.get("cwd", ""),
         "stop_hook_active": bool(payload.get("stop_hook_active")), "prompt": payload.get("prompt"), "native": payload,
     }
@@ -400,8 +424,8 @@ def pass_through(app: str, event: str, results: list, alerts: list, ask_is_deny:
 
 
 def without_transcripts(payload: dict) -> dict:
-    """Cursor's input without its transcripts, which a hook expecting Claude Code's format would misread."""
-    return {key: value for key, value in payload.items() if key not in ("transcript_path", "agent_transcript_path")}
+    """Cursor or Antigravity input without its transcripts, which a hook expecting Claude Code's format would misread."""
+    return {key: value for key, value in payload.items() if key not in ("transcript_path", "agent_transcript_path", "transcriptPath")}
 
 
 def cursor_fallback(event: str, combined: Combined) -> bytes:
@@ -428,8 +452,12 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
     except ValueError:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     state = os.path.join(layout_root, "state")
     calling = caller(app, payload)
+    raw_payload = payload
+    run_user_prompt = True
     if calling == "cursor":
         # Cursor sends its own input; every hook gets the input Claude Code would have sent. Each step
         # falls back instead of failing, because a dispatcher that crashes runs no hook at all.
@@ -447,6 +475,26 @@ def main(layout_root, launcher, app: str, event: str) -> int:
                 cursor.remove_old(state)
             except Exception:
                 pass
+    elif calling == "antigravity":
+        # Antigravity sends its own camelCase input; every hook gets the input Claude Code would have sent.
+        from . import antigravity
+        if event == "user_prompt":
+            try:
+                run_user_prompt = antigravity.should_run_user_prompt(raw_payload, state, record=False)
+            except Exception:
+                run_user_prompt = True
+        try:
+            payload = antigravity.to_claude(event, raw_payload)
+        except Exception:
+            payload = dict(without_transcripts(raw_payload), hook_event_name=APP_EVENTS["claude"].get(event, raw_payload.get("hook_event_name")))
+            name = antigravity.raw_tool_name(raw_payload)
+            if name:
+                payload["tool_name"] = antigravity.TOOL_NAMES.get(name, name)
+        if event == "session_start":
+            try:
+                antigravity.remove_old(state)
+            except Exception:
+                pass
     try:
         with open(os.path.join(state, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
@@ -454,14 +502,26 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         index = {}
     hooks = [h for h in index.get("hooks", []) if event in h.get("events", [])]
     hooks = [h for h in hooks if not h.get("apps") or calling in h["apps"] or (calling == "cursor" and "claude" in h["apps"])]
-    if event in ("pre_tool_use", "post_tool_use"):
-        kind = tool_kind(app, str(payload.get("tool_name", "")))
+    if calling == "antigravity":
+        if event == "user_prompt" and not run_user_prompt:
+            hooks = []
+        elif event == "stop" and not antigravity.allow_stop_hooks(raw_payload):
+            hooks = []
+    if event in ("pre_tool_use", "post_tool_use") and hooks:
+        kind = _resolved_tool_kind(app, calling, str(payload.get("tool_name", "")))
         hooks = [h for h in hooks if not h.get("tools") or kind in h["tools"]]
     hooks.sort(key=lambda h: (h.get("order", 0), h.get("name", "")))
     if calling == "cursor":
         if hooks:
             try:
                 payload = cursor.with_transcripts(payload, state)
+            except Exception:
+                payload = without_transcripts(payload)
+        raw = json.dumps(payload).encode("utf-8")
+    elif calling == "antigravity":
+        if hooks:
+            try:
+                payload = antigravity.with_transcripts(payload, state, event)
             except Exception:
                 payload = without_transcripts(payload)
         raw = json.dumps(payload).encode("utf-8")
@@ -473,13 +533,16 @@ def main(layout_root, launcher, app: str, event: str) -> int:
     # Alerts: one line to the user and one to the agent, once per session.
     session = str(payload.get("session_id") or "")
     fresh = []
-    # Cursor shows nothing a hook says when the agent stops, so an alert waits for a later event.
-    if session and event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop"):
+    # Cursor shows nothing on stop; Antigravity surfaces messages via injectSteps on session_start and user_prompt.
+    deliver_alerts = event in ("session_start", "user_prompt", "pre_tool_use", "post_tool_use", "stop") and not (calling == "cursor" and event == "stop")
+    if calling == "antigravity":
+        deliver_alerts = (event == "session_start") or (event == "user_prompt" and run_user_prompt)
+    if session and deliver_alerts:
         # A hold still open when the agent stops is shown then, because no later event may follow.
         fresh = unseen_alerts(state, session, settle=event != "stop")
     cursor_ask_is_deny = calling == "cursor" or (app == "claude" and os.path.isdir(os.path.join(os.path.expanduser("~"), ".cursor")))
-    # Cursor gets every answer through emit(), so cursor.stdout() reads one shape, not exit code 2 or plain text.
-    passed = None if calling == "cursor" else pass_through(app, event, results, fresh, cursor_ask_is_deny)
+    # Cursor and Antigravity get every answer through emit(), so stdout() reads one shape, not exit code 2 or plain text.
+    passed = None if calling in ("cursor", "antigravity") else pass_through(app, event, results, fresh, cursor_ask_is_deny)
     if passed is None:
         combined = combine(app, event, results)
         user, context = alert_lines(event, fresh)
@@ -488,8 +551,10 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         delivered = fresh
     # Start a background sync when this event calls for one.
     want_sync = event == "session_start"
-    if event == "post_tool_use" and str(payload.get("tool_name", "")) in WRITE_TOOLS.get(app, []):
-        want_sync = True
+    if event == "post_tool_use":
+        tool_name = str(payload.get("tool_name", ""))
+        if tool_name in WRITE_TOOLS.get(app, []) or (calling == "antigravity" and tool_name in WRITE_TOOLS["claude"]):
+            want_sync = True
     if event == "stop" and copies_changed(index):
         want_sync = True
     if want_sync and not os.environ.get("AGENT_KIT_SYNC_NO_BACKGROUND") and os.environ.get("AGENT_KIT_SYNC_TEST") != "1":
@@ -510,6 +575,17 @@ def main(layout_root, launcher, app: str, event: str) -> int:
         except Exception:
             out = cursor_fallback(event, combined)
             delivered = []  # The fallback answer carries no alerts; show them at a later event.
+    elif calling == "antigravity":
+        try:
+            out = antigravity.stdout(event, out, raw_payload, payload)
+        except Exception:
+            out = antigravity.fallback(event, combined, raw_payload)
+            delivered = []
+        if event == "user_prompt" and run_user_prompt and combined.decision not in ("deny", "continue"):
+            try:
+                antigravity.record_user_prompt(raw_payload, state)
+            except Exception:
+                pass
     if session:
         mark_shown(state, session, delivered)
     if err:

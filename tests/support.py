@@ -20,7 +20,7 @@ from agent_kit_sync import gitops, toml  # noqa: E402
 from agent_kit_sync.engine import Engine  # noqa: E402
 from agent_kit_sync.paths import Layout  # noqa: E402
 
-HOME_VARS = ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_KIT_SYNC_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+HOME_VARS = ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTIGRAVITY_GEMINI_DIR", "AGENT_KIT_SYNC_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 IDENTITY = {"name": "Test Person", "email": "test@example.com"}
 
 
@@ -47,9 +47,10 @@ def git(repo, *args):
 
 @contextmanager
 def as_home(home: Path):
-    saved = {name: os.environ.get(name) for name in HOME_VARS}
+    saved_names = set(HOME_VARS) | {k for k in os.environ if k.startswith("ANTIGRAVITY_")}
+    saved = {name: os.environ.get(name) for name in saved_names}
     try:
-        for name in HOME_VARS:
+        for name in saved_names:
             os.environ.pop(name, None)
         os.environ["HOME"] = str(home)
         os.environ["USERPROFILE"] = str(home)
@@ -70,8 +71,10 @@ class Machine:
         self.layout = Layout(self.home / ".agent-kit-sync")
         self.layout.root.mkdir()
         for app in apps:
-            folder = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor"}[app]
+            folder = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor", "antigravity": ".gemini"}[app]
             (self.home / folder).mkdir()
+            if app == "antigravity":
+                (self.home / folder / "antigravity").mkdir()
         self.apps = list(apps)
         with self.env():
             git(None, "clone", "-q", str(remote), str(self.layout.config))

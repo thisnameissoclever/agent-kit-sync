@@ -26,7 +26,12 @@ def main() -> int:
         path = Path(tmp) / "f.txt"
         atomic_write(path, b"one")
         assert path.read_bytes() == b"one"
-    from . import dispatch, engine, register  # noqa: F401  (import check)
+    from . import antigravity, antigravity_rules, dispatch, engine, register  # noqa: F401  (import check)
+    translated = antigravity.to_claude("pre_tool_use", {"conversationId": "c1", "hookEventName": "PreToolUse", "toolCall": {"name": "run_command", "args": {"CommandLine": "echo hi"}}})
+    assert translated["tool_name"] == "Bash" and translated["tool_input"]["command"] == "echo hi", translated
+    reply = antigravity.answer("pre_tool_use", {"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "no"}})
+    assert reply == {"decision": "deny", "reason": "no"}, reply
+    assert antigravity_rules.compose("m", "a", "Rule.\n").name == "agent-kit-sync--m--a.md"
     print("self-test passed")
     return 0
 

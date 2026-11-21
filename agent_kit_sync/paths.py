@@ -9,14 +9,18 @@ from pathlib import Path
 
 KIT_DIR_NAME = ".agent-kit-sync"
 APPS = ("claude", "codex", "cursor", "antigravity")
-# Apps whose items this version installs. Antigravity support comes later.
-SUPPORTED_APPS = ("claude", "codex", "cursor")
+SUPPORTED_APPS = ("claude", "codex", "cursor", "antigravity")
+ANTIGRAVITY_PLUGIN_NAME = "agent-kit-sync"
 PROGRAMS = {
     "claude": ("claude",),
     "codex": ("codex",),
     "cursor": ("cursor", "cursor-agent"),
     "antigravity": ("antigravity", "agy"),
 }
+
+
+def antigravity_plugin_dir(app_home: Path) -> Path:
+    return app_home / "config" / "plugins" / ANTIGRAVITY_PLUGIN_NAME
 
 
 def os_name() -> str:

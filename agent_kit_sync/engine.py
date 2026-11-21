@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from . import checks, gitops, render, sections, settings, toml, tomledit
 from .fsutil import ChangedUnderneath, atomic_write, prune_empty_dirs, read_or_none, real, remove_file, sha256, stat_signature
 from .model import ConfigError, Inventory, Item, Machine, Module, load_inventory, load_local_modules, load_machine, load_module
-from .paths import Layout
+from .paths import Layout, antigravity_plugin_dir, default_app_home
 from .plan import Copy, Plan, Planner, SectionBlock, SettingWrite, INSTRUCTION_FILES, SETTINGS_FILES, is_code_path, item_templates, values_for
 from .state import Alerts, Held, Index, Journal, RunRecord
 from .tree import CommitTree, Tree
@@ -407,7 +407,10 @@ class Engine:
 
     def _guard_deletions(self, changes: List[LocalChange]) -> List[LocalChange]:
         deleted_items = {change.item_key for change in changes if change.kind in ("delete", "section-delete")}
-        vanished_apps = {app for app in self.machine.apps if not self.machine.app_homes[app].is_dir()}
+        vanished_apps = {
+            app for app in self.machine.apps
+            if not (antigravity_plugin_dir(self.machine.app_homes[app]) if app == "antigravity" else self.machine.app_homes[app]).is_dir()
+        }
         guarded: Set[str] = set()
         if len(deleted_items) > DELETION_GUARD:
             guarded = deleted_items
@@ -575,7 +578,7 @@ class Engine:
                 raise render.RenderError(f"after this edit, the {self._app_label(app)} copy cannot be written: {error}") from None
 
     def _app_label(self, app: str) -> str:
-        return {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "kit": "hook"}.get(app, app)
+        return {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "antigravity": "Antigravity", "kit": "hook"}.get(app, app)
 
     def _executable_for(self, changes: List[LocalChange], source_rel: str) -> Optional[bool]:
         from .fsutil import is_executable
@@ -1601,6 +1604,10 @@ class Engine:
             data = items[(module, item)].data if (module, item) in items else {}
             relative = data.get("variants", {}).get("cursor", data.get("file", "module.toml"))
             texts.append((module, text, origin(module, item, "cursor", relative, True)))
+        for module, item, text in plan.antigravity_blocks:
+            data = items[(module, item)].data if (module, item) in items else {}
+            relative = data.get("variants", {}).get("antigravity", data.get("file", "module.toml"))
+            texts.append((module, text, origin(module, item, "antigravity", relative, True)))
         for write in plan.settings:
             module, item = write.item_key.split("/", 1)
             texts.append((module, json.dumps(write.value, ensure_ascii=False), origin(module, item, write.app, "module.toml")))
@@ -1653,6 +1660,7 @@ class Engine:
         self._write_sections(plan)
         self.index.save()
         self.write_cursor_rules(plan)
+        self.write_antigravity_plugin(plan)
         self._write_settings(plan)
         self.index.save()
         head = gitops.head(self.checkout) if (self.checkout / ".git").exists() else None
@@ -2030,18 +2038,8 @@ class Engine:
             if outcome.errors:
                 self._alert_list("cursor-rules", outcome.errors, "agent-kit-sync could not remove some of its Cursor rule files: {listed}")
             return
-        support = {str(copy.path): copy.data for copy in plan.copies if copy.app == "kit" and copy.kind == "file"}
+        support = self._support_files(plan)
         failed = set(plan.failed)
-        for entry in self.index.copies.values():
-            # A failed module keeps its earlier installed files; a section importing one still gets its text.
-            if entry.get("app") == "kit" and entry.get("kind") == "file" and entry.get("item_key", "").split("/", 1)[0] in failed:
-                path = Path(entry["path"])
-                try:
-                    data = read_or_none(path)
-                except OSError:
-                    data = None
-                if data is not None:
-                    support.setdefault(str(path), data)
         blocks = [b for b in plan.cursor_blocks if not self.frozen(f"{b[0]}/{b[1]}")]
         planned = cursor_rules.plan_rules(blocks, support)
         # A module that failed this run, or an item with a held edit, keeps its rule files as they are.
@@ -2056,11 +2054,76 @@ class Engine:
         else:
             self._close_edited_notice()
 
-    def _close_edited_notice(self) -> None:
+    def write_antigravity_plugin(self, plan: Plan, everything_removed: bool = False) -> None:
+        """Write Antigravity's managed plugin manifest and rule files. They are output only: nothing
+        in them is carried back, so no state of Antigravity's plugin can change the config repo, and
+        a problem with them raises an alert instead of stopping the run."""
+        try:
+            self._write_antigravity_plugin(plan, everything_removed)
+        except Exception as error:  # noqa: BLE001 - Antigravity's output must never stop a sync.
+            self.alerts.raise_("antigravity-plugin", f"agent-kit-sync could not write Antigravity's plugin files: {error}", "agent-kit-sync status")
+
+    def _write_antigravity_plugin(self, plan: Plan, everything_removed: bool) -> None:
+        from . import antigravity_rules
+        app_home = self.machine.app_homes.get("antigravity") or default_app_home("antigravity")
+        plugin_dir = antigravity_plugin_dir(app_home)
+        folder = plugin_dir / "rules"
+        backups = self.layout.state / "backups" / "antigravity-rules"
+        if "antigravity" not in self.machine.apps or everything_removed:
+            outcome = antigravity_rules.write_rules(folder, [], set(), backups)
+            manifest_error = antigravity_rules.remove_manifest(plugin_dir)
+            for key in ("antigravity-rules", "antigravity-rule-import", "antigravity-rule-size", "antigravity-rule-foreign"):
+                self.alerts.close(key)
+            self._close_edited_notice("antigravity-rule-edited")
+            if manifest_error:
+                self.alerts.raise_("antigravity-plugin", f"agent-kit-sync could not remove Antigravity's plugin manifest: {manifest_error}", "agent-kit-sync status")
+            else:
+                self.alerts.close("antigravity-plugin")
+            if outcome.backed_up:
+                self._alert_list("antigravity-rule-edited", outcome.backed_up, "agent-kit-sync removed its Antigravity rule files, and saved the ones that had been edited as: {listed}")
+            if outcome.errors:
+                self._alert_list("antigravity-rules", outcome.errors, "agent-kit-sync could not remove some of its Antigravity rule files: {listed}")
+            return
+        manifest_error = antigravity_rules.ensure_manifest(plugin_dir)
+        if manifest_error:
+            self.alerts.raise_("antigravity-plugin", f"agent-kit-sync could not write Antigravity's plugin manifest: {manifest_error}", "agent-kit-sync status")
+        else:
+            self.alerts.close("antigravity-plugin")
+        support = self._support_files(plan)
+        failed = set(plan.failed)
+        blocks = [b for b in plan.antigravity_blocks if not self.frozen(f"{b[0]}/{b[1]}")]
+        planned = antigravity_rules.plan_rules(blocks, support)
+        keep = {(module, item) for module, item in antigravity_rules.owners(folder) if module in failed or self.frozen(f"{module}/{item}")}
+        outcome = antigravity_rules.write_rules(folder, planned.rules, keep, backups)
+        self._alert_list("antigravity-rule-import", planned.unmatched + planned.unreadable, "Antigravity plugins do not follow @path lines, and these lines in synced sections name no file agent-kit-sync installs as text, so Antigravity gets the bare line: {listed}. Install the file with a [[files]] item, or write its text into the section.")
+        self._alert_list("antigravity-rule-size", planned.oversized, f"Antigravity reads only the first {antigravity_rules.RULE_LIMIT:,} bytes of a rule, and these rule files are still larger after splitting: {{listed}}. Shorten the section's longest paragraph.")
+        self._alert_list("antigravity-rule-foreign", outcome.foreign, "agent-kit-sync did not write these Antigravity rule files, because a file it did not write is at the same name: {listed}. Rename the file, then run agent-kit-sync sync.")
+        self._alert_list("antigravity-rules", outcome.errors, "agent-kit-sync could not write some of Antigravity's rule files: {listed}")
+        if outcome.backed_up:
+            self._alert_list("antigravity-rule-edited", outcome.backed_up, "Antigravity's rule files are written by agent-kit-sync and never carried back, so edits in them were replaced. Make the change in CLAUDE.md, AGENTS.md, or the installed file instead. The edited files were saved as: {listed}")
+        else:
+            self._close_edited_notice("antigravity-rule-edited")
+
+    def _support_files(self, plan: Plan) -> Dict[str, bytes]:
+        support = {str(copy.path): copy.data for copy in plan.copies if copy.app == "kit" and copy.kind == "file"}
+        failed = set(plan.failed)
+        for entry in self.index.copies.values():
+            # A failed module keeps its earlier installed files; a section importing one still gets its text.
+            if entry.get("app") == "kit" and entry.get("kind") == "file" and entry.get("item_key", "").split("/", 1)[0] in failed:
+                path = Path(entry["path"])
+                try:
+                    data = read_or_none(path)
+                except OSError:
+                    data = None
+                if data is not None:
+                    support.setdefault(str(path), data)
+        return support
+
+    def _close_edited_notice(self, key: str = "cursor-rule-edited") -> None:
         """The notice of replaced edits stays a day, so every app's next session shows it, then closes."""
         for alert in self.alerts.open():
-            if alert.get("key") == "cursor-rule-edited" and time.time() - float(alert.get("time", 0)) > 86400:
-                self.alerts.close("cursor-rule-edited")
+            if alert.get("key") == key and time.time() - float(alert.get("time", 0)) > 86400:
+                self.alerts.close(key)
 
     def _alert_list(self, key: str, items: List[str], message: str) -> None:
         if not items:

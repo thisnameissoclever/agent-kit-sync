@@ -139,19 +139,38 @@ def scan_machine() -> dict:
                 skill = child / "SKILL.md"
                 if skill.is_file():
                     found["skills"].append({"app": app, "name": child.name, "path": str(child), "link": child.is_symlink(), "description": frontmatter_value(skill, "description")})
-        agents = home / "agents"
+        agents = (home / "config" / "agents") if app == "antigravity" else (home / "agents")
         if agents.is_dir():
             for child in sorted(agents.iterdir()):
                 if child.suffix in (".md", ".toml") and child.is_file():
                     found["agents"].append({"app": app, "name": child.stem, "path": str(child)})
-        for settings_name in ("settings.json", "hooks.json"):
-            path = home / settings_name
+        if app == "antigravity":
+            path = home / "config" / "hooks.json"
             data = read_json(path)
-            for event, groups in (data.get("hooks") or {}).items():
-                for g, group in enumerate(groups if isinstance(groups, list) else []):
-                    for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                        if isinstance(handler, dict):
-                            found["hooks"].append({"app": app, "file": str(path), "event": event, "matcher": group.get("matcher"), "command": handler.get("command"), "args": handler.get("args"), "timeout": handler.get("timeout"), "status_message": handler.get("statusMessage"), "position": g})
+            for hook_name, events in data.items():
+                if not isinstance(events, dict):
+                    continue
+                for event, entries in events.items():
+                    if not isinstance(entries, list):
+                        continue
+                    for idx, item in enumerate(entries):
+                        if not isinstance(item, dict):
+                            continue
+                        if isinstance(item.get("hooks"), list):
+                            for handler in item["hooks"]:
+                                if isinstance(handler, dict):
+                                    found["hooks"].append({"app": app, "file": str(path), "event": event, "matcher": item.get("matcher"), "command": handler.get("command"), "args": handler.get("args"), "timeout": handler.get("timeout"), "name": hook_name, "position": idx})
+                        else:
+                            found["hooks"].append({"app": app, "file": str(path), "event": event, "matcher": None, "command": item.get("command"), "args": item.get("args"), "timeout": item.get("timeout"), "name": hook_name, "position": idx})
+        else:
+            for settings_name in ("settings.json", "hooks.json"):
+                path = home / settings_name
+                data = read_json(path)
+                for event, groups in (data.get("hooks") or {}).items():
+                    for g, group in enumerate(groups if isinstance(groups, list) else []):
+                        for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                            if isinstance(handler, dict):
+                                found["hooks"].append({"app": app, "file": str(path), "event": event, "matcher": group.get("matcher"), "command": handler.get("command"), "args": handler.get("args"), "timeout": handler.get("timeout"), "status_message": handler.get("statusMessage"), "position": g})
         if app == "codex":
             config = home / "config.toml"
             try:
@@ -164,7 +183,7 @@ def scan_machine() -> dict:
                 for group in groups:
                     for handler in group.get("hooks", []) if isinstance(group, dict) else []:
                         found["hooks"].append({"app": app, "file": str(config), "event": event, "matcher": group.get("matcher"), "command": handler.get("command"), "inline": True})
-        for name in ("CLAUDE.md", "AGENTS.md"):
+        for name in ("CLAUDE.md", "AGENTS.md", "GEMINI.md"):
             path = home / name
             if path.is_file():
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -358,17 +377,52 @@ def remove_registrations(layout: Layout, entries: List[dict]) -> List[str]:
         previous = json.loads(record.read_text(encoding="utf-8")) if record.exists() else []
         previous += [{"file": str(path), "event": e["event"], "command": e["command"]} for e in wanted]
         data = json.loads(raw.decode("utf-8"))
-        hooks = data.get("hooks") or {}
-        for entry in wanted:
-            groups = hooks.get(entry["event"], [])
-            for group in groups:
-                kept = [h for h in group.get("hooks", []) if str(h.get("command")) != entry["command"]]
-                if len(kept) != len(group.get("hooks", [])):
-                    removed.append(f"{entry['event']}: {entry['command']}")
-                group["hooks"] = kept
-            hooks[entry["event"]] = [g for g in groups if g.get("hooks")]
-            if not hooks[entry["event"]]:
-                del hooks[entry["event"]]
+        if isinstance(data, dict) and isinstance(data.get("hooks"), dict):
+            hooks = data["hooks"]
+            for entry in wanted:
+                groups = hooks.get(entry["event"], [])
+                if not isinstance(groups, list):
+                    continue
+                for group in groups:
+                    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                        continue
+                    kept = [h for h in group["hooks"] if str(h.get("command")) != entry["command"]]
+                    if len(kept) != len(group["hooks"]):
+                        removed.append(f"{entry['event']}: {entry['command']}")
+                    group["hooks"] = kept
+                hooks[entry["event"]] = [g for g in groups if not isinstance(g, dict) or g.get("hooks")]
+                if not hooks[entry["event"]]:
+                    del hooks[entry["event"]]
+        elif isinstance(data, dict):
+            # Antigravity hooks.json stores {hook_name: {event: [group_or_flat_handler]}} at top level.
+            for entry in wanted:
+                hook_names = [entry["name"]] if entry.get("name") in data else [k for k, v in data.items() if isinstance(v, dict)]
+                for hook_name in hook_names:
+                    events_map = data.get(hook_name)
+                    if not isinstance(events_map, dict):
+                        continue
+                    items = events_map.get(entry["event"])
+                    if not isinstance(items, list):
+                        continue
+                    kept_items = []
+                    for item in items:
+                        if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                            kept_h = [h for h in item["hooks"] if not (isinstance(h, dict) and str(h.get("command")) == entry["command"])]
+                            if len(kept_h) != len(item["hooks"]):
+                                removed.append(f"{entry['event']}: {entry['command']}")
+                            if kept_h:
+                                item["hooks"] = kept_h
+                                kept_items.append(item)
+                        elif isinstance(item, dict) and str(item.get("command")) == entry["command"]:
+                            removed.append(f"{entry['event']}: {entry['command']}")
+                        else:
+                            kept_items.append(item)
+                    if kept_items:
+                        events_map[entry["event"]] = kept_items
+                    elif entry["event"] in events_map:
+                        del events_map[entry["event"]]
+                    if not any(isinstance(v, list) for v in events_map.values()):
+                        del data[hook_name]
         from .settings import json_indent
         original = raw.decode("utf-8")
         atomic_write(path, (json.dumps(data, indent=json_indent(original), ensure_ascii=False) + ("\n" if original.endswith("\n") else "")).encode("utf-8"))
@@ -393,16 +447,44 @@ def restore_registrations(layout: Layout) -> List[str]:
         path = Path(entry["file"])
         backup = layout.state / "backups" / "registrations" / (path.parent.name + "-" + path.name)
         original = read_json(backup)
-        group = next((g for g in (original.get("hooks") or {}).get(entry["event"], []) for h in g.get("hooks", []) if str(h.get("command")) == entry["command"]), None)
-        if group is None:
-            continue
         raw = read_or_none(path)
         data = json.loads(raw.decode("utf-8")) if raw else {}
-        groups = data.setdefault("hooks", {}).setdefault(entry["event"], [])
-        if any(str(h.get("command")) == entry["command"] for g in groups for h in g.get("hooks", [])):
-            continue
-        handler = next(h for h in group["hooks"] if str(h.get("command")) == entry["command"])
-        groups.append(dict(group, hooks=[handler]))
+        if isinstance(original.get("hooks"), dict):
+            group = next((g for g in (original.get("hooks") or {}).get(entry["event"], []) for h in g.get("hooks", []) if str(h.get("command")) == entry["command"]), None)
+            if group is None:
+                continue
+            groups = data.setdefault("hooks", {}).setdefault(entry["event"], [])
+            if any(str(h.get("command")) == entry["command"] for g in groups for h in g.get("hooks", [])):
+                continue
+            handler = next(h for h in group["hooks"] if str(h.get("command")) == entry["command"])
+            groups.append(dict(group, hooks=[handler]))
+        else:
+            matched = None
+            for hook_name, events_map in original.items():
+                if not isinstance(events_map, dict):
+                    continue
+                for item in events_map.get(entry["event"], []) if isinstance(events_map.get(entry["event"]), list) else []:
+                    if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                        for handler in item["hooks"]:
+                            if isinstance(handler, dict) and str(handler.get("command")) == entry["command"]:
+                                matched = (hook_name, dict(item, hooks=[handler]), True)
+                                break
+                    elif isinstance(item, dict) and str(item.get("command")) == entry["command"]:
+                        matched = (hook_name, dict(item), False)
+                        break
+                if matched:
+                    break
+            if matched is None:
+                continue
+            hook_name, item_to_add, grouped = matched
+            events_map = data.setdefault(hook_name, {})
+            dest = events_map.setdefault(entry["event"], [])
+            if grouped:
+                if any(isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(str(h.get("command")) == entry["command"] for h in g["hooks"] if isinstance(h, dict)) for g in dest):
+                    continue
+            elif any(isinstance(h, dict) and str(h.get("command")) == entry["command"] for h in dest):
+                continue
+            dest.append(item_to_add)
         from .settings import json_indent
         text = raw.decode("utf-8") if raw else ""
         atomic_write(path, (json.dumps(data, indent=json_indent(text), ensure_ascii=False) + ("\n" if text.endswith("\n") or not text else "")).encode("utf-8"))

@@ -38,15 +38,15 @@ agent-kit-sync accepts no responsibility for anything that leaks from a public c
 
 ## What reaches each agent app
 
-| Item | Claude Code | Codex | Cursor |
-|---|---|---|---|
-| Skills | `~/.claude/skills/` | `~/.agents/skills/` | Reads the Claude Code and Codex folders |
-| Subagent definitions | `~/.claude/agents/` | `~/.codex/agents/` (TOML) | `~/.cursor/agents/` |
-| Instruction sections | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.cursor/rules/agent-kit-sync--*.mdc`, written only |
-| Agent settings | `~/.claude/settings.json` | `~/.codex/config.toml` | Not yet |
-| Hooks | Registered in `settings.json` | Registered in `hooks.json` | Runs Claude Code's hooks |
+| Item | Claude Code | Codex | Cursor | Antigravity |
+|---|---|---|---|---|
+| Skills | `~/.claude/skills/` | `~/.agents/skills/` | Reads the Claude Code and Codex folders | `~/.gemini/config/plugins/agent-kit-sync/skills/` |
+| Subagent definitions | `~/.claude/agents/` | `~/.codex/agents/` (TOML) | `~/.cursor/agents/` | `~/.gemini/config/plugins/agent-kit-sync/agents/` |
+| Instruction sections | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.cursor/rules/agent-kit-sync--*.mdc`, written only | `~/.gemini/config/plugins/agent-kit-sync/rules/agent-kit-sync--*.md`, written only |
+| Agent settings | `~/.claude/settings.json` | `~/.codex/config.toml` | Not yet | Not yet |
+| Hooks | Registered in `settings.json` | Registered in `hooks.json` | Runs Claude Code's hooks | Registered in plugin `hooks.json` |
 
-`CLAUDE_CONFIG_DIR` and `CODEX_HOME` move Claude Code's and Codex's folders, and agent-kit-sync follows them. A machine gets copies only for the apps it has. Antigravity is not supported yet.
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` move Claude Code's and Codex's folders, and agent-kit-sync follows them. A machine gets copies only for the apps it has.
 
 ## Requirements
 
@@ -195,6 +195,8 @@ agent-kit-sync changes only text between its own markers. New sections are added
 
 Cursor does not read `~/.claude/CLAUDE.md`. agent-kit-sync writes each section meant for Cursor as its own rule file, `~/.cursor/rules/agent-kit-sync--MODULE--ITEM.mdc`, which Cursor applies to every chat. Cursor does not follow `@path` lines, so each line that names a file agent-kit-sync installs, such as `@{{kit.module}}/writing-style.md`, is replaced by that file's text, and a line that names a path agent-kit-sync does not install raises an alert. Lines inside code fences, and `@` lines inside the imported file, stay as they are. Cursor reads only the first 102,400 bytes of a rule, so a longer section is split into `--partN` files, at blank lines where it can; a code fence cut in two is closed and opened again. These rule files are written only, never read back: edit the section in `CLAUDE.md` or `AGENTS.md`, or the installed file, and the change reaches every app. An edit made in one of these rule files, including to its header, is saved to the kit folder's `state/backups/cursor-rules/`, replaced, and reported in an alert for a day; removing one changes nothing, and the next sync writes it again. agent-kit-sync recognizes its own files by a marker line that names the file, so a file at one of these names that it did not write is left alone with an alert, and no other rule file is touched. Uninstalling, or removing Cursor from the machine's apps, removes only agent-kit-sync's rule files. Cursor reads these files only for a workspace inside your user folder; for a workspace elsewhere, such as on another drive, the session-start hook tells the agent to read them.
 
+For Antigravity, agent-kit-sync writes a managed plugin at `~/.gemini/config/plugins/agent-kit-sync/` (with `plugin.json` and `rules/agent-kit-sync--MODULE--ITEM.md`), leaving `~/.gemini/GEMINI.md` untouched for your own rules. Like Cursor's rule files, Antigravity's plugin rules expand `@path` imports of installed support files, split under Antigravity's 24,000-byte per-file limit, are output only (edits are saved to `state/backups/antigravity-rules/` and replaced), and are removed cleanly on uninstall or when Antigravity is removed from `apps`.
+
 `agent-kit-sync status` shows the size of each instruction file. Codex reads its global `AGENTS.md` in full; its 32 KiB limit applies only to `AGENTS.md` files in project folders, which agent-kit-sync does not write. Codex reads `AGENTS.override.md` instead of `AGENTS.md` when that file exists, and `agent-kit-sync doctor` reports it.
 
 ## Hooks
@@ -228,6 +230,8 @@ A hook fails when it exits with a code other than 0 or 2, prints output the disp
 When only one `native` hook runs for an event and it does not fail, the dispatcher returns that hook's output, error text, and exit code unchanged, so an existing hook behaves as it did when the app ran it directly. Two cases change the output: agent-kit-sync adds its own alerts, and `ask` becomes `deny` as above. Alerts join JSON output; plain-text context at session start or prompt submission is returned in the app's JSON form with the alerts added. An alert that cannot be added, after exit code 2 or plain text on other events, is shown at the session's next event. When several hooks run, the dispatcher combines their answers, and a refusal from any hook wins.
 
 Cursor runs the entries in Claude Code's settings but sends its own input: event names such as `preToolUse`, tool names such as `Shell` and `MCP:<tool>`, and transcripts in its own format. When the input has Cursor's `cursor_version` field, the dispatcher gives each hook the input Claude Code would send instead: Claude Code's event and tool names, an MCP tool as `mcp__cursor__<tool>`, file fields named `file_path` and `content`, the shell command's own folder or else the workspace folder as `cwd`, and a copy of the transcript's messages in Claude Code's format, kept in the kit folder's `state/cursor/` folder and removed at a Cursor session start once a week old. Cursor's transcript holds no tool results, so a hook cannot see the answer to a question the agent asked with a question tool. Cursor shows every edit to a file as a `Write` of the whole new text, so a hook sees an edit to an existing file of up to 1 MB of UTF-8 text as an `Edit` from the old text to the new; a larger file stays a `Write`. The answer gets Cursor's own fields, such as `permission` and `additional_context`, next to Claude Code's. Cursor shows the user only the message of a refused tool call or prompt, so a notice meant for the user goes there when there is one, and to the agent on session start, prompt, and tool events otherwise. When the agent stops, Cursor has no place for a notice, so it is dropped, and an alert waits for a later event. Cursor drops added context longer than 10,000 characters, so longer context is cut to fit, and the note at its end gives the path of a file with the whole text. Each registered tool matcher also lists Cursor's names for the same tools.
+
+Antigravity runs the dispatcher entries registered in its managed plugin's `hooks.json` (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, and `Stop`) and sends camelCase payloads with `toolCall` arguments and its own `transcriptPath` format. The dispatcher translates those inputs to Claude Code's format (including mapping Antigravity tools such as `run_command`, `read_file`/`view_file`, `write_file`/`write_to_file`/`edit_file`/`replace_file_content`/`multi_replace_file_content`, and MCP calls, converting whole-file overwrites on existing files to `Edit`, deduplicating `PreInvocation` once per user turn, gating `Stop` on `terminationReason`, and keeping translated JSONL transcripts in `state/antigravity/`). Responses translate back into Antigravity's JSON contract (`allow`, `deny`, native `ask`, `overwrite`, `continue` on stop, and `injectSteps` for context and alerts on `SessionStart` and `PreInvocation`).
 
 If Python moves, such as after an upgrade, the registered commands cannot start. Run `agent-kit-sync repair` in a terminal; the command falls back to any `python3` on the path, or run `python3 ~/.agent-kit-sync/launcher.py repair` directly.
 
@@ -348,7 +352,7 @@ Your protections are the checks, the policy settings `code_changes`, `outgoing`,
 
 ## Current limits
 
-- Cursor's settings, and Antigravity, are not supported yet.
+- Cursor's and Antigravity's settings are not supported yet.
 - Skills from other repositories, such as public skill collections, cannot be added as sources yet.
 - Test results cover only the systems on which the tests actually ran. The optional **Tests** workflow can test agent-kit-sync on Linux, macOS, and Windows on demand. Your own hooks are tested on Windows only when a Windows machine installs them.
 
