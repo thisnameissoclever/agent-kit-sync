@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 from . import VERSION, gitops, sections, toml, tomledit
 from .fsutil import atomic_write, read_or_none, real, sha256
-from .paths import Layout, detect_apps, os_name
+from .paths import ANTIGRAVITY_PLUGIN_NAME, Layout, antigravity_plugin_dir, detect_apps, os_name
 
 SHARED_MEMORY_MODULE = "shared-memory"
 SHARED_MEMORY_SECTION = "entries"
@@ -414,6 +414,17 @@ def cmd_doctor(args, layout: Layout) -> int:
         unapproved = _codex_unapproved(machine.app_homes["codex"], path, layout)
         if unapproved:
             problems.append(f"Codex has not approved {len(unapproved)} agent-kit-sync hook entries ({', '.join(unapproved)}). Run agent-kit-sync repair, which approves them, or open /hooks in Codex and approve them.")
+    if "antigravity" in machine.apps:
+        plugin_dir = antigravity_plugin_dir(machine.app_homes["antigravity"])
+        manifest = plugin_dir / "plugin.json"
+        manifest_data = _json(manifest)
+        if not manifest.is_file() or manifest_data.get("name") != ANTIGRAVITY_PLUGIN_NAME:
+            problems.append(f"Antigravity's plugin manifest at {manifest} is missing or belongs to another plugin. Run agent-kit-sync sync.")
+        hooks_path = plugin_dir / "hooks.json"
+        mine = _antigravity_registered(_json(hooks_path), layout)
+        notes.append(f"Antigravity: {len(mine)} agent-kit-sync hook entries in {hooks_path}.")
+        if not mine:
+            problems.append("No agent-kit-sync hook entries in Antigravity's plugin hooks.json. Run agent-kit-sync repair.")
     if (Path.home() / ".cursor").is_dir():
         notes.append("Cursor is installed. It runs the hooks registered for Claude Code; if the dispatcher cannot start there, Cursor lets every action continue.")
         exec_form = [event for event, handler in _own_entries(_json(machine.app_homes["claude"] / "settings.json"), layout) if handler.get("args")] if "claude" in machine.apps else []
@@ -421,10 +432,23 @@ def cmd_doctor(args, layout: Layout) -> int:
             problems.append(f"Cursor cannot run {len(exec_form)} agent-kit-sync entries in Claude Code's settings ({', '.join(exec_form)}), because it ignores their \"args\" and starts Python with no script. "
                             "agent-kit-sync writes that form only when the path to Python or to agent-kit-sync holds an apostrophe together with $, a backtick, a typographic double quote, or two backslashes in a row. "
                             "Run agent-kit-sync repair; if this stays, install Python or agent-kit-sync under a path without an apostrophe.")
-    for event in ("session_start", "pre_tool_use", "stop"):
-        code, out = _dry_dispatch(layout, "claude" if "claude" in machine.apps else "codex", event)
-        if code not in (0,):
-            problems.append(f"The dispatcher exited with {code} on a sample {event} event: {out[:200]}")
+    if "claude" in machine.apps or "codex" in machine.apps:
+        for event in ("session_start", "pre_tool_use", "stop"):
+            code, out = _dry_dispatch(layout, "claude" if "claude" in machine.apps else "codex", event)
+            if code not in (0,):
+                problems.append(f"The dispatcher exited with {code} on a sample {event} event: {out[:200]}")
+    if "antigravity" in machine.apps:
+        for event in ("session_start", "pre_tool_use", "stop"):
+            code, out = _dry_dispatch(layout, "antigravity", event)
+            if code not in (0,):
+                problems.append(f"The Antigravity dispatcher exited with {code} on a sample {event} event: {out[:200]}")
+            else:
+                try:
+                    parsed = json.loads(out) if out.strip() else None
+                except ValueError:
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    problems.append(f"The Antigravity dispatcher returned non-JSON output on a sample {event} event: {out[:200]}")
     for line in notes:
         say(line)
     for line in problems:
@@ -461,9 +485,10 @@ def _codex_unapproved(codex_home: Path, hooks_path: Path, layout: Layout) -> Lis
 
 def _json(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _handlers(data: dict):
@@ -508,10 +533,39 @@ def _registered(data: dict, layout: Layout) -> List[str]:
     return [event for event, _handler in _own_entries(data, layout)]
 
 
+def _antigravity_registered(data: dict, layout: Layout) -> List[str]:
+    from .register import _entry_command, ours
+    entry = data.get(ANTIGRAVITY_PLUGIN_NAME)
+    if not isinstance(entry, dict):
+        return []
+    found = []
+    for event, items in entry.items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("hooks"), list):
+                for handler in item["hooks"]:
+                    if isinstance(handler, dict) and ours(_entry_command(handler), layout.launcher):
+                        found.append(event)
+            elif ours(_entry_command(item), layout.launcher):
+                found.append(event)
+    return found
+
+
 def _dry_dispatch(layout: Layout, app: str, event: str):
-    payload = {"session_id": "agent-kit-sync-doctor", "hook_event_name": event, "cwd": str(Path.home())}
-    if event == "pre_tool_use":
-        payload.update({"tool_name": "Read", "tool_input": {"file_path": str(Path.home() / "x")}})
+    if app == "antigravity":
+        from .dispatch import APP_EVENTS
+        payload = {"conversationId": "agent-kit-sync-doctor", "hookEventName": APP_EVENTS["antigravity"].get(event, event), "cwd": str(Path.home())}
+        if event == "pre_tool_use":
+            payload["toolCall"] = {"id": "doctor-1", "name": "read_file", "args": {"Path": str(Path.home() / "x")}}
+        elif event == "stop":
+            payload["terminationReason"] = "NO_TOOL_CALL"
+    else:
+        payload = {"session_id": "agent-kit-sync-doctor", "hook_event_name": event, "cwd": str(Path.home())}
+        if event == "pre_tool_use":
+            payload.update({"tool_name": "Read", "tool_input": {"file_path": str(Path.home() / "x")}})
     env = dict(os.environ, AGENT_KIT_SYNC_NO_BACKGROUND="1")
     try:
         result = processes.run([sys.executable, "-I", "-S", str(layout.launcher), "hook", app, event], input=json.dumps(payload).encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=env)
@@ -666,6 +720,7 @@ def cmd_uninstall(args, layout: Layout) -> int:
         engine._write_settings(plan)
         engine.index.save()
         unregister(layout, machine)
+        engine.write_antigravity_plugin(plan, everything_removed=True)
         from .setup import restore_registrations
         restore_registrations(layout)
     say(f"Removed agent-kit-sync from this machine. The kit folder {layout.root} is left in place; delete it yourself when you no longer need its backups and logs. Codex keeps its approval records for the removed entries until you clear them in /hooks.")

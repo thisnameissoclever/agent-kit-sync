@@ -16,7 +16,7 @@ HOME_VARS = ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONF
 
 
 def isolated_env(home: Path) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in HOME_VARS and not k.startswith("AGENT_KIT_SYNC")}
+    env = {k: v for k, v in os.environ.items() if k not in HOME_VARS and not k.startswith(("AGENT_KIT_SYNC", "ANTIGRAVITY_"))}
     env.update({"HOME": str(home), "USERPROFILE": str(home), "AGENT_KIT_SYNC_TEST": "1", "AGENT_KIT_SYNC_NO_BACKGROUND": "1"})
     return env
 

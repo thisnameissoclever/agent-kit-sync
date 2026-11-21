@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .dispatch import APP_EVENTS, WRITE_TOOLS, matcher_for
-from .fsutil import ChangedUnderneath, atomic_write, read_or_none, sha256
+from .fsutil import ChangedUnderneath, atomic_write, read_or_none, remove_file, sha256
 from .model import Machine
-from .paths import Layout, os_name
+from .paths import ANTIGRAVITY_PLUGIN_NAME, Layout, antigravity_plugin_dir, default_app_home, os_name
 
 TOOL_EVENTS = ("session_start", "post_tool_use", "stop")
+ANTIGRAVITY_GROUPED_EVENTS = ("PreToolUse", "PostToolUse")
 # PowerShell reads each of these as a single quote, so an argument holding one cannot go in single quotes.
 POWERSHELL_QUOTES = "'\u2018\u2019\u201a\u201b"
 
@@ -220,6 +221,116 @@ def update_file(path: Path, layout: Layout, desired: Dict[str, dict]) -> bool:
     raise ValueError(f"{path} kept changing while agent-kit-sync updated it")
 
 
+def _rmdir_if_empty(folder: Path) -> None:
+    try:
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+    except OSError:
+        pass
+
+
+def _antigravity_hooks_path(machine: Machine) -> Tuple[Path, Path]:
+    home = machine.app_homes.get("antigravity") or default_app_home("antigravity")
+    plugin_dir = antigravity_plugin_dir(home)
+    return plugin_dir, plugin_dir / "hooks.json"
+
+
+def update_antigravity_file(path: Path, layout: Layout, desired: Dict[str, dict]) -> bool:
+    """Make agent-kit-sync's entries in Antigravity's plugin hooks.json match `desired`. Returns True if changed."""
+    for _attempt in range(3):
+        raw = read_or_none(path)
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw and raw.strip() else {}
+        except ValueError as error:
+            raise ValueError(f"{path} is not valid JSON: {error}") from None
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must hold a JSON object")
+        existing = data.get(ANTIGRAVITY_PLUGIN_NAME)
+        if existing is None:
+            entry: dict = {}
+        elif isinstance(existing, dict):
+            entry = existing
+        else:
+            raise ValueError(f"{path} entry {ANTIGRAVITY_PLUGIN_NAME!r} must hold a JSON object")
+        changed = False
+        for native_event in list(entry):
+            items = entry[native_event]
+            if not isinstance(items, list):
+                continue
+            kept = []
+            if native_event in ANTIGRAVITY_GROUPED_EVENTS:
+                for group in items:
+                    if isinstance(group, dict) and "hooks" not in group and ours(_entry_command(group), layout.launcher):
+                        changed = True
+                        continue
+                    raw_hooks = group.get("hooks") if isinstance(group, dict) else None
+                    handlers = raw_hooks if isinstance(raw_hooks, list) else []
+                    mine = [h for h in handlers if isinstance(h, dict) and ours(_entry_command(h), layout.launcher)]
+                    if not mine:
+                        kept.append(group)
+                        continue
+                    wanted = desired.get(native_event)
+                    if wanted and not wanted.get("present") and len(handlers) == 1 and group.get("matcher") == wanted["matcher"] and handlers[0] == wanted["handler"]:
+                        kept.append(group)
+                        wanted["present"] = True
+                        continue
+                    changed = True
+                    others = [h for h in handlers if h not in mine]
+                    if others:
+                        kept.append(dict(group, hooks=others))
+            else:
+                for handler in items:
+                    if not isinstance(handler, dict) or not ours(_entry_command(handler), layout.launcher):
+                        kept.append(handler)
+                        continue
+                    wanted = desired.get(native_event)
+                    if wanted and not wanted.get("present") and handler == wanted["handler"]:
+                        kept.append(handler)
+                        wanted["present"] = True
+                        continue
+                    changed = True
+            entry[native_event] = kept
+            if not kept:
+                del entry[native_event]
+                changed = True
+        for native_event, wanted in desired.items():
+            if wanted.get("present"):
+                continue
+            if native_event in ANTIGRAVITY_GROUPED_EVENTS:
+                entry.setdefault(native_event, []).append({"matcher": wanted["matcher"], "hooks": [wanted["handler"]]})
+            else:
+                entry.setdefault(native_event, []).append(wanted["handler"])
+            changed = True
+        if entry:
+            data[ANTIGRAVITY_PLUGIN_NAME] = entry
+        elif ANTIGRAVITY_PLUGIN_NAME in data:
+            del data[ANTIGRAVITY_PLUGIN_NAME]
+            changed = True
+        if not data:
+            if raw is None:
+                return False
+            try:
+                remove_file(path, expect=sha256(raw))
+                _rmdir_if_empty(path.parent)
+                return True
+            except ChangedUnderneath:
+                for wanted in desired.values():
+                    wanted.pop("present", None)
+                continue
+        if not changed:
+            return False
+        from .settings import json_indent
+        original = raw.decode("utf-8") if raw else ""
+        text = json.dumps(data, indent=json_indent(original), ensure_ascii=False) + ("\n" if raw is None or raw.endswith(b"\n") else "")
+        try:
+            atomic_write(path, text.encode("utf-8"), expect=sha256(raw) if raw is not None else None)
+            return True
+        except ChangedUnderneath:
+            for wanted in desired.values():
+                wanted.pop("present", None)
+    raise ValueError(f"{path} kept changing while agent-kit-sync updated it")
+
+
 def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict], on_failure_supported: bool) -> Dict[str, dict]:
     result = {}
     for event, spec in needed(hooks, app).items():
@@ -237,6 +348,14 @@ def desired_entries(layout: Layout, machine: Machine, app: str, hooks: List[dict
                 handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
             if spec["closed"] and on_failure_supported and event not in ("stop", "subagent_stop"):
                 handler["onFailure"] = "block"
+        elif app == "antigravity":
+            # Antigravity runs hook commands via sh -c on Unix and cmd /c on Windows with the
+            # plugin folder as cwd, and has no commandWindows override.
+            cmd = shell_join(parts)
+            if os_name() == "windows" and '"' in cmd:
+                # cmd.exe /c without /s strips quotes when quoted paths appear, so prefix call.
+                cmd = "call " + cmd
+            handler = {"type": "command", "command": cmd, "timeout": 60}
         else:
             handler = {"type": "command", "command": shell_join(parts), "timeout": 60}
             if os_name() == "windows":
@@ -257,6 +376,14 @@ def register(layout: Layout, machine: Machine, hooks: List[dict]) -> Dict[str, b
             continue
         path = machine.app_homes[app] / ("settings.json" if app == "claude" else "hooks.json")
         changed[app] = update_file(path, layout, desired_entries(layout, machine, app, hooks, supported))
+    plugin_dir, ag_path = _antigravity_hooks_path(machine)
+    if "antigravity" in machine.apps:
+        changed["antigravity"] = update_antigravity_file(ag_path, layout, desired_entries(layout, machine, "antigravity", hooks, supported))
+    elif ag_path.exists():
+        changed["antigravity"] = update_antigravity_file(ag_path, layout, {})
+        _rmdir_if_empty(plugin_dir)
+    else:
+        _rmdir_if_empty(plugin_dir)
     return changed
 
 
@@ -268,4 +395,9 @@ def unregister(layout: Layout, machine: Machine) -> Dict[str, bool]:
         path = machine.app_homes[app] / ("settings.json" if app == "claude" else "hooks.json")
         if path.exists():
             changed[app] = update_file(path, layout, {})
+    plugin_dir, ag_path = _antigravity_hooks_path(machine)
+    if ag_path.exists():
+        changed["antigravity"] = update_antigravity_file(ag_path, layout, {})
+    if "antigravity" in machine.apps:
+        _rmdir_if_empty(plugin_dir)
     return changed

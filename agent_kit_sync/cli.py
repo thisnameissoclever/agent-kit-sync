@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import VERSION, gitops, toml
-from .paths import Layout, kit_dir
+from .paths import Layout, antigravity_plugin_dir, kit_dir
 
 
 def layout_from_env() -> Layout:
@@ -224,6 +224,12 @@ def cmd_status(args, layout: Layout) -> int:
             path = engine.machine.app_homes[app] / file_name
             if path.exists():
                 say(f"{path}: {path.stat().st_size:,} bytes")
+    if "antigravity" in engine.machine.apps:
+        plugin_dir = antigravity_plugin_dir(engine.machine.app_homes["antigravity"])
+        rules_dir = plugin_dir / "rules"
+        if plugin_dir.is_dir() or rules_dir.is_dir():
+            count = sum(1 for child in rules_dir.iterdir() if child.is_file()) if rules_dir.is_dir() else 0
+            say(f"{plugin_dir}: {count} rule file(s)")
     held = Held(layout).all()
     alerts = Alerts(layout).open()
     if held:
@@ -250,6 +256,10 @@ def _unsynced(engine) -> List[str]:
         folders += [machine.app_homes["claude"] / "skills", machine.app_homes["claude"] / "agents"]
     if "codex" in machine.apps:
         folders += [Path.home() / ".agents" / "skills", machine.app_homes["codex"] / "skills", machine.app_homes["codex"] / "agents"]
+    if "antigravity" in machine.apps:
+        ag_home = machine.app_homes["antigravity"]
+        plugin_dir = antigravity_plugin_dir(ag_home)
+        folders += [plugin_dir / "skills", plugin_dir / "agents", ag_home / "config" / "skills", ag_home / "config" / "agents"]
     for folder in folders:
         if not folder.is_dir():
             continue
